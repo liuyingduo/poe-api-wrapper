@@ -1,7 +1,7 @@
 from time import sleep
 from httpx import Client, ReadTimeout, ConnectError
 from requests_toolbelt import MultipartEncoder
-import os, secrets, string, random, websocket, orjson, threading, queue, ssl, hashlib, re
+import os, secrets, string, random, websocket, orjson, threading, queue, ssl, hashlib, re, uuid
 from loguru import logger
 from typing import Generator
 from .utils import (
@@ -14,7 +14,7 @@ from .utils import (
                     generate_nonce, 
                     generate_file
                     )
-from .queries import generate_payload
+from .queries import generate_payload, resolve_query_name
 from .bundles import PoeBundle
 from .proxies import PROXY
 if PROXY:
@@ -29,10 +29,10 @@ class PoeApi:
     HEADERS = HEADERS
     MAX_CONCURRENT_MESSAGES = 3
 
-    def __init__(self, tokens: dict={}, proxy: list=[], auto_proxy: bool=False):
+    def __init__(self, tokens: dict={}, proxy: list=[], auto_proxy: bool=False, headers: dict=None):
         self.client = None
-        if not {'p-b', 'p-lat'}.issubset(tokens):
-            raise ValueError("Please provide valid p-b and p-lat cookies")
+        if 'p-b' not in tokens:
+            raise ValueError("Please provide a valid p-b cookie")
     
         self.tokens: dict = tokens
         self.formkey: str = ""
@@ -48,22 +48,33 @@ class PoeApi:
         self.proxies: dict = {}
         self.bundle: PoeBundle = None
         
-        self.client = Client(headers=self.HEADERS, timeout=60, http2=True)
+        self.client = Client(headers=self.HEADERS.copy(), timeout=60, http2=True)
+        if headers:
+            self.client.headers.update(headers)
         self.client.cookies.update({
-                                'p-b': self.tokens['p-b'], 
-                                'p-lat': self.tokens['p-lat']
+                                'p-b': self.tokens['p-b'],
                                 })
-        
-        if { '__cf_bm', 'cf_clearance'}.issubset(tokens):
+        if 'p-lat' in self.tokens and self.tokens['p-lat']:
             self.client.cookies.update({
-                '__cf_bm': tokens['__cf_bm'], 
-                'cf_clearance': tokens['cf_clearance']
+                'p-lat': self.tokens['p-lat']
             })
+        
+        cloudflare_cookies = {}
+        if '__cf_bm' in tokens and tokens['__cf_bm']:
+            cloudflare_cookies['__cf_bm'] = tokens['__cf_bm']
+        if 'cf_clearance' in tokens and tokens['cf_clearance']:
+            cloudflare_cookies['cf_clearance'] = tokens['cf_clearance']
+        if cloudflare_cookies:
+            self.client.cookies.update(cloudflare_cookies)
         
         if 'formkey' in tokens:
             self.formkey = tokens['formkey']
             self.client.headers.update({
                 'Poe-Formkey': self.formkey,
+            })
+        if 'poe-revision' in tokens and tokens['poe-revision']:
+            self.client.headers.update({
+                'Poe-Revision': tokens['poe-revision'],
             })
         
         if self.formkey == "":
@@ -117,6 +128,7 @@ class PoeApi:
             logger.warning(f"Waiting queue {ratelimit}/2 to avoid rate limit")
             sleep(random.randint(2, 3))
         status_code = 0
+        resolved_query_name = resolve_query_name(query_name)
         
         try:
             payload = generate_payload(query_name, variables)
@@ -138,11 +150,21 @@ class PoeApi:
             
             headers.update({
                 "poe-tag-id": hashlib.md5(base_string.encode()).hexdigest(),
+                "poe-queryname": resolved_query_name,
+                "poegraphql": "1",
             })
             response = self.client.post(f'{self.BASE_URL}/api/{path}', data=payload, headers=headers, follow_redirects=True, timeout=30)
             
             status_code = response.status_code
-            json_data = orjson.loads(response.text)
+            response_text = response.text
+            content_type = response.headers.get("content-type", "")
+            try:
+                json_data = orjson.loads(response_text)
+            except Exception as json_error:
+                body_preview = response_text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    f"Non-JSON response. status_code:{status_code}, content_type:{content_type}, body_preview:{body_preview!r}"
+                ) from json_error
 
             if (
                 "success" in json_data.keys()
@@ -302,20 +324,20 @@ class PoeApi:
                 subscriptionName = payload.get("subscription_name")
                 
                 if subscriptionName not in ("messageAdded", "messageCancelled", "chatTitleUpdated"):
-                    return
+                    continue
 
                 data = (payload.get("data", {}))
                 
                 if not data:
-                    return
+                    continue
                 
                 if subscriptionName == "messageAdded" and data["messageAdded"]["author"] == "human":
-                    return
+                    continue
                         
                 chat_id: int = int(payload.get("unique_id")[(len(subscriptionName) + 1):])
                 
                 if chat_id not in self.message_queues:
-                    return
+                    continue
                 
                 if chat_id in self.message_queues:
                     self.message_queues[chat_id].put(
@@ -326,7 +348,7 @@ class PoeApi:
                     )
                     if subscriptionName == "messageAdded":
                         self.active_messages[chat_id] = data["messageAdded"]["messageId"]          
-                    return
+                    continue
                     
         except Exception:
             logger.exception(f"Failed to parse message: {ws_data}")
@@ -356,7 +378,14 @@ class PoeApi:
         self.bots = {}
         if not (get_all or count):
             raise TypeError("Please provide at least one of the following parameters: get_all=<bool>, count=<int>")
-        response = self.send_request('gql_POST',"AvailableBotsSelectorModalPaginationQuery", {}) 
+        query_variables = {
+            "botSelectorFilter": "all",
+            "cursor": None,
+            "filterCanvasOnlyBots": False,
+            "includeHomePageBotSelectorFragment": False,
+            "limit": 10,
+        }
+        response = self.send_request('gql_POST', "AvailableBotsSelectorModalPaginationQuery", query_variables)
         bots = [
             each["node"]
             for each in response["data"]["viewer"]["availableBotsConnection"]["edges"]
@@ -367,7 +396,8 @@ class PoeApi:
             self.bots.update({bot["handle"]: {"bot": bot} for bot in bots})
             return self.bots
         while len(bots) < count or get_all:
-            response = self.send_request("gql_POST", "AvailableBotsSelectorModalPaginationQuery", {"cursor": cursor})
+            query_variables["cursor"] = cursor
+            response = self.send_request("gql_POST", "AvailableBotsSelectorModalPaginationQuery", query_variables)
             new_bots = [
                 each["node"]
                 for each in response["data"]["viewer"]["availableBotsConnection"]["edges"]
@@ -677,7 +707,11 @@ class PoeApi:
             sleep(0.01)
         self.connect_ws()
         
-        bot = bot_map(bot)
+        bot_input = bot
+        bot = bot_map(bot_input)
+        bot_candidates = [bot]
+        if bot_input != bot:
+            bot_candidates.append(bot_input)
         attachments = []
         
         if file_path == []:
@@ -691,28 +725,41 @@ class PoeApi:
             for i in range(len(file_form)):
                 attachments.append(f'file{i}')
         
-        botInfo = self.get_botInfo(bot)
-        msgPrice = botInfo.get('displayMessagePointPrice')
-        if not botInfo:
-            raise ValueError(
-                f"Failed to get bot info for {bot}. Make sure the bot exists before creating new chat."
-            )
+        msgPrice = None
+        try:
+            botInfo = self.get_botInfo(bot)
+            msgPrice = botInfo.get('displayMessagePointPrice')
+        except Exception:
+            msgPrice = None
             
         if (chatId == None and chatCode == None):
             try:
                 variables = {
                                 "chatId": None, 
-                                "bot": bot,
                                 "query":message, 
                                 "shouldFetchChat": True, 
-                                "source":{"sourceType":"chat_input","chatInputMetadata":{"useVoiceRecord":False,}}, 
+                                "source":{"sourceType":"chat_input","chatInputMetadata":{"useVoiceRecord":False, "newChatContext": "home_page_input"}}, 
                                 "clientNonce": generate_nonce(),
-                                "sdid":"",
+                                "sdid": str(uuid.uuid4()),
                                 "attachments":attachments, 
                                 "existingMessageAttachmentsIds":[],
-                                "messagePointsDisplayPrice": msgPrice
+                                "chatNonce": generate_nonce(),
+                                "referencedMessageId": None,
+                                "parameters": None,
+                                "fileHashJwts": []
                             }
-                message_data = self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                message_data = None
+                send_error = None
+                for bot_candidate in bot_candidates:
+                    try:
+                        variables["bot"] = bot_candidate
+                        message_data = self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                        bot = bot_candidate
+                        break
+                    except Exception as e:
+                        send_error = e
+                if message_data is None:
+                    raise send_error
         
                 if message_data["data"] == None and message_data["errors"]:
                     raise ValueError(
@@ -765,19 +812,32 @@ class PoeApi:
             title = chatdata['title']
             variables = {
                             'chatId': chatId, 
-                            'bot': bot, 
                             'query': message, 
                             'shouldFetchChat': False, 
                             'source': { "sourceType": "chat_input", "chatInputMetadata": {"useVoiceRecord": False}}, 
                             "clientNonce": generate_nonce(), 
-                            'sdid':"", 
+                            'sdid': str(uuid.uuid4()), 
                             'attachments': attachments, 
                             "existingMessageAttachmentsIds":[],
-                            "messagePointsDisplayPrice": msgPrice
+                            "chatNonce": generate_nonce(),
+                            "referencedMessageId": None,
+                            "parameters": None,
+                            "fileHashJwts": []
                         }
             
             try:
-                message_data = self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                message_data = None
+                send_error = None
+                for bot_candidate in bot_candidates:
+                    try:
+                        variables["bot"] = bot_candidate
+                        message_data = self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                        bot = bot_candidate
+                        break
+                    except Exception as e:
+                        send_error = e
+                if message_data is None:
+                    raise send_error
                     
                 if message_data["data"] == None and message_data["errors"]:
                     raise RuntimeError(f"An unknown error occurred. Raw response data: {message_data}")
@@ -888,8 +948,12 @@ class PoeApi:
         self.retry_attempts = 3
         
     def cancel_message(self, chunk: dict):
-        variables = {"messageId": chunk["messageId"], "textLength": len(chunk["text"])}
-        self.send_request('gql_POST', 'StopMessage_messageCancel_Mutation', variables)
+        if chunk.get("chatId") is not None:
+            variables = {"chatId": chunk["chatId"]}
+            self.send_request('gql_POST', 'cancelViewerActiveJobs_cancelViewerActiveJobs_Mutation', variables)
+        else:
+            variables = {"messageId": chunk["messageId"], "textLength": len(chunk["text"])}
+            self.send_request('gql_POST', 'StopMessage_messageCancel_Mutation', variables)
         
     def chat_break(self, bot: str, chatId: int=None, chatCode: str=None):
         bot = bot_map(bot)

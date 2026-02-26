@@ -1,0 +1,11 @@
+# Core runtime dependencies
+httpx[http2]
+websocket-client
+requests-toolbelt
+loguru
+rich==13.3.4
+beautifulsoup4
+quickjs
+nest-asyncio
+orjson
+aiofiles

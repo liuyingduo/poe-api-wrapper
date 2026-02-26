@@ -4,11 +4,13 @@ QUERIES = {
   "RegenerateMessageMutation": "056f5f4b6a39ca7786a4f0b2ef37eee401c81d6086cd78ffc12fe2ce0bccb1fd",
   "AddEmailMutation": "6d9ff3c8ed7badced30cfdad97492d4c21719931e8c44c5601abfa429b62ded7",
   "ChatHelpers_addMessageBreakEdgeMutation_Mutation": "9450e06185f46531eca3e650c26fa8524f876924d1a8e9a3fb322305044bdac3",
-  "SendChatBreakMutation": "528382d26ae0a33020feddee41e5a02f837b9b09886dc29dc1d638fd7143d212",
+  "SendChatBreakMutation": "f1c759d5a5248717860192964538f3658dbc91c52e8ca92a7adbfab9e6c5536d",
+  "sendChatBreakMutation": "f1c759d5a5248717860192964538f3658dbc91c52e8ca92a7adbfab9e6c5536d",
   "AddPhoneNumber": "26ae865f0686a910a86759c069eb1c0085d78b55a8abf64444ec63b03c76fb58",
   "AnnotateWithIdsProviderQuery": "b4e6992c3af8f208ab2b3979dce48889835736ed29f623ea9f609265018d0d8f",
   "AvailableBotsListModalPaginationQuery": "3be373baa573ccd196b9d71c94953b1d1bc586625bd64efe51655d75e68bbfb7",
-  "AvailableBotsSelectorModalPaginationQuery": "26214d2e2381b435992200b171b9f39f360cfd5d668c71b071d5575aa6c3c10e",
+  "AvailableBotsSelectorModalPaginationQuery": "b044c1f843c1319070d8e2d1e65220f0dc15d50882d49b31ec32ee9ef4647454",
+  "availableBotsSelectorModalPaginationQuery": "b044c1f843c1319070d8e2d1e65220f0dc15d50882d49b31ec32ee9ef4647454",
   "BotInfoFormRunCheckMutation": "87d55551061151b852fd7c53ec34dbb1ae784516b0ba2df5255b201f0d4e1444",
   "BotInfoModalQuery": "33254e9e91d63d16dbac1d70aa6accfb31786be05f7749772a32bc37d9ccb799",
   "BotLandingPageQuery": "18c8cd1a9e0707e93cf44d31e909809b05ceedcd2d10cdf7d1c49a82f6718e09",
@@ -78,6 +80,7 @@ QUERIES = {
   "Knowledge_EditKnowledgeSourceMutation": "627557c27853ba0d52ceb77e58116034f103d60a5b00bf5e0c5edd2af6b21827",
   "EditBotIndexPageQuery": "4b19c8068312a192bd37aee05adcfbb91e65379a85a6cae3b7f3ffdd0eeed9b1",
   "StopMessage_messageCancel_Mutation": "d2d75098e1878758a5bcd39c89ff6c8c7f5fd633a4f432c234fede8cb743c2e6",
+  "cancelViewerActiveJobs_cancelViewerActiveJobs_Mutation": "bec4c5fb9ea395932da3174c38da893ffaf7ab142130ef1f0f796526051a80de",
   "MessageCancelled": "14647e90e5960ec81fa83ae53d270462c3743199fbb6c4f26f40f4c83116d2ff",
   "MessageDeleted": "91f1ea046d2f3e21dabb3131898ec3c597cb879aa270ad780e8fdd687cde02a3",
   "MessageCreated": "26847fdf99c61144d75b62d3c6a6e959667a6d48190256bbef2e90d41ce3b931",
@@ -122,6 +125,7 @@ QUERIES = {
   "SearchResultsMainQuery": "7ee1c22fd46693de7869ce0305d0209b7fda41ef91389110cd989804194fcaf8",
   "SelectorTestPageQuery": "9ec86fe8e3d0d3b264d0fab0feb73e38c86d616c7c3d8340d7a6146bd8445ed3",
   "SendMessageMutation": "f1486efc974a214dac6586c46b81bf631a95e58eab1d27b215f622859d74a23e",
+  "sendMessageMutation": "af2d4152f71b189bc23542de7edeb813f8fb5afe2204b4827d1a4a26074f1caf",
   "SendVerificationCodeMutation": "d418fa3d2357d089b20065226041180573fa0b0382914a90cf905435281af520",
   "SetPrimaryEmailMutation": "01e75a6d937351b304ca9cc0b231e43587a5923e7f8618863bdf996df38d28b5",
   "SettingsDefaultBotSectionMutation": "4084604e8741af8650ac6b4236cdfa13c91a70cf1c63ad8a368706a386d0887e",
@@ -138,6 +142,7 @@ QUERIES = {
   "StaticContentQuery": "15267bf130fbe298a6f60334f57ccf62bc16ff06c74d5778ba54b4b4f21f8d0c",
   "SubscriptionTosQuery": "6696950c5612023d877acd6a6f9026668960994825d3fa71a80528c316510c2f",
   "SubscriptionsMutation": "5a7bfc9ce3b4e456cd05a537cfa27096f08417593b8d9b53f57587f3b7b63e99",
+  "subscriptionsMutation": "5a7bfc9ce3b4e456cd05a537cfa27096f08417593b8d9b53f57587f3b7b63e99",
   "UniversalLinkPageQuery": "ec7c629dd6ec79f9d26dda9c4ef9cb1e24aa41d7b92090596b6639eeee5e6cc8",
   "UpdatePhoneNumber": "c49f5f64947c2946f8007f366bbc0ca5b1f0bbbdc6b72ad97be90533f0e83c28",
   "UseBotSelectorBotQuery": "6af7249e90de59baef2e770f7e773f9f7730fd49db6b4e82035c49a078818534",
@@ -158,9 +163,20 @@ QUERIES = {
   "MessageCitationSourceModalQuery": "ad19832b5d80a626449366a6b1ff0f43272a4324e5d0bd586dbce67922edbd2c",
 }
 
+QUERY_NAME_ALIASES = {
+  "SendMessageMutation": "sendMessageMutation",
+  "SubscriptionsMutation": "subscriptionsMutation",
+  "SendChatBreakMutation": "sendChatBreakMutation",
+  "AvailableBotsSelectorModalPaginationQuery": "availableBotsSelectorModalPaginationQuery",
+}
+
+def resolve_query_name(query_name: str) -> str:
+    return QUERY_NAME_ALIASES.get(query_name, query_name)
+
 def generate_payload(query_name, variables) -> str:
     if query_name == "recv":
         return generate_recv_payload(variables)
+    query_name = resolve_query_name(query_name)
     payload = {
         "queryName": query_name,
         "variables": variables,

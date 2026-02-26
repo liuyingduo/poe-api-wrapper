@@ -1,0 +1,19 @@
+[project]
+name = "poe-api-wrapper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "beautifulsoup4>=4.14.3",
+    "httpx[http2]>=0.28.1",
+    "loguru>=0.7.3",
+    "nest-asyncio>=1.6.0",
+    "orjson>=3.11.7",
+    "quickjs>=1.19.4",
+    "requests-toolbelt>=1.0.0",
+    "rich==13.3.4",
+    "websocket>=0.2.1",
+    "websocket-client>=1.9.0",
+]

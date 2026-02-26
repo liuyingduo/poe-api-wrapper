@@ -4,8 +4,10 @@ import unittest, random, string, loguru
 loguru.logger.disable('poe_api_wrapper')
 
 p_b = input("Enter your p-b cookie: ")
-p_lat = input("Enter your p-lat cookie: ")
-TOKEN = {'p-b': p_b, 'p-lat': p_lat}
+p_lat = input("Enter your p-lat cookie (optional, press Enter to skip): ").strip()
+TOKEN = {'p-b': p_b}
+if p_lat:
+    TOKEN['p-lat'] = p_lat
 
 def testObjectGenerator(length):
        return ''.join(random.choice(string.ascii_letters) for _ in range(length))

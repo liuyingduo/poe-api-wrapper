@@ -8,3 +8,4 @@ playground/
 examples/
 langchain/
 Dockerfile
+.env
