@@ -4,13 +4,26 @@ from loguru import logger
 import quickjs
 import re
 
+try:
+    import execjs
+except ImportError:
+    execjs = None
+
 class PoeBundle:
-    form_key_pattern = r"window\.([a-zA-Z0-9]+)=function\(\)\{return window"
+    form_key_pattern = r"window\.([a-zA-Z0-9_]+)=function\(\)\{return window"
+    seeded_call_pattern = r'window\.([a-zA-Z0-9_]+)\(\s*["\']([^"\']{16,})["\']\s*\)'
     window_secret_pattern = r'let useFormkeyDecode=[\s\S]*?(window\.[\w]+="[^"]+")'
     static_pattern = r'static[^"]*\.js'
+    js_bootstrap = (
+        "var window = {document:{hack:1},navigator:{userAgent:'Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36'}};"
+        "var process = undefined;"
+        "var QuickJS = undefined;"
+    )
 
     def __init__(self, document: str):
-        self._window = "const window={document:{hack:1},navigator:{userAgent:'safari <3'}};"
+        self._window = self.js_bootstrap
         self._src_scripts = []
         self._webpack_script: str = None
 
@@ -69,15 +82,45 @@ class PoeBundle:
     def get_base_url(src: str) -> str:
         return src.split("static/")[0]
 
-    def get_form_key(self) -> str:
-        script = self._window
+    def _resolve_formkey_expression(self) -> str:
+        seeded_match = re.search(self.seeded_call_pattern, self._window)
+        if seeded_match:
+            function_name, seed = seeded_match.groups()
+            return f'window.{function_name}("{seed}")'
 
-        match = re.search(self.form_key_pattern, script)
-        if not (secret := match.group(1)):
-            raise RuntimeError("Failed to parse form-key function in Poe document")
-        
-        script += f'window.{secret}().slice(0, 32);'
+        match = re.search(self.form_key_pattern, self._window)
+        if match:
+            function_name = match.group(1)
+            return f"window.{function_name}()"
+
+        raise RuntimeError("Failed to parse form-key function in Poe document")
+
+    def _get_form_key_by_execjs(self, expression: str) -> str:
+        if execjs is None:
+            raise RuntimeError("PyExecJS is not installed")
+
+        script = (
+            self._window
+            + f"\nfunction __poe_formkey__(){{return String({expression}).slice(0, 32);}}"
+        )
+        context = execjs.compile(script)
+        return str(context.call("__poe_formkey__"))
+
+    def _get_form_key_by_quickjs(self, expression: str) -> str:
+        script = self._window + f"\nString({expression}).slice(0, 32);"
         context = quickjs.Context()
-        formkey = str(context.eval(script))
-        logger.info(f"Retrieved formkey successfully: {formkey}")
+        return str(context.eval(script))
+
+    def get_form_key(self) -> str:
+        expression = self._resolve_formkey_expression()
+
+        try:
+            formkey = self._get_form_key_by_execjs(expression)
+            logger.info(f"Retrieved formkey successfully via execjs: {formkey}")
+            return formkey
+        except Exception as execjs_error:
+            logger.warning(f"ExecJS formkey extraction failed: {execjs_error}")
+
+        formkey = self._get_form_key_by_quickjs(expression)
+        logger.info(f"Retrieved formkey successfully via quickjs fallback: {formkey}")
         return formkey

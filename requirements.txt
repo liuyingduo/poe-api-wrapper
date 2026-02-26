@@ -6,6 +6,7 @@ loguru
 rich==13.3.4
 beautifulsoup4
 quickjs
+PyExecJS
 nest-asyncio
 orjson
 aiofiles

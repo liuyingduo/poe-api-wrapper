@@ -138,6 +138,66 @@ class AsyncPoeApi:
                 logger.info(f"Connection failed with {proxies[p]}. Trying {p+1}/{len(proxies)} ...")
                 await asyncio.sleep(1)
 
+    def _extract_file_hash_jwt(self, raw_text: str):
+        token_pattern = re.compile(r"^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$")
+
+        def find_token(obj):
+            if isinstance(obj, str):
+                value = obj.strip().strip('"')
+                if token_pattern.match(value):
+                    return value
+                return None
+            if isinstance(obj, dict):
+                for key in ("fileHashJwt", "file_hash_jwt", "jwt", "token"):
+                    if key in obj:
+                        token = find_token(obj[key])
+                        if token:
+                            return token
+                for value in obj.values():
+                    token = find_token(value)
+                    if token:
+                        return token
+            if isinstance(obj, list):
+                for value in obj:
+                    token = find_token(value)
+                    if token:
+                        return token
+            return None
+
+        stripped = raw_text.strip()
+        if token_pattern.match(stripped.strip('"')):
+            return stripped.strip('"')
+
+        try:
+            parsed = orjson.loads(stripped)
+        except Exception:
+            return None
+
+        return find_token(parsed)
+
+    async def finish_upload(self, file_form: list) -> list:
+        file_hash_jwts = []
+        for file in file_form:
+            response = await self.client.post(
+                f"{self.BASE_URL}/api/finish_upload_POST",
+                files={"file": file},
+                follow_redirects=True,
+                timeout=30,
+            )
+            if response.status_code != 200:
+                preview = response.text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    f"finish_upload_POST failed. status_code:{response.status_code}, body_preview:{preview!r}"
+                )
+            file_hash_jwt = self._extract_file_hash_jwt(response.text)
+            if not file_hash_jwt:
+                preview = response.text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    f"Failed to parse fileHashJwt from finish_upload_POST response. body_preview:{preview!r}"
+                )
+            file_hash_jwts.append(file_hash_jwt)
+        return file_hash_jwts
+
     async def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False, ratelimit: int = 0):
         if ratelimit > 0:
             logger.warning(f"Waiting queue {ratelimit}/2 to avoid rate limit")
@@ -762,17 +822,19 @@ class AsyncPoeApi:
         if bot_input != bot:
             bot_candidates.append(bot_input)
         attachments = []
+        file_hash_jwts = []
         
         if file_path == []:
             apiPath = 'gql_POST'
             file_form = []
         else:
-            apiPath = 'gql_upload_POST'
+            apiPath = 'gql_POST'
             file_form, file_size = generate_file(file_path, self.proxies)
             if file_size > 350000000:
                 raise RuntimeError("File size too large. Please try again with a smaller file.")
             for i in range(len(file_form)):
                 attachments.append(f'file{i}')
+            file_hash_jwts = await self.finish_upload(file_form)
         
         msgPrice = None
         try:
@@ -795,14 +857,14 @@ class AsyncPoeApi:
                                 "chatNonce": generate_nonce(),
                                 "referencedMessageId": None,
                                 "parameters": None,
-                                "fileHashJwts": []
+                                "fileHashJwts": file_hash_jwts
                             }
                 message_data = None
                 send_error = None
                 for bot_candidate in bot_candidates:
                     try:
                         variables["bot"] = bot_candidate
-                        message_data = await self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                        message_data = await self.send_request(apiPath, 'SendMessageMutation', variables)
                         bot = bot_candidate
                         break
                     except Exception as e:
@@ -871,7 +933,7 @@ class AsyncPoeApi:
                             "chatNonce": generate_nonce(),
                             "referencedMessageId": None,
                             "parameters": None,
-                            "fileHashJwts": []
+                            "fileHashJwts": file_hash_jwts
                         }
             
             try:
@@ -880,7 +942,7 @@ class AsyncPoeApi:
                 for bot_candidate in bot_candidates:
                     try:
                         variables["bot"] = bot_candidate
-                        message_data = await self.send_request(apiPath, 'SendMessageMutation', variables, file_form)
+                        message_data = await self.send_request(apiPath, 'SendMessageMutation', variables)
                         bot = bot_candidate
                         break
                     except Exception as e:

@@ -25,11 +25,21 @@ def load_dotenv(path: str = ".env") -> None:
 
 load_dotenv()
 
+
+def parse_env_list(var_name: str, sep: str = "|") -> list[str]:
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(sep) if item.strip()]
+
+
 tokens = {
     "p-b": os.environ["POE_P_B"],
-    "formkey": os.environ["POE_FORMKEY"],
     "cf_clearance": os.environ["POE_CF_CLEARANCE"],
 }
+
+if os.environ.get("POE_FORMKEY"):
+    tokens["formkey"] = os.environ["POE_FORMKEY"]
 
 if os.environ.get("POE_CF_BM"):
     tokens["__cf_bm"] = os.environ["POE_CF_BM"]
@@ -51,8 +61,12 @@ headers = {
 client = PoeApi(tokens=tokens, headers=headers)
 bot_name = os.environ.get("POE_BOT", "Assistant")
 prompt = os.environ.get("POE_PROMPT", "Hello, reply with one short line to confirm test success.")
+file_paths = parse_env_list("POE_FILES")
 
-for chunk in client.send_message(bot=bot_name, message=prompt):
+if file_paths:
+    print(f"Uploading {len(file_paths)} file(s)...")
+
+for chunk in client.send_message(bot=bot_name, message=prompt, file_path=file_paths):
     print(chunk.get("response", ""), end="", flush=True)
 
 print("\n\nDone")
