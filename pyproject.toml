@@ -26,4 +26,5 @@ dependencies = [
     "websocket-client>=1.9.0",
     "openai>=2.24.0",
     "tzdata>=2025.3",
+    "python-multipart>=0.0.22",
 ]

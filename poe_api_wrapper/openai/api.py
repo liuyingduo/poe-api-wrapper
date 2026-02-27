@@ -13,11 +13,12 @@ from urllib.parse import urlparse
 
 import orjson
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from starlette.responses import JSONResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from httpx import AsyncClient
 from loguru import logger
 
@@ -1329,15 +1330,51 @@ async def create_images(
 @app.api_route("/v1/images/edits", methods=["POST", "OPTIONS"], response_model=None)
 async def edit_images(
     request: Request,
-    data: ImagesEditData,
     _auth: None = Depends(require_service_auth),
 ) -> JSONResponse:
     runtime = _runtime()
-    image, prompt, model, n, size = data.image, data.prompt, data.model, data.n, data.size
+    content_type = (request.headers.get("content-type") or "").lower()
+    form_keys: List[str] = []
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        form_keys = [str(k) for k in form.keys()]
+        image = form.get("image")
+        if image is None:
+            images = form.getlist("image")
+            image = images[0] if images else None
+        if image is None:
+            image = form.get("image[]")
+        if image is None:
+            images = form.getlist("image[]")
+            image = images[0] if images else None
+        if image is None:
+            for key, value in form.multi_items():
+                if key.startswith("image") and isinstance(value, (UploadFile, StarletteUploadFile)):
+                    image = value
+                    break
+
+        prompt = form.get("prompt")
+        model = form.get("model")
+        raw_n = form.get("n", 1)
+        raw_size = form.get("size", "1024x1024")
+        try:
+            n = int(raw_n)
+        except Exception:
+            _openai_http_error(400, "invalid_request_error", "Invalid n value")
+        size = raw_size if isinstance(raw_size, str) else "1024x1024"
+    else:
+        payload = await request.json()
+        data = ImagesEditData(**payload)
+        image, prompt, model, n, size = data.image, data.prompt, data.model, data.n, data.size
+
     request.state.model = model
 
-    if not (isinstance(image, str) and (os.path.exists(image) or image.startswith("http"))):
-        _openai_http_error(400, "invalid_request_error", "Invalid image input")
+    if not isinstance(image, (str, UploadFile, StarletteUploadFile)):
+        debug_suffix = ""
+        if form_keys:
+            debug_suffix = f"; form_keys={form_keys}; image_type={type(image).__name__}"
+        _openai_http_error(400, "invalid_request_error", f"Invalid image input{debug_suffix}")
     if not isinstance(prompt, str):
         _openai_http_error(400, "invalid_request_error", "Invalid prompt")
     if model not in app.state.models:
@@ -1371,11 +1408,30 @@ async def edit_images(
     edit_attachment = image
     edit_temp_files: List[str] = []
     try:
-        if isinstance(image, str) and image.lower().startswith(("http://", "https://")):
-            materialized_paths, edit_temp_files = await _materialize_remote_attachments([image])
+        if isinstance(image, (UploadFile, StarletteUploadFile)):
+            suffix = Path(image.filename or "").suffix
+            if not suffix:
+                ctype = (image.content_type or "").split(";", 1)[0].strip().lower()
+                suffix = _guess_suffix_from_content_type(ctype) or ".jpg"
+            fd, tmp_path = tempfile.mkstemp(prefix="poe_edit_", suffix=suffix)
+            with os.fdopen(fd, "wb") as tmp:
+                while True:
+                    chunk = await image.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+            edit_temp_files.append(tmp_path)
+            edit_attachment = tmp_path
+        elif isinstance(image, str) and image.lower().startswith(("http://", "https://")):
+            materialized_paths, remote_temp_files = await _materialize_remote_attachments([image])
             if not materialized_paths:
                 _openai_http_error(400, "invalid_request_error", "Failed to materialize edit image")
+            edit_temp_files.extend(remote_temp_files)
             edit_attachment = materialized_paths[0]
+        elif isinstance(image, str):
+            if not os.path.exists(image):
+                _openai_http_error(400, "invalid_request_error", "Invalid image input")
+            edit_attachment = image
 
         client = await runtime.pool.get_client(account_doc)
         response = await image_handler(base_model, prompt, tokens_limit)
