@@ -165,7 +165,20 @@ def generate_file(file_path: list, proxy: dict=None):
             if not content_type:
                 raise RuntimeError("This file type is not supported. Please try again with a different file.")
             logger.info(f"Downloading file from {file}")
-            with Client(proxies=proxy, http2=True) as fetcher:
+            # httpx changed proxy kwarg across versions (proxy vs proxies).
+            # Build client in a version-compatible way.
+            client_kwargs = {"http2": True}
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            try:
+                fetcher = Client(**client_kwargs)
+            except TypeError:
+                if "proxy" in client_kwargs:
+                    legacy_kwargs = {"http2": True, "proxies": client_kwargs["proxy"]}
+                    fetcher = Client(**legacy_kwargs)
+                else:
+                    raise
+            with fetcher:
                 response = fetcher.get(file)
                 file_data = response.content
             files.append((file_name, file_data, content_type))

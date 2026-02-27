@@ -782,7 +782,9 @@ class AccountHealthRefresher:
                 settings = await client.get_settings()
                 message_info = settings.get("messagePointInfo", {})
                 subscription = settings.get("subscription", {})
-                balance = int(message_info.get("messagePointBalance", 0) or 0)
+                balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+                    message_info.get("addonPointBalance", 0) or 0
+                )
                 subscription_active = bool(subscription.get("isActive", False))
                 await self.repo.update_account_health(
                     account_id,

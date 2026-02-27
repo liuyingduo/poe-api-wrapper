@@ -26,7 +26,7 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
         
 image_input = client.chat.completions.create(
-    model="claude-instant",
+    model="GPT-4o",
     messages=[
         {
             "role": "user",

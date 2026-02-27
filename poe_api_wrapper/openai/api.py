@@ -1,11 +1,14 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import mimetypes
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import orjson
 import uvicorn
@@ -53,6 +56,7 @@ from poe_api_wrapper.openai.type import (
 )
 
 DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_TOKENS = 128000
 
 app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
 app.add_middleware(
@@ -125,6 +129,10 @@ def _require_env(name: str) -> str:
 
 def _split_csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _model_tokens(meta: dict[str, Any]) -> int:
+    return int(meta.get("tokens", DEFAULT_MODEL_TOKENS) or DEFAULT_MODEL_TOKENS)
 
 
 @dataclass
@@ -476,7 +484,7 @@ async def list_models(
                 "object": "model",
                 "created": await helpers.__generate_timestamp(),
                 "owned_by": meta["owned_by"],
-                "tokens": meta["tokens"],
+                "tokens": _model_tokens(meta),
                 "endpoints": meta["endpoints"],
             }
         )
@@ -487,7 +495,7 @@ async def list_models(
             "object": "model",
             "created": await helpers.__generate_timestamp(),
             "owned_by": values["owned_by"],
-            "tokens": values["tokens"],
+            "tokens": _model_tokens(values),
             "endpoints": values["endpoints"],
         }
         for model_name, values in app.state.models.items()
@@ -559,6 +567,93 @@ async def message_handler(
         return {"bot": base_model, "message": message}
     except Exception as exc:
         _openai_http_error(400, "invalid_request_error", f"Failed to process messages: {exc}")
+
+
+def _guess_suffix_from_url(url: str) -> str:
+    path = urlparse(url).path or ""
+    suffix = Path(path).suffix.lower()
+    return suffix if suffix else ""
+
+
+def _guess_suffix_from_content_type(content_type: str) -> str:
+    if not content_type:
+        return ""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    guessed = mimetypes.guess_extension(media_type) or ""
+    if guessed == ".jpe":
+        return ".jpg"
+    return guessed
+
+
+def _cleanup_temp_files(paths: List[str]) -> None:
+    for file_path in paths:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            logger.warning("Failed to remove temp file: {}", file_path)
+
+
+async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[str], List[str]]:
+    if not attachments:
+        return [], []
+
+    resolved_paths: List[str] = []
+    temp_files: List[str] = []
+    remote_urls = [
+        item
+        for item in attachments
+        if isinstance(item, str) and item.lower().startswith(("http://", "https://"))
+    ]
+
+    if not remote_urls:
+        return list(attachments), []
+
+    remote_to_local: dict[str, str] = {}
+    try:
+        async with AsyncClient(http2=True, timeout=30, follow_redirects=True) as fetcher:
+            for remote_url in remote_urls:
+                resp = await fetcher.get(
+                    remote_url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "image/*,*/*;q=0.8",
+                    },
+                )
+                if resp.status_code >= 400:
+                    _openai_http_error(
+                        400,
+                        "invalid_request_error",
+                        f"Failed to download image_url: {remote_url} (HTTP {resp.status_code})",
+                    )
+
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if not content_type.startswith("image/"):
+                    _openai_http_error(
+                        400,
+                        "invalid_request_error",
+                        f"image_url must point to an image resource, got Content-Type={content_type or 'unknown'}",
+                    )
+
+                suffix = _guess_suffix_from_content_type(content_type) or _guess_suffix_from_url(remote_url) or ".jpg"
+                fd, tmp_path = tempfile.mkstemp(prefix="poe_img_", suffix=suffix)
+                with os.fdopen(fd, "wb") as tmp:
+                    tmp.write(resp.content)
+                temp_files.append(tmp_path)
+                remote_to_local[remote_url] = tmp_path
+    except Exception:
+        _cleanup_temp_files(temp_files)
+        raise
+
+    for item in attachments:
+        if isinstance(item, str) and item in remote_to_local:
+            resolved_paths.append(remote_to_local[item])
+        else:
+            resolved_paths.append(item)
+    return resolved_paths, temp_files
 
 
 async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
@@ -641,7 +736,8 @@ async def generate_chunks(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: List[str],
+    attachment_paths: List[str],
+    temp_files: List[str],
     max_tokens: Optional[int],
     include_usage: bool,
     raw_tool_calls: Optional[list[dict[str, Any]]],
@@ -661,7 +757,7 @@ async def generate_chunks(
             async for chunk in client.send_message(
                 bot=response["bot"],
                 message=response["message"],
-                file_path=image_urls,
+                file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
             ):
@@ -734,6 +830,7 @@ async def generate_chunks(
         if not emitted_done:
             yield b"data: [DONE]\n\n"
     finally:
+        _cleanup_temp_files(temp_files)
         runtime.refresher.schedule_refresh(account_id)
         await lease.release()
 
@@ -746,7 +843,8 @@ async def streaming_response(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: List[str],
+    attachment_paths: List[str],
+    temp_files: List[str],
     max_tokens: Optional[int],
     include_usage: bool,
     raw_tool_calls: Optional[list[dict[str, Any]]],
@@ -765,7 +863,8 @@ async def streaming_response(
             model=model,
             completion_id=completion_id,
             prompt_tokens=prompt_tokens,
-            image_urls=image_urls,
+            attachment_paths=attachment_paths,
+            temp_files=temp_files,
             max_tokens=max_tokens,
             include_usage=include_usage,
             raw_tool_calls=raw_tool_calls,
@@ -789,7 +888,8 @@ async def non_streaming_response(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: List[str],
+    attachment_paths: List[str],
+    temp_files: List[str],
     max_tokens: Optional[int],
     raw_tool_calls: Optional[list[dict[str, Any]]],
     chat_code: Optional[str],
@@ -805,7 +905,7 @@ async def non_streaming_response(
             async for chunk in client.send_message(
                 bot=response["bot"],
                 message=response["message"],
-                file_path=image_urls,
+                file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
             ):
@@ -874,6 +974,7 @@ async def non_streaming_response(
         payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
         raise HTTPException(status_code=status, detail=payload)
     finally:
+        _cleanup_temp_files(temp_files)
         runtime.refresher.schedule_refresh(account_id)
         await lease.release()
 
@@ -970,7 +1071,7 @@ async def _chat_completions_impl(
     include_usage = stream_options.get("include_usage", False) if stream_options else False
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
-    tokens_limit = model_data["tokens"]
+    tokens_limit = _model_tokens(model_data)
     endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
 
@@ -1039,6 +1140,22 @@ async def _chat_completions_impl(
 
     completion_id = await helpers.__generate_completion_id()
 
+    attachment_paths: List[str] = []
+    temp_files: List[str] = []
+    if not raw_tool_calls and image_urls:
+        try:
+            attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
+        except HTTPException:
+            await lease.release()
+            raise
+        except Exception as exc:
+            await lease.release()
+            _openai_http_error(
+                400,
+                "invalid_request_error",
+                f"Failed to process image_url attachments: {exc}",
+            )
+
     if streaming:
         return await streaming_response(
             runtime=runtime,
@@ -1047,7 +1164,8 @@ async def _chat_completions_impl(
             model=model,
             completion_id=completion_id,
             prompt_tokens=prompt_tokens,
-            image_urls=image_urls,
+            attachment_paths=attachment_paths,
+            temp_files=temp_files,
             max_tokens=max_tokens,
             include_usage=include_usage,
             raw_tool_calls=raw_tool_calls,
@@ -1066,7 +1184,8 @@ async def _chat_completions_impl(
         model=model,
         completion_id=completion_id,
         prompt_tokens=prompt_tokens,
-        image_urls=image_urls,
+        attachment_paths=attachment_paths,
+        temp_files=temp_files,
         max_tokens=max_tokens,
         raw_tool_calls=raw_tool_calls,
         chat_code=chat_code,
@@ -1105,7 +1224,7 @@ async def create_images(
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
-    tokens_limit = model_data["tokens"]
+    tokens_limit = _model_tokens(model_data)
     endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
     if "/v1/images/generations" not in endpoints:
@@ -1188,7 +1307,7 @@ async def edit_images(
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
-    tokens_limit = model_data["tokens"]
+    tokens_limit = _model_tokens(model_data)
     endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
     if "/v1/images/edits" not in endpoints:
@@ -1207,13 +1326,21 @@ async def edit_images(
         await lease.release()
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
+    edit_attachment = image
+    edit_temp_files: List[str] = []
     try:
+        if isinstance(image, str) and image.lower().startswith(("http://", "https://")):
+            materialized_paths, edit_temp_files = await _materialize_remote_attachments([image])
+            if not materialized_paths:
+                _openai_http_error(400, "invalid_request_error", "Failed to materialize edit image")
+            edit_attachment = materialized_paths[0]
+
         client = await runtime.pool.get_client(account_doc)
         response = await image_handler(base_model, prompt, tokens_limit)
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio, [image])
+            image_generation = await generate_image(client, response, aspect_ratio, [edit_attachment])
             urls.extend([url for url in image_generation.split() if url.startswith("https://")])
             if len(urls) >= n:
                 break
@@ -1238,6 +1365,7 @@ async def edit_images(
         payload, status = await _account_error_payload(runtime, account_id, "ephemeral", False, exc)
         raise HTTPException(status_code=status, detail=payload)
     finally:
+        _cleanup_temp_files(edit_temp_files)
         runtime.refresher.schedule_refresh(account_id)
         await lease.release()
 

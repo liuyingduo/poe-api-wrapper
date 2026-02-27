@@ -1,6 +1,6 @@
 from httpx import AsyncClient, ConnectError, ReadTimeout
 import asyncio, orjson, random, ssl, threading, websocket, string, secrets, os, hashlib, re, aiofiles, uuid
-from typing import  AsyncIterator
+from typing import AsyncIterator, Optional
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
 
@@ -52,10 +52,12 @@ class AsyncPoeApi:
         self.current_thread: dict[str, list] = {}
         self.retry_attempts: int = 3
         self.ws_refresh: int = 3
+        self.ws_heartbeat_interval: int = 25
         self.groups: dict = {}
         self.proxies: dict = {}
         self.bundle: PoeBundle = None
         self.loop: asyncio.AbstractEventLoop = None
+        self._ws_heartbeat_task: Optional[asyncio.Task] = None
         
         self.client = AsyncClient(headers=self.HEADERS.copy(), timeout=60, http2=True)
         if headers:
@@ -308,7 +310,11 @@ class AsyncPoeApi:
             
     def ws_run_thread(self):
         if self.ws and not self.ws.sock:
-            kwargs = {"sslopt": {"cert_reqs": ssl.CERT_NONE}}
+            kwargs = {
+                "sslopt": {"cert_reqs": ssl.CERT_NONE},
+                "ping_interval": 20,
+                "ping_timeout": 10,
+            }
             try:
                 self.ws.run_forever(**kwargs)
             except Exception as e:
@@ -375,10 +381,12 @@ class AsyncPoeApi:
                 self.ws_error = True
                 self.ws.close()
                 raise RuntimeError("Timed out waiting for websocket to connect.")
+        self._start_ws_heartbeat()
 
     def disconnect_ws(self):
         self.ws_connecting = False
         self.ws_connected = False
+        self._schedule_stop_ws_heartbeat()
         if self.ws:
             self.ws.close()
             logger.info("Websocket connection closed.")
@@ -386,10 +394,12 @@ class AsyncPoeApi:
     def on_ws_connect(self, ws):
         self.ws_connecting = False
         self.ws_connected = True
+        self._schedule_start_ws_heartbeat()
 
     def on_ws_close(self, ws, close_status_code, close_message):
         self.ws_connecting = False
         self.ws_connected = False
+        self._schedule_stop_ws_heartbeat()
         if self.ws_error:
             logger.warning("Connection to remote host was lost. Reconnecting...")
             self.ws_error = False
@@ -399,10 +409,64 @@ class AsyncPoeApi:
         self.ws_connecting = False
         self.ws_connected = False
         self.ws_error = True
+        self._schedule_stop_ws_heartbeat()
+
+    def _start_ws_heartbeat(self):
+        if not self.loop or not self.loop.is_running():
+            return
+        if self._ws_heartbeat_task and not self._ws_heartbeat_task.done():
+            return
+        self._ws_heartbeat_task = self.loop.create_task(self._ws_heartbeat_loop())
+
+    def _stop_ws_heartbeat(self):
+        task = self._ws_heartbeat_task
+        self._ws_heartbeat_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_start_ws_heartbeat(self):
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self._start_ws_heartbeat)
+        else:
+            self._start_ws_heartbeat()
+
+    def _schedule_stop_ws_heartbeat(self):
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self._stop_ws_heartbeat)
+        else:
+            self._stop_ws_heartbeat()
+
+    async def _ws_heartbeat_loop(self):
+        try:
+            while self.ws_connected and not self.ws_error:
+                await asyncio.sleep(self.ws_heartbeat_interval)
+                if not self.ws_connected or self.ws_error:
+                    break
+                ws = getattr(self, "ws", None)
+                if not ws or not ws.sock:
+                    continue
+                try:
+                    ws.send('{"type":"ping"}')
+                except Exception as exc:
+                    logger.debug(f"Failed to send websocket heartbeat ping. Reason: {exc}")
+                    break
+        except asyncio.CancelledError:
+            pass
 
     def on_message(self, ws, msg):
         try:
             ws_data = orjson.loads(msg)
+
+            if isinstance(ws_data, dict):
+                message_type = ws_data.get("type")
+                if message_type == "ping":
+                    try:
+                        ws.send('{"type":"pong"}')
+                    except Exception as exc:
+                        logger.debug(f"Failed to reply websocket pong. Reason: {exc}")
+                    return
+                if message_type == "pong":
+                    return
 
             if "error" in ws_data.keys() and ws_data["error"] == "missed_messages":
                 self.refresh_ws()
@@ -494,9 +558,16 @@ class AsyncPoeApi:
         response_json = await self.send_request('gql_POST', 'SettingsPageQuery', {})
         if response_json['data'] == None and response_json["errors"]:
             raise RuntimeError(f'Failed to get settings. Raw response data: {response_json}')
+        viewer = response_json.get("data", {}).get("viewer", {})
+        message_info = dict(viewer.get("messagePointInfo") or {})
+        message_info["subscriptionPointBalance"] = int(message_info.get("subscriptionPointBalance", 0) or 0)
+        message_info["addonPointBalance"] = int(message_info.get("addonPointBalance", 0) or 0)
+        message_info["totalPointBalance"] = (
+            message_info["subscriptionPointBalance"] + message_info["addonPointBalance"]
+        )
         return {
-            "subscription": response_json["data"]["viewer"]["subscription"],
-            "messagePointInfo": response_json["data"]["viewer"]["messagePointInfo"]
+            "subscription": viewer.get("subscription"),
+            "messagePointInfo": message_info
         }
     
     async def get_available_bots(self, count: int=25, get_all: bool=False):
