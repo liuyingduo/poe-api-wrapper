@@ -55,9 +55,9 @@ client = openai.OpenAI(
 
 images_url = client.images.generate(
   model="playground-v2.5",
-  prompt="A cute baby sea otter",
+  prompt="A little girl",
   n=1, # The number of images to generate
-  size="auto"
+  size="16:9"
 )
 
 print(images_url)
