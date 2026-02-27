@@ -59,6 +59,11 @@ from poe_api_wrapper.openai.type import (
 
 DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_TOKENS = 128000
+DEFAULT_MODEL_ENDPOINTS = [
+    "/v1/chat/completions",
+    "/v1/images/generations",
+    "/v1/images/edits",
+]
 
 app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
 app.add_middleware(
@@ -135,6 +140,13 @@ def _split_csv(raw: str) -> list[str]:
 
 def _model_tokens(meta: dict[str, Any]) -> int:
     return int(meta.get("tokens", DEFAULT_MODEL_TOKENS) or DEFAULT_MODEL_TOKENS)
+
+
+def _model_endpoints(meta: dict[str, Any]) -> list[str]:
+    endpoints = meta.get("endpoints")
+    if isinstance(endpoints, list) and endpoints:
+        return endpoints
+    return DEFAULT_MODEL_ENDPOINTS
 
 
 @dataclass
@@ -499,7 +511,7 @@ async def list_models(
                 "created": await helpers.__generate_timestamp(),
                 "owned_by": meta["owned_by"],
                 "tokens": _model_tokens(meta),
-                "endpoints": meta["endpoints"],
+                "endpoints": _model_endpoints(meta),
             }
         )
 
@@ -510,7 +522,7 @@ async def list_models(
             "created": await helpers.__generate_timestamp(),
             "owned_by": values["owned_by"],
             "tokens": _model_tokens(values),
-            "endpoints": values["endpoints"],
+            "endpoints": _model_endpoints(values),
         }
         for model_name, values in app.state.models.items()
     ]
@@ -1125,11 +1137,7 @@ async def _chat_completions_impl(
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
-    endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
-
-    if "/v1/chat/completions" not in endpoints:
-        _openai_http_error(400, "invalid_request_error", "This model does not support chat completions")
 
     session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
     request.state.session_id = session_id
@@ -1273,10 +1281,7 @@ async def create_images(
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
-    endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
-    if "/v1/images/generations" not in endpoints:
-        _openai_http_error(400, "invalid_request_error", "Model does not support image generation")
 
     try:
         account_doc, lease = await runtime.selector.select_account()
@@ -1387,10 +1392,7 @@ async def edit_images(
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
-    endpoints = model_data["endpoints"]
     premium_model = bool(model_data.get("premium_model", False))
-    if "/v1/images/edits" not in endpoints:
-        _openai_http_error(400, "invalid_request_error", "Model does not support image edits")
 
     try:
         account_doc, lease = await runtime.selector.select_account()
