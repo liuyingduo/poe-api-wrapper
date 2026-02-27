@@ -1,7 +1,6 @@
-from httpx import AsyncClient, ConnectError, ReadTimeout, ConnectTimeout, ProxyError
-import asyncio, orjson, random, ssl, threading, websocket, string, secrets, os, hashlib, re, aiofiles, uuid
+from httpx import AsyncClient
+import asyncio, orjson, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid
 from typing import AsyncIterator, Optional
-from urllib.parse import urlparse, unquote
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
 
@@ -21,9 +20,6 @@ from .utils import (
                     )
 from .queries import generate_payload, resolve_query_name
 from .bundles import PoeBundle
-from .proxies import PROXY
-if PROXY:
-    from .proxies import fetch_proxy
 
 """
 This API is modified and maintained by @snowby666
@@ -47,9 +43,7 @@ class AsyncPoeApi:
         self.client = None
         if 'p-b' not in tokens:
             raise ValueError("Please provide a valid p-b cookie")
-        
-        self.proxy: list = proxy
-        self.auto_proxy: bool = auto_proxy
+
         self.tokens: dict = tokens
         self.formkey: str = ""
         self.ws_connecting: bool = False
@@ -67,10 +61,7 @@ class AsyncPoeApi:
         self.loop: asyncio.AbstractEventLoop = None
         self._ws_heartbeat_task: Optional[asyncio.Task] = None
         self._extra_headers = headers or {}
-        env_retry_limit = os.getenv("POE_REQUEST_RETRY_LIMIT", "4").strip()
-        self.request_retry_limit: int = request_retry_limit if request_retry_limit is not None else int(env_retry_limit or "4")
-        self.request_retry_limit = max(1, self.request_retry_limit)
-        
+
         self.client = self._build_http_client()
         if 'formkey' in tokens:
             self.formkey = tokens['formkey']
@@ -82,26 +73,13 @@ class AsyncPoeApi:
                 'Poe-Revision': tokens['poe-revision'],
             })
 
-    def _proxy_to_url(self, proxy_item) -> str:
-        if isinstance(proxy_item, str):
-            return proxy_item.strip()
-        if isinstance(proxy_item, dict):
-            return str(proxy_item.get("http://") or proxy_item.get("https://") or "").strip()
-        return ""
-
-    def _build_http_client(self, proxy_url: str = "") -> AsyncClient:
+    def _build_http_client(self) -> AsyncClient:
         kwargs = {
             "headers": self.HEADERS.copy(),
-            "timeout": 60,
+            "timeout": None,
             "http2": True,
         }
-        if proxy_url:
-            try:
-                client = AsyncClient(proxy=proxy_url, **kwargs)
-            except TypeError:
-                client = AsyncClient(proxies=proxy_url, **kwargs)
-        else:
-            client = AsyncClient(**kwargs)
+        client = AsyncClient(**kwargs)
 
         if self._extra_headers:
             client.headers.update(self._extra_headers)
@@ -118,33 +96,10 @@ class AsyncPoeApi:
             client.headers.update({'Poe-Revision': self.tokens['poe-revision']})
         return client
 
-    def _ws_proxy_kwargs(self) -> dict:
-        if not self.proxies:
-            return {}
-        try:
-            parsed = urlparse(self.proxies)
-            if not parsed.hostname:
-                return {}
-            kwargs = {
-                "http_proxy_host": parsed.hostname,
-                "http_proxy_port": parsed.port or (443 if parsed.scheme == "https" else 80),
-            }
-            if parsed.username:
-                kwargs["http_proxy_auth"] = (unquote(parsed.username), unquote(parsed.password or ""))
-            return kwargs
-        except Exception:
-            return {}
-        
     async def create(self):
         if self.formkey == "":
             await self.load_bundle()
-        
-        if self.proxy != [] or self.auto_proxy == True:
-            await self.select_proxy(self.proxy, auto_proxy=self.auto_proxy)
-        elif self.proxy == [] and self.auto_proxy == False:
-            await self.connect_ws() 
-        else:
-            raise ValueError("Please provide a valid proxy list or set auto_proxy to False")
+        await self.connect_ws()
         
         logger.info("Async instance created")
 
@@ -166,33 +121,6 @@ class AsyncPoeApi:
             logger.error(f"Failed to load bundle. Reason: {e}")
             logger.warning("Failed to get formkey from bundle. Please provide a valid formkey manually." if self.formkey == "" else "Continuing with provided formkey")
         
-    async def select_proxy(self, proxy: list, auto_proxy: bool=False):
-        if proxy == [] and auto_proxy == True:
-            if not PROXY:
-                raise ValueError("Please install ballyregan for auto proxy")
-            proxies = fetch_proxy()
-        elif proxy != [] and auto_proxy == False:
-            if isinstance(proxy, list):
-                proxies = proxy
-            else:
-                proxies = [proxy]
-        else:
-            raise ValueError("Please provide a valid proxy list or set auto_proxy to False")
-        for p in range(len(proxies)):
-            try:
-                proxy_url = self._proxy_to_url(proxies[p])
-                if not proxy_url:
-                    raise ValueError("Invalid proxy value")
-                self.proxies = proxy_url
-                await self.client.aclose()
-                self.client = self._build_http_client(proxy_url)
-                await self.connect_ws()
-                logger.info(f"Connection established with proxy #{p+1}")
-                break
-            except:
-                logger.info(f"Connection failed with {proxies[p]}. Trying {p+1}/{len(proxies)} ...")
-                await asyncio.sleep(1)
-
     def _extract_file_hash_jwt(self, raw_text: str):
         token_pattern = re.compile(r"^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$")
 
@@ -237,7 +165,6 @@ class AsyncPoeApi:
                 f"{self.BASE_URL}/api/finish_upload_POST",
                 files={"file": file},
                 follow_redirects=True,
-                timeout=30,
             )
             if response.status_code != 200:
                 preview = response.text[:300].replace("\n", " ")
@@ -253,10 +180,7 @@ class AsyncPoeApi:
             file_hash_jwts.append(file_hash_jwt)
         return file_hash_jwts
 
-    async def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False, ratelimit: int = 0):
-        if ratelimit > 0:
-            logger.warning(f"Waiting queue {ratelimit}/2 to avoid rate limit")
-            await asyncio.sleep(random.randint(2, 3))
+    async def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False):
         status_code = 0
         resolved_query_name = resolve_query_name(query_name)
         
@@ -283,19 +207,10 @@ class AsyncPoeApi:
                 "poe-queryname": resolved_query_name,
                 "poegraphql": "1",
             })
-            response = await self.client.post(f'{self.BASE_URL}/api/{path}', data=payload, headers=headers, follow_redirects=True, timeout=30)
+            response = await self.client.post(f'{self.BASE_URL}/api/{path}', data=payload, headers=headers, follow_redirects=True)
             
             status_code = response.status_code
             
-            if status_code == 403:
-                if ratelimit < self.request_retry_limit:
-                    logger.warning(
-                        f"Received 403 status code, retrying... (attempt {ratelimit + 1}/{self.request_retry_limit})"
-                    )
-                    return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
-                else:
-                    raise Exception(f"Max retries reached after receiving 403 status code")
-
             if not response.text:
                 raise Exception(f"Empty response with status code {status_code}")
 
@@ -331,34 +246,13 @@ class AsyncPoeApi:
                 return json_data
             
         except Exception as e:
-            if isinstance(e, ReadTimeout):
-                if query_name == "SendMessageMutation":
-                    logger.error(f"Failed to send message {variables['query']} due to ReadTimeout")
-                    raise e
-                else:
-                    if ratelimit < self.request_retry_limit:
-                        logger.warning(
-                            f"Automatic retrying request {query_name} due to ReadTimeout ({ratelimit + 1}/{self.request_retry_limit})"
-                        )
-                        return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
-                    logger.error(f"ReadTimeout retries exhausted for request {query_name}")
-                    raise e
-
-            if (
-                isinstance(e, (ConnectError, ConnectTimeout, ProxyError)) or 500 <= status_code < 600
-            ) and ratelimit < self.request_retry_limit:
-                logger.warning(
-                    f"Retrying request {query_name} after network/provider error ({ratelimit + 1}/{self.request_retry_limit}): {e}"
-                )
-                return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
-
             error_code = f"status_code:{status_code}, " if status_code else ""
             raise Exception(
                 f"Sending request {query_name} failed. {error_code} Error log: {repr(e)}"
             )
     
     async def get_channel_settings(self):
-        response = await self.client.get(f'{self.BASE_URL}/api/settings', headers=self.HEADERS, follow_redirects=True, timeout=30)
+        response = await self.client.get(f'{self.BASE_URL}/api/settings', headers=self.HEADERS, follow_redirects=True)
         response_json = orjson.loads(response.text)
         self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
         self.tchannel_data = response_json["tchannelData"]
@@ -378,7 +272,6 @@ class AsyncPoeApi:
                 "ping_interval": 20,
                 "ping_timeout": 10,
             }
-            kwargs.update(self._ws_proxy_kwargs())
             try:
                 self.ws.run_forever(**kwargs)
             except Exception as e:
@@ -389,7 +282,7 @@ class AsyncPoeApi:
                 # "RuntimeError: Cannot close a running event loop".
                 pass
              
-    async def connect_ws(self, timeout=20):
+    async def connect_ws(self):
          
         if self.ws_connected:
             return
@@ -435,16 +328,8 @@ class AsyncPoeApi:
         t = threading.Thread(target=self.ws_run_thread, daemon=True)
         t.start()
 
-        timer = 0
         while not self.ws_connected:
             await asyncio.sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                self.ws_connecting = False
-                self.ws_connected = False
-                self.ws_error = True
-                self.ws.close()
-                raise RuntimeError("Timed out waiting for websocket to connect.")
         self._start_ws_heartbeat()
 
     def disconnect_ws(self):
@@ -799,27 +684,54 @@ class AsyncPoeApi:
             raise ValueError(
                 f"Bot {handle} not found. Make sure the bot exists before creating new chat."
             )
-        botData = response_json['data']['bot']
+        root_data = response_json["data"]
+        botData = root_data["bot"]
+        viewer = root_data["viewer"]
+
+        custom_ui_raw = botData.get("customUIDefinition")
+        custom_ui = orjson.loads(custom_ui_raw) if isinstance(custom_ui_raw, str) and custom_ui_raw else None
+
+        file_upload_limits_raw = viewer.get("fileUploadSizeLimits")
+        file_upload_limits = (
+            orjson.loads(file_upload_limits_raw)
+            if isinstance(file_upload_limits_raw, str) and file_upload_limits_raw
+            else None
+        )
+
         data = {
-                'handle': botData['handle'],
-                'model':botData['model'],
-                'supportsFileUpload': botData['supportsFileUpload'], 
-                'messageTimeoutSecs': botData['messageTimeoutSecs'], 
-                # 'displayMessagePointPrice': botData['messagePointLimit']['displayMessagePointPrice'], deprecated
-                # 'numRemainingMessages': botData['messagePointLimit']['numRemainingMessages'], deprecated
-                'viewerIsCreator': botData['viewerIsCreator'],
-                'id': botData['id'],
+                'handle': botData["handle"],
+                'displayName': botData["displayName"],
+                'model': botData["model"],
+                'supportsFileUpload': bool(botData["supportsFileUpload"]),
+                'allowsImageAttachments': bool(botData["allowsImageAttachments"]),
+                'uploadFileSizeLimit': botData["uploadFileSizeLimit"],
+                'messageTimeoutSecs': botData["messageTimeoutSecs"],
+                'canUserAccessBot': bool(botData["canUserAccessBot"]),
+                'noAccessMessage': botData.get("noAccessMessage"),
+                'limitedAccessType': botData.get("limitedAccessType"),
+                'isApiBot': bool(botData["isApiBot"]),
+                'isOfficialBot': bool(botData["isOfficialBot"]),
+                'isDown': bool(botData["isDown"]),
+                'isServerBot': bool(botData.get("isServerBot", False)),
+                'viewerIsCreator': bool(botData["viewerIsCreator"]),
+                'id': botData["id"],
+                'botId': botData["botId"],
+                'description': botData.get("description"),
+                'customUIDefinition': custom_ui,
+                'customUIDefinitionRaw': custom_ui_raw,
+                'submitMessageParamsAsDict': bool(viewer["submitMessageParamsAsDict"]),
+                'shouldUseFinishUploadEndpoint': bool(viewer["shouldUseFinishUploadEndpoint"]),
+                'shouldUsePresignedUrl': bool(viewer["shouldUsePresignedUrl"]),
+                'fileUploadSizeLimits': file_upload_limits,
+                'supportedPreviewsContentTypes': root_data.get("supportedPreviewsContentTypes", []),
+                'supportedExecutableLanguages': root_data.get("supportedExecutableLanguages", []),
                 }
         return data
         
     async def retry_message(self, chatCode: str, suggest_replies: bool=False, timeout: int=5):
         self.retry_attempts = 3
-        timer = 0
         while None in self.active_messages.values() and len(self.active_messages) > self.MAX_CONCURRENT_MESSAGES:
             await asyncio.sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                raise RuntimeError("Timed out waiting for other messages to send.")
             
         prompt_md5 = hashlib.md5((chatCode + generate_nonce()).encode()).hexdigest()
         self.active_messages[prompt_md5] = None
@@ -839,7 +751,6 @@ class AsyncPoeApi:
         
         chatId = response_json['data']['chatOfCode']['chatId']
         title = response_json['data']['chatOfCode']['title']
-        # msgPrice = response_json['data']['chatOfCode']['defaultBotObject']['messagePointLimit']['displayMessagePointPrice']
         last_message = edges[0]['node']
         
         if last_message['author'] == 'human':
@@ -882,23 +793,10 @@ class AsyncPoeApi:
         
         while True:
             try:
-                ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=timeout)
+                ws_data = await self.message_queues[chatId].get()
             except KeyError:
                 await asyncio.sleep(1)
                 continue
-            except asyncio.TimeoutError:
-                try:
-                    if self.retry_attempts > 0:
-                        self.retry_attempts -= 1
-                        logger.warning(f"Retrying request {3-self.retry_attempts}/3 times...")
-                    else:
-                        self.retry_attempts = 3
-                        await self.delete_queues(chatId)
-                        raise RuntimeError("Timed out waiting for response.")
-                    await self.connect_ws()
-                    continue
-                except Exception as e:
-                    raise e
             
             if ws_data["subscription"] == "messageCancelled":
                 break
@@ -954,12 +852,8 @@ class AsyncPoeApi:
         
     async def send_message(self, bot: str, message: str, chatId: int=None, chatCode: str=None, msgPrice: int=20, file_path: list=[], suggest_replies: bool=False, timeout: int=5) -> AsyncIterator[dict]:
         self.retry_attempts = 3
-        timer = 0
         while None in self.active_messages.values() and len(self.active_messages) > self.MAX_CONCURRENT_MESSAGES:
             await asyncio.sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                raise RuntimeError("Timed out waiting for other messages to send.")
         
         prompt_md5 = hashlib.md5((message + generate_nonce()).encode()).hexdigest()
         self.active_messages[prompt_md5] = None
@@ -989,11 +883,6 @@ class AsyncPoeApi:
             file_hash_jwts = await self.finish_upload(file_form)
         
         msgPrice = None
-        try:
-            botInfo = await self.get_botInfo(bot)
-            msgPrice = botInfo.get('displayMessagePointPrice')
-        except Exception:
-            msgPrice = None
         
         if (chatId == None and chatCode == None):
             try:
@@ -1043,10 +932,7 @@ class AsyncPoeApi:
                         raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                     elif status in ('rate_limit_exceeded', 'concurrent_messages'):
                         await self.delete_pending_messages(prompt_md5)
-                        await asyncio.sleep(random.randint(4, 6))
-                        async for chunk in self.send_message(bot, message, chatId, chatCode, msgPrice, file_path, suggest_replies, timeout):
-                            yield chunk
-                        return
+                        raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
 
                     chat_data = message_data['data']['messageEdgeCreate'].get('chat')
                     if not chat_data:
@@ -1119,10 +1005,7 @@ class AsyncPoeApi:
                         raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                     elif status in ('rate_limit_exceeded', 'concurrent_messages'):
                         await self.delete_pending_messages(prompt_md5)
-                        await asyncio.sleep(random.randint(4, 6))
-                        async for chunk in self.send_message(bot, message, chatId, chatCode, msgPrice, file_path, suggest_replies, timeout):
-                            yield chunk
-                        return
+                        raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                         
                 await self.delete_pending_messages(prompt_md5)
             except Exception as e:
@@ -1140,23 +1023,10 @@ class AsyncPoeApi:
         
         while True:
             try:
-                ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=timeout)
+                ws_data = await self.message_queues[chatId].get()
             except KeyError:
                 await asyncio.sleep(1)
                 continue
-            except asyncio.TimeoutError:
-                try:
-                    if self.retry_attempts > 0:
-                        self.retry_attempts -= 1
-                        logger.warning(f"Retrying request {3-self.retry_attempts}/3 times...")
-                    else:
-                        self.retry_attempts = 3
-                        await self.delete_queues(chatId)
-                        raise RuntimeError("Timed out waiting for response.")
-                    await self.connect_ws()
-                    continue
-                except Exception as e:
-                    raise e
             
             if ws_data["subscription"] == "messageCancelled":
                 break

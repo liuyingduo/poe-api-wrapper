@@ -66,7 +66,7 @@ file_paths = parse_env_list("POE_FILES")
 if file_paths:
     print(f"Uploading {len(file_paths)} file(s)...")
 
-for chunk in client.send_message(bot=bot_name, message=prompt, file_path=file_paths):
+for chunk in client.send_message(bot=bot_name, message=prompt, file_path=file_paths,timeout=120):
     print(chunk.get("response", ""), end="", flush=True)
 
 print("\n\nDone")

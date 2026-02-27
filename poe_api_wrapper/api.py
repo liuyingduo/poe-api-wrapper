@@ -1,5 +1,5 @@
 from time import sleep
-from httpx import Client, ReadTimeout, ConnectError
+from httpx import Client
 from requests_toolbelt import MultipartEncoder
 import os, secrets, string, random, websocket, orjson, threading, queue, ssl, hashlib, re, uuid
 from loguru import logger
@@ -16,9 +16,6 @@ from .utils import (
                     )
 from .queries import generate_payload, resolve_query_name
 from .bundles import PoeBundle
-from .proxies import PROXY
-if PROXY:
-    from .proxies import fetch_proxy
 
 """
 This API is modified and maintained by @snowby666
@@ -51,7 +48,7 @@ class PoeApi:
         self._ws_heartbeat_stop = threading.Event()
         self._ws_heartbeat_thread: Optional[threading.Thread] = None
         
-        self.client = Client(headers=self.HEADERS.copy(), timeout=60, http2=True)
+        self.client = Client(headers=self.HEADERS.copy(), timeout=None, http2=True)
         if headers:
             self.client.headers.update(headers)
         self.client.cookies.update({
@@ -82,13 +79,7 @@ class PoeApi:
         
         if self.formkey == "":
             self.load_bundle()
-
-        if proxy != [] or auto_proxy == True:
-            self.select_proxy(proxy, auto_proxy=auto_proxy)
-        elif proxy == [] and auto_proxy == False:
-            self.connect_ws() 
-        else:
-            raise ValueError("Please provide a valid proxy list or set auto_proxy to False")
+        self.connect_ws() 
         
     def __del__(self):
         if self.client:
@@ -106,26 +97,6 @@ class PoeApi:
             logger.error(f"Failed to load bundle. Reason: {e}")
             logger.warning("Failed to get formkey from bundle. Please provide a valid formkey manually." if self.formkey == "" else "Continuing with provided formkey")
             
-    def select_proxy(self, proxy: list, auto_proxy: bool=False):
-        if proxy == [] and auto_proxy == True:
-            if not PROXY:
-                raise ValueError("Please install ballyregan for auto proxy")
-            proxies = fetch_proxy()
-        elif proxy != [] and auto_proxy == False:
-            proxies = proxy
-        else:
-            raise ValueError("Please provide a valid proxy list or set auto_proxy to False")
-        for p in range(len(proxies)):
-            try:
-                self.proxies = proxies[p]
-                self.client.proxies = self.proxies 
-                self.connect_ws()
-                logger.info(f"Connection established with {proxies[p]}")
-                break
-            except:
-                logger.info(f"Connection failed with {proxies[p]}. Trying {p+1}/{len(proxies)} ...")
-                sleep(1)
-
     def _extract_file_hash_jwt(self, raw_text: str):
         token_pattern = re.compile(r"^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$")
 
@@ -170,7 +141,6 @@ class PoeApi:
                 f"{self.BASE_URL}/api/finish_upload_POST",
                 files={"file": file},
                 follow_redirects=True,
-                timeout=30,
             )
             if response.status_code != 200:
                 preview = response.text[:300].replace("\n", " ")
@@ -186,10 +156,7 @@ class PoeApi:
             file_hash_jwts.append(file_hash_jwt)
         return file_hash_jwts
     
-    def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False, ratelimit: int = 0):
-        if ratelimit > 0:
-            logger.warning(f"Waiting queue {ratelimit}/2 to avoid rate limit")
-            sleep(random.randint(2, 3))
+    def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False):
         status_code = 0
         resolved_query_name = resolve_query_name(query_name)
         
@@ -216,7 +183,7 @@ class PoeApi:
                 "poe-queryname": resolved_query_name,
                 "poegraphql": "1",
             })
-            response = self.client.post(f'{self.BASE_URL}/api/{path}', data=payload, headers=headers, follow_redirects=True, timeout=30)
+            response = self.client.post(f'{self.BASE_URL}/api/{path}', data=payload, headers=headers, follow_redirects=True)
             
             status_code = response.status_code
             response_text = response.text
@@ -252,26 +219,13 @@ class PoeApi:
                 return json_data
             
         except Exception as e:
-            if isinstance(e, ReadTimeout):
-                if query_name == "SendMessageMutation":
-                    logger.error(f"Failed to send message {variables['query']} due to ReadTimeout")
-                    raise e
-                else:
-                    logger.error(f"Automatic retrying request {query_name} due to ReadTimeout")
-                    return self.send_request(path, query_name, variables, file_form)
-
-            if (
-                isinstance(e, ConnectError) or 500 <= status_code < 600
-            ) and ratelimit < 2:
-                return self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
-
             error_code = f"status_code:{status_code}, " if status_code else ""
             raise Exception(
                 f"Sending request {query_name} failed. {error_code} Error log: {repr(e)}"
             )
     
     def get_channel_settings(self):
-        response_json = orjson.loads(self.client.get(f'{self.BASE_URL}/api/settings', headers=self.HEADERS, follow_redirects=True, timeout=30).text)
+        response_json = orjson.loads(self.client.get(f'{self.BASE_URL}/api/settings', headers=self.HEADERS, follow_redirects=True).text)
         self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
         self.tchannel_data = response_json["tchannelData"]
         self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
@@ -292,7 +246,7 @@ class PoeApi:
             }
             self.ws.run_forever(**kwargs)
              
-    def connect_ws(self, timeout=20):
+    def connect_ws(self):
         
         if self.ws_connected:
             return
@@ -333,16 +287,8 @@ class PoeApi:
         t = threading.Thread(target=self.ws_run_thread, daemon=True)
         t.start()
 
-        timer = 0
         while not self.ws_connected:
             sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                self.ws_connecting = False
-                self.ws_connected = False
-                self.ws_error = True
-                self.ws.close()
-                raise RuntimeError("Timed out waiting for websocket to connect.")
         self._start_ws_heartbeat()
 
     def disconnect_ws(self):
@@ -652,27 +598,54 @@ class PoeApi:
             raise ValueError(
                 f"Bot {handle} not found. Make sure the bot exists before creating new chat."
             )
-        botData = response_json['data']['bot']
-        data = {    
-                'handle': botData['handle'],
-                'model':botData['model'],
-                'supportsFileUpload': botData['supportsFileUpload'], 
-                'messageTimeoutSecs': botData['messageTimeoutSecs'], 
-                # 'displayMessagePointPrice': botData['messagePointLimit']['displayMessagePointPrice'], 
-                # 'numRemainingMessages': botData['messagePointLimit']['numRemainingMessages'],
-                'viewerIsCreator': botData['viewerIsCreator'],
-                'id': botData['id'],
+        root_data = response_json["data"]
+        botData = root_data["bot"]
+        viewer = root_data["viewer"]
+
+        custom_ui_raw = botData.get("customUIDefinition")
+        custom_ui = orjson.loads(custom_ui_raw) if isinstance(custom_ui_raw, str) and custom_ui_raw else None
+
+        file_upload_limits_raw = viewer.get("fileUploadSizeLimits")
+        file_upload_limits = (
+            orjson.loads(file_upload_limits_raw)
+            if isinstance(file_upload_limits_raw, str) and file_upload_limits_raw
+            else None
+        )
+
+        data = {
+                'handle': botData["handle"],
+                'displayName': botData["displayName"],
+                'model': botData["model"],
+                'supportsFileUpload': bool(botData["supportsFileUpload"]),
+                'allowsImageAttachments': bool(botData["allowsImageAttachments"]),
+                'uploadFileSizeLimit': botData["uploadFileSizeLimit"],
+                'messageTimeoutSecs': botData["messageTimeoutSecs"],
+                'canUserAccessBot': bool(botData["canUserAccessBot"]),
+                'noAccessMessage': botData.get("noAccessMessage"),
+                'limitedAccessType': botData.get("limitedAccessType"),
+                'isApiBot': bool(botData["isApiBot"]),
+                'isOfficialBot': bool(botData["isOfficialBot"]),
+                'isDown': bool(botData["isDown"]),
+                'isServerBot': bool(botData.get("isServerBot", False)),
+                'viewerIsCreator': bool(botData["viewerIsCreator"]),
+                'id': botData["id"],
+                'botId': botData["botId"],
+                'description': botData.get("description"),
+                'customUIDefinition': custom_ui,
+                'customUIDefinitionRaw': custom_ui_raw,
+                'submitMessageParamsAsDict': bool(viewer["submitMessageParamsAsDict"]),
+                'shouldUseFinishUploadEndpoint': bool(viewer["shouldUseFinishUploadEndpoint"]),
+                'shouldUsePresignedUrl': bool(viewer["shouldUsePresignedUrl"]),
+                'fileUploadSizeLimits': file_upload_limits,
+                'supportedPreviewsContentTypes': root_data.get("supportedPreviewsContentTypes", []),
+                'supportedExecutableLanguages': root_data.get("supportedExecutableLanguages", []),
                 }
         return data
         
     def retry_message(self, chatCode: str, suggest_replies: bool=False, timeout: int=5):
         self.retry_attempts = 3
-        timer = 0
         while None in self.active_messages.values() and len(self.active_messages) > self.MAX_CONCURRENT_MESSAGES:
             sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                raise RuntimeError("Timed out waiting for other messages to send.")
             
         prompt_md5 = hashlib.md5((chatCode + generate_nonce()).encode()).hexdigest()
         self.active_messages[prompt_md5] = None
@@ -692,7 +665,6 @@ class PoeApi:
         
         chatId = response_json['data']['chatOfCode']['chatId']
         title = response_json['data']['chatOfCode']['title']
-        # msgPrice = response_json['data']['chatOfCode']['defaultBotObject']['messagePointLimit']['displayMessagePointPrice']
         last_message = edges[0]['node']
         
         if last_message['author'] == 'human':
@@ -735,23 +707,10 @@ class PoeApi:
         
         while True:
             try:
-                ws_data = self.message_queues[chatId].get(timeout=timeout)
+                ws_data = self.message_queues[chatId].get()
             except KeyError:
                 sleep(1)
                 continue
-            except queue.Empty:
-                try:
-                    if self.retry_attempts > 0:
-                        self.retry_attempts -= 1
-                        logger.warning(f"Retrying request {3-self.retry_attempts}/3 times...")
-                    else:
-                        self.retry_attempts = 3
-                        self.delete_queues(chatId)
-                        raise RuntimeError("Timed out waiting for response.")
-                    self.connect_ws()
-                    continue
-                except Exception as e:
-                    raise e
             
             if ws_data["subscription"] == "messageCancelled":
                 break
@@ -807,12 +766,8 @@ class PoeApi:
         
     def send_message(self, bot: str, message: str, chatId: int=None, chatCode: str=None, msgPrice: int=20, file_path: list=[], suggest_replies: bool=False, timeout: int=5) -> Generator[dict, None, None]:
         self.retry_attempts = 3
-        timer = 0
         while None in self.active_messages.values() and (len(self.active_messages) > self.MAX_CONCURRENT_MESSAGES):
             sleep(0.01)
-            timer += 0.01
-            if timer > timeout:
-                raise RuntimeError("Timed out waiting for other messages to send.")
 
         prompt_md5 = hashlib.md5((message + generate_nonce()).encode()).hexdigest() 
         self.active_messages[prompt_md5] = None
@@ -842,11 +797,6 @@ class PoeApi:
             file_hash_jwts = self.finish_upload(file_form)
         
         msgPrice = None
-        try:
-            botInfo = self.get_botInfo(bot)
-            msgPrice = botInfo.get('displayMessagePointPrice')
-        except Exception:
-            msgPrice = None
             
         if (chatId == None and chatCode == None):
             try:
@@ -896,10 +846,7 @@ class PoeApi:
                         raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                     elif status in ('rate_limit_exceeded', 'concurrent_messages'):
                         self.delete_pending_messages(prompt_md5)
-                        sleep(random.randint(4, 6))
-                        for chunk in self.send_message(bot, message, chatId, chatCode, msgPrice, file_path, suggest_replies, timeout):
-                            yield chunk
-                        return
+                        raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
 
                     chat_data = message_data['data']['messageEdgeCreate'].get('chat')
                     if not chat_data:
@@ -972,10 +919,7 @@ class PoeApi:
                         raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                     elif status in ('rate_limit_exceeded', 'concurrent_messages'):
                         self.delete_pending_messages(prompt_md5)
-                        sleep(random.randint(4, 6))
-                        for chunk in self.send_message(bot, message, chatId, chatCode, msgPrice, file_path, suggest_replies, timeout):
-                            yield chunk
-                        return
+                        raise RuntimeError(f"{message_data['data']['messageEdgeCreate']['statusMessage']}")
                         
                 self.delete_pending_messages(prompt_md5)
             except Exception as e:
@@ -993,23 +937,10 @@ class PoeApi:
         
         while True:
             try:
-                ws_data = self.message_queues[chatId].get(timeout=timeout)
+                ws_data = self.message_queues[chatId].get()
             except KeyError:
                 sleep(1)
                 continue
-            except queue.Empty:
-                try:
-                    if self.retry_attempts > 0:
-                        self.retry_attempts -= 1
-                        logger.warning(f"Retrying request {3-self.retry_attempts}/3 times...")
-                    else:
-                        self.retry_attempts = 3
-                        self.delete_queues(chatId)
-                        raise RuntimeError("Timed out waiting for response.")
-                    self.connect_ws()
-                    continue
-                except Exception as e:
-                    raise e
             
             if ws_data["subscription"] == "messageCancelled":
                 break

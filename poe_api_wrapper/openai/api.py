@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import math
 import mimetypes
 import os
 import tempfile
@@ -143,10 +144,6 @@ class GatewayConfig:
     fernet_key: str
     admin_api_key: str
     service_api_keys_bootstrap: list[str]
-    poe_proxy_urls: list[str]
-    poe_request_retry_limit: int
-    poe_chat_timeout_seconds: int
-    poe_media_timeout_seconds: int
     max_inflight_per_account: int
     global_inflight_limit: int
     depleted_threshold: int
@@ -170,10 +167,6 @@ class GatewayConfig:
             fernet_key=_require_env("FERNET_KEY"),
             admin_api_key=_require_env("ADMIN_API_KEY"),
             service_api_keys_bootstrap=_split_csv(os.getenv("SERVICE_API_KEYS_BOOTSTRAP", "")),
-            poe_proxy_urls=_split_csv(os.getenv("POE_PROXY_URLS", "")),
-            poe_request_retry_limit=_env_int("POE_REQUEST_RETRY_LIMIT", 4),
-            poe_chat_timeout_seconds=_env_int("POE_CHAT_TIMEOUT_SECONDS", 30),
-            poe_media_timeout_seconds=_env_int("POE_MEDIA_TIMEOUT_SECONDS", 120),
             max_inflight_per_account=_env_int("MAX_INFLIGHT_PER_ACCOUNT", 2),
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
@@ -315,8 +308,6 @@ async def startup_event() -> None:
     pool = PoeClientPool(
         repo=repo,
         default_poe_revision=config.default_poe_revision,
-        proxy_urls=config.poe_proxy_urls,
-        request_retry_limit=config.poe_request_retry_limit,
     )
     refresher = AccountHealthRefresher(
         repo=repo,
@@ -525,15 +516,11 @@ async def list_models(
     return JSONResponse({"object": "list", "data": models_data})
 
 
-async def call_tools(client, messages, tools, tool_choice, timeout_seconds: int):
+async def call_tools(client, messages, tools, tool_choice):
     try:
         response = await message_handler("gpt4_o_mini", messages, 128000, tools, tool_choice)
         tool_calls = None
-        async for chunk in client.send_message(
-            bot="gpt4_o_mini",
-            message=response["message"],
-            timeout=max(5, int(timeout_seconds)),
-        ):
+        async for chunk in client.send_message(bot="gpt4_o_mini", message=response["message"]):
             try:
                 raw = chunk.get("text", "").strip().replace("\n", "").replace("\\", "")
                 parsed = orjson.loads(raw)
@@ -620,6 +607,45 @@ def _cleanup_temp_files(paths: List[str]) -> None:
             logger.warning("Failed to remove temp file: {}", file_path)
 
 
+def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
+    # `auto` means "let provider choose default size/aspect", so we do not force any aspect.
+    normalized_size = (size or "").strip().lower()
+    if normalized_size in ("", "auto", "default", "1024x1024"):
+        return ""
+
+    model_sizes = app.state.models.get(model, {}).get("sizes", {})
+    if size in model_sizes:
+        return model_sizes[size]
+
+    # Accept ratio form like "16:9" and pass through.
+    if ":" in normalized_size:
+        parts = normalized_size.split(":", 1)
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            left = int(parts[0])
+            right = int(parts[1])
+            if left > 0 and right > 0:
+                return f"--aspect {left}:{right}"
+
+    # Accept free-form WxH (e.g. 1536x1024) and convert to reduced ratio.
+    if "x" in normalized_size:
+        parts = normalized_size.split("x", 1)
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            width = int(parts[0])
+            height = int(parts[1])
+            if width > 0 and height > 0:
+                gcd = math.gcd(width, height)
+                return f"--aspect {width // gcd}:{height // gcd}"
+
+    supported_sizes = ["auto", "1024x1024"]
+    if isinstance(model_sizes, dict):
+        supported_sizes.extend(model_sizes.keys())
+    _openai_http_error(
+        400,
+        "invalid_request_error",
+        f"Invalid size for model {model}. Supported values: {sorted(set(supported_sizes))}",
+    )
+
+
 async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[str], List[str]]:
     if not attachments:
         return [], []
@@ -637,7 +663,7 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
 
     remote_to_local: dict[str, str] = {}
     try:
-        async with AsyncClient(http2=True, timeout=30, follow_redirects=True) as fetcher:
+        async with AsyncClient(http2=True, timeout=None, follow_redirects=True) as fetcher:
             for remote_url in remote_urls:
                 resp = await fetcher.get(
                     remote_url,
@@ -682,20 +708,13 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     return resolved_paths, temp_files
 
 
-async def generate_image(
-    client,
-    response: dict,
-    aspect_ratio: str,
-    image: list = None,
-    timeout_seconds: int = 120,
-) -> str:
+async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
     image = image or []
     try:
         async for chunk in client.send_message(
             bot=response["bot"],
             message=f"{response['message']} {aspect_ratio}",
             file_path=image,
-            timeout=max(5, int(timeout_seconds)),
         ):
             pass
         return chunk["text"]
@@ -779,7 +798,6 @@ async def generate_chunks(
     session_id: str,
     persistent_session: bool,
     account_id: str,
-    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
@@ -794,7 +812,6 @@ async def generate_chunks(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
-                timeout=max(5, int(message_timeout_seconds)),
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -888,7 +905,6 @@ async def streaming_response(
     session_id: str,
     persistent_session: bool,
     account_id: str,
-    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> StreamingResponse:
     return StreamingResponse(
@@ -909,7 +925,6 @@ async def streaming_response(
             session_id=session_id,
             persistent_session=persistent_session,
             account_id=account_id,
-            message_timeout_seconds=message_timeout_seconds,
             lease=lease,
         ),
         status_code=200,
@@ -934,7 +949,6 @@ async def non_streaming_response(
     session_id: str,
     persistent_session: bool,
     account_id: str,
-    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> JSONResponse:
     try:
@@ -946,7 +960,6 @@ async def non_streaming_response(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
-                timeout=max(5, int(message_timeout_seconds)),
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -1172,13 +1185,7 @@ async def _chat_completions_impl(
 
     raw_tool_calls = None
     if tools:
-        raw_tool_calls = await call_tools(
-            client,
-            text_messages,
-            tools,
-            tool_choice,
-            int(runtime.config.poe_chat_timeout_seconds),
-        )
+        raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
     if raw_tool_calls:
         response = {"bot": "gpt4_o_mini", "message": ""}
         prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
@@ -1201,13 +1208,6 @@ async def _chat_completions_impl(
                 f"Failed to process image_url attachments: {exc}",
             )
 
-    message_timeout_seconds = int(runtime.config.poe_chat_timeout_seconds)
-    if attachment_paths:
-        message_timeout_seconds = max(
-            message_timeout_seconds,
-            int(runtime.config.poe_media_timeout_seconds),
-        )
-
     if streaming:
         return await streaming_response(
             runtime=runtime,
@@ -1226,7 +1226,6 @@ async def _chat_completions_impl(
             session_id=session_id,
             persistent_session=persistent_session,
             account_id=account_id,
-            message_timeout_seconds=message_timeout_seconds,
             lease=lease,
         )
 
@@ -1246,7 +1245,6 @@ async def _chat_completions_impl(
         session_id=session_id,
         persistent_session=persistent_session,
         account_id=account_id,
-        message_timeout_seconds=message_timeout_seconds,
         lease=lease,
     )
 
@@ -1269,12 +1267,7 @@ async def create_images(
     if not isinstance(n, int) or n < 1:
         _openai_http_error(400, "invalid_request_error", "Invalid n value")
 
-    if size == "1024x1024":
-        aspect_ratio = ""
-    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
-        aspect_ratio = app.state.models[model]["sizes"][size]
-    else:
-        _openai_http_error(400, "invalid_request_error", f"Invalid size for model {model}")
+    aspect_ratio = _resolve_image_aspect(model, size)
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
@@ -1303,12 +1296,7 @@ async def create_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(
-                client,
-                response,
-                aspect_ratio,
-                timeout_seconds=int(runtime.config.poe_media_timeout_seconds),
-            )
+            image_generation = await generate_image(client, response, aspect_ratio)
             urls.extend([url for url in image_generation.split() if url.startswith("https://")])
             if len(urls) >= n:
                 break
@@ -1316,7 +1304,7 @@ async def create_images(
         if len(urls) == 0:
             _openai_http_error(500, "provider_error", f"Provider for {model} sent invalid response")
 
-        async with AsyncClient(http2=True, timeout=20) as fetcher:
+        async with AsyncClient(http2=True, timeout=None) as fetcher:
             for url in urls:
                 resp = await fetcher.get(url)
                 content_type = resp.headers.get("Content-Type", "")
@@ -1357,12 +1345,7 @@ async def edit_images(
     if not isinstance(n, int) or n < 1:
         _openai_http_error(400, "invalid_request_error", "Invalid n value")
 
-    if size == "1024x1024":
-        aspect_ratio = ""
-    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
-        aspect_ratio = app.state.models[model]["sizes"][size]
-    else:
-        _openai_http_error(400, "invalid_request_error", f"Invalid size for model {model}")
+    aspect_ratio = _resolve_image_aspect(model, size)
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
@@ -1399,13 +1382,7 @@ async def edit_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(
-                client,
-                response,
-                aspect_ratio,
-                [edit_attachment],
-                timeout_seconds=int(runtime.config.poe_media_timeout_seconds),
-            )
+            image_generation = await generate_image(client, response, aspect_ratio, [edit_attachment])
             urls.extend([url for url in image_generation.split() if url.startswith("https://")])
             if len(urls) >= n:
                 break
@@ -1413,7 +1390,7 @@ async def edit_images(
         if len(urls) == 0:
             _openai_http_error(500, "provider_error", f"Provider for {model} sent invalid response")
 
-        async with AsyncClient(http2=True, timeout=20) as fetcher:
+        async with AsyncClient(http2=True, timeout=None) as fetcher:
             for url in urls:
                 resp = await fetcher.get(url)
                 content_type = resp.headers.get("Content-Type", "")

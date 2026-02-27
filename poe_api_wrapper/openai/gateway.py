@@ -662,13 +662,9 @@ class PoeClientPool:
         self,
         repo: AccountRepository,
         default_poe_revision: Optional[str] = None,
-        proxy_urls: Optional[list[str]] = None,
-        request_retry_limit: int = 4,
     ):
         self.repo = repo
         self.default_poe_revision = (default_poe_revision or "").strip()
-        self.proxy_urls = [item.strip() for item in (proxy_urls or []) if item and item.strip()]
-        self.request_retry_limit = max(1, int(request_retry_limit))
         self._clients: dict[str, AsyncPoeApi] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
@@ -705,15 +701,7 @@ class PoeClientPool:
     async def _create_client(self, creds: dict[str, Any]) -> AsyncPoeApi:
         tokens = self._build_tokens(creds)
         headers = self._build_headers(creds)
-        proxy_config = []
-        if self.proxy_urls:
-            proxy_config = [{"http://": proxy, "https://": proxy} for proxy in self.proxy_urls]
-        return await AsyncPoeApi(
-            tokens=tokens,
-            headers=headers,
-            proxy=proxy_config,
-            request_retry_limit=self.request_retry_limit,
-        ).create()
+        return await AsyncPoeApi(tokens=tokens, headers=headers).create()
 
     async def _create_client_with_fallback(self, account_id: str, creds: dict[str, Any]) -> AsyncPoeApi:
         try:
