@@ -1,5 +1,5 @@
 import openai 
-client = openai.OpenAI(api_key="anything", base_url="http://127.0.0.1:8000/v1/", default_headers={"Authorization": "Bearer anything"})
+client = openai.OpenAI(api_key="svc_app_zaiwen", base_url="http://127.0.0.1:8003/v1/")
 
 # Non-Streaming Example
 response = client.chat.completions.create(

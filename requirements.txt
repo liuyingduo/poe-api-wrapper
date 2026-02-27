@@ -10,3 +10,10 @@ PyExecJS
 nest-asyncio
 orjson
 aiofiles
+fastapi
+pydantic
+nltk
+tiktoken
+pymongo
+cryptography
+uvicorn

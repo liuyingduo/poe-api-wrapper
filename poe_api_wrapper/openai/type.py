@@ -1,11 +1,12 @@
 from pydantic import BaseModel, Extra
 from typing import Any, Optional, List, Literal, Dict, Union
 
-class ChatData(BaseModel):
+class ChatData(BaseModel, extra=Extra.allow):
     model: Any
     messages: Any
     stream: Optional[bool] = False
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     frequency_penalty: Optional[float] = 0.0
     presence_penalty: Optional[float] = 1.0
     temperature: Optional[float] = 1.0
@@ -13,19 +14,43 @@ class ChatData(BaseModel):
     stream_options: Optional[dict[str, Any]] = None
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    metadata: Optional[dict[str, Any]] = None
+    user: Optional[str] = None
+    n: Optional[int] = 1
+    extra_body: Optional[dict[str, Any]] = None
     
-class ImagesGenData(BaseModel):
+class ImagesGenData(BaseModel, extra=Extra.allow):
     prompt: Any
     model: Any
     n: Optional[int] = 1
     size: Optional[str] = '1024x1024'
     
-class ImagesEditData(BaseModel):
+class ImagesEditData(BaseModel, extra=Extra.allow):
     image: Any
     prompt: Any
     model: Any
     n: Optional[int] = 1
     size: Optional[str] = '1024x1024'
+
+
+class ResponsesData(BaseModel, extra=Extra.allow):
+    model: Any
+    input: Any
+    stream: Optional[bool] = False
+    max_output_tokens: Optional[int] = None
+    metadata: Optional[dict[str, Any]] = None
+    user: Optional[str] = None
+
+
+class AccountUpsertData(BaseModel):
+    email: str
+    poe_p_b: str
+    poe_cf_clearance: str
+    poe_cf_bm: Optional[str] = None
+    p_lat: Optional[str] = None
+    formkey: Optional[str] = None
+    poe_revision: Optional[str] = None
+    user_agent: Optional[str] = None
 
 
 # OpenAI typing

@@ -1,298 +1,592 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, ORJSONResponse
+﻿from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+
+import orjson
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from daphne.cli import CommandLineInterface
-from typing import Any, Dict, Tuple, Union, AsyncGenerator
-from poe_api_wrapper import AsyncPoeApi
-from poe_api_wrapper.openai import helpers
-from poe_api_wrapper.openai.type import *
-import orjson, asyncio, random, os, uuid
+from fastapi.responses import StreamingResponse
+from starlette.responses import JSONResponse
 from httpx import AsyncClient
+from loguru import logger
 
-DIR = os.path.dirname(os.path.abspath(__file__))
+from poe_api_wrapper.openai import helpers
+from poe_api_wrapper.openai.gateway import (
+    AccountHealthRefresher,
+    AccountLease,
+    AccountRepository,
+    AccountSelector,
+    CapacityLimitError,
+    CredentialCrypto,
+    NoAccountAvailableError,
+    PoeClientPool,
+    RuntimeLimiter,
+    SessionManager,
+    build_openai_error,
+    extract_bearer_token,
+    hash_api_key,
+    mask_secret,
+)
+from poe_api_wrapper.openai.type import (
+    AccountUpsertData,
+    ChatCompletionChunk,
+    ChatCompletionChunkChoice,
+    ChatCompletionMessageToolCall,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionUsage,
+    ChatData,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+    FunctionCall,
+    ImagesEditData,
+    ImagesGenData,
+    MessageResponse,
+    ResponsesData,
+)
 
-app = FastAPI(title="Poe API Wrapper", description="OpenAI Proxy Server")
+DIR = Path(__file__).resolve().parent
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-with open(os.path.join(DIR, "secrets.json"), "rb") as f:
-    TOKENS = orjson.loads(f.read())
-    if "tokens" not in TOKENS:
-        raise Exception("Tokens not found in secrets.json")
-    app.state.tokens = TOKENS["tokens"]
-
-with open(os.path.join(DIR, "models.json"), "rb") as f:
-    models = orjson.loads(f.read())
-    app.state.models = models
+app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-async def call_tools(messages, tools, tool_choice):
-    response = await message_handler("gpt4_o_mini", messages, 128000, tools, tool_choice)
-    tool_calls = None
-    client, _ = await rotate_token(app.state.tokens)
-    async for chunk in client.send_message(bot="gpt4_o_mini", message=response["message"]):
-        try:
-            res_list = orjson.loads(chunk["text"].strip().replace("\n", "").replace("\\",""))
-            if res_list and type(res_list) == list:
-                tool_calls = res_list
-                break
-        except Exception as e:
-            pass
-        
-    return tool_calls
-    
-    
+def _load_dotenv_file(path: Path) -> bool:
+    if not path.exists():
+        return False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+    return True
+
+
+def _bootstrap_env() -> None:
+    # Priority:
+    # 1) Existing process environment
+    # 2) Explicit config file via GATEWAY_CONFIG_FILE
+    # 3) .env.gateway / .env in cwd and package dir
+    explicit_path = os.getenv("GATEWAY_CONFIG_FILE", "").strip()
+    loaded_from: list[Path] = []
+    if explicit_path:
+        p = Path(explicit_path)
+        if _load_dotenv_file(p):
+            loaded_from.append(p)
+
+    for candidate in (
+        Path.cwd() / ".env.gateway",
+        Path.cwd() / ".env",
+        DIR / ".env.gateway",
+        DIR / ".env",
+    ):
+        if _load_dotenv_file(candidate):
+            loaded_from.append(candidate)
+
+    if loaded_from:
+        logger.info("Loaded gateway config from: {}", ", ".join(str(p) for p in loaded_from))
+
+
+_bootstrap_env()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"Environment variable {name} must be an integer")
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Environment variable {name} is required")
+    return value
+
+
+def _split_csv(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+@dataclass
+class GatewayConfig:
+    default_poe_revision: str
+    mongodb_uri: str
+    mongodb_db: str
+    fernet_key: str
+    admin_api_key: str
+    service_api_keys_bootstrap: list[str]
+    max_inflight_per_account: int
+    global_inflight_limit: int
+    depleted_threshold: int
+    refresh_interval_seconds: int
+    recent_active_minutes: int
+    cooldown_seconds: int
+    prewarm_concurrency: int
+
+    @classmethod
+    def from_env(cls) -> "GatewayConfig":
+        return cls(
+            default_poe_revision=os.getenv(
+                "POE_REVISION",
+                "b759a4647fa291beba4792e9139bc4c014399434",
+            ).strip(),
+            mongodb_uri=_require_env("MONGODB_URI"),
+            mongodb_db=_require_env("MONGODB_DB"),
+            fernet_key=_require_env("FERNET_KEY"),
+            admin_api_key=_require_env("ADMIN_API_KEY"),
+            service_api_keys_bootstrap=_split_csv(os.getenv("SERVICE_API_KEYS_BOOTSTRAP", "")),
+            max_inflight_per_account=_env_int("MAX_INFLIGHT_PER_ACCOUNT", 2),
+            global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
+            depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
+            refresh_interval_seconds=_env_int("REFRESH_INTERVAL_SECONDS", 600),
+            recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
+            cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
+            prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
+        )
+
+
+@dataclass
+class GatewayRuntime:
+    config: GatewayConfig
+    repo: AccountRepository
+    limiter: RuntimeLimiter
+    selector: AccountSelector
+    pool: PoeClientPool
+    refresher: AccountHealthRefresher
+    sessions: SessionManager
+
+
+with (DIR / "models.json").open("rb") as f:
+    app.state.models = orjson.loads(f.read())
+
+
+def _runtime() -> GatewayRuntime:
+    runtime = getattr(app.state, "runtime", None)
+    if not runtime:
+        raise RuntimeError("Gateway runtime is not initialized")
+    return runtime
+
+
+def _openai_http_error(code: int, err_type: str, message: str, metadata: Optional[dict[str, Any]] = None):
+    raise HTTPException(status_code=code, detail=build_openai_error(code, err_type, message, metadata))
+
+
+def _is_depleted_error(error_text: str) -> bool:
+    lower = error_text.lower()
+    return any(token in lower for token in ("insufficient", "balance", "reached_limit", "402", "daily limit"))
+
+
+def _is_invalid_error(error_text: str) -> bool:
+    lower = error_text.lower()
+    return any(token in lower for token in ("403", "forbidden", "unauthorized", "invalid", "challenge"))
+
+
+def _is_rate_limit_error(error_text: str) -> bool:
+    lower = error_text.lower()
+    return any(token in lower for token in ("rate_limit", "429", "concurrent_messages", "too many requests"))
+
+
+async def _account_error_payload(
+    runtime: GatewayRuntime,
+    account_id: str,
+    session_id: str,
+    persistent_session: bool,
+    exc: Exception,
+) -> tuple[dict[str, Any], int]:
+    error_text = str(exc)
+    metadata = {"session_id": session_id, "account_id": account_id}
+    if _is_depleted_error(error_text):
+        await runtime.repo.mark_account_depleted(account_id, error_text)
+        await runtime.pool.invalidate_client(account_id)
+        if persistent_session:
+            await runtime.sessions.break_session(session_id, "bound account is depleted")
+            message = "Bound account has no remaining points. Create a new session_id and retry."
+        else:
+            message = "Insufficient credits on selected account."
+        return build_openai_error(402, "insufficient_credits", message, metadata), 402
+
+    if _is_invalid_error(error_text):
+        await runtime.repo.mark_account_invalid(account_id, error_text)
+        await runtime.pool.invalidate_client(account_id)
+        if persistent_session:
+            await runtime.sessions.break_session(session_id, "bound account is invalid")
+            message = "Bound account became invalid. Create a new session_id and retry."
+        else:
+            message = "Selected account failed authorization."
+        return build_openai_error(403, "authentication_error", message, metadata), 403
+
+    if _is_rate_limit_error(error_text):
+        await runtime.repo.record_account_error(
+            account_id,
+            error_text,
+            cooldown_seconds=runtime.config.cooldown_seconds,
+        )
+        return build_openai_error(429, "rate_limit_error", "Rate limit reached. Retry with backoff.", metadata), 429
+
+    await runtime.repo.record_account_error(
+        account_id,
+        error_text,
+        cooldown_seconds=runtime.config.cooldown_seconds,
+    )
+    return build_openai_error(500, "provider_error", f"Provider error: {error_text}", metadata), 500
+
+
+async def _prewarm_pool(runtime: GatewayRuntime) -> None:
+    try:
+        primary_pool = await runtime.selector.get_primary_pool()
+    except NoAccountAvailableError:
+        logger.info("Prewarm skipped: no active accounts yet. Service will wait for admin account upsert.")
+        return
+    if not primary_pool:
+        logger.warning("Prewarm skipped: no candidate accounts available")
+        return
+
+    semaphore = asyncio.Semaphore(runtime.config.prewarm_concurrency)
+
+    async def _prewarm_one(account_doc: dict[str, Any]) -> None:
+        account_id = str(account_doc["_id"])
+        async with semaphore:
+            try:
+                await runtime.pool.get_client(account_doc)
+                logger.info("Prewarmed account {}", mask_secret(account_id))
+            except Exception as exc:
+                logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
+                await runtime.repo.record_account_error(
+                    account_id,
+                    f"prewarm_error: {exc}",
+                    cooldown_seconds=runtime.config.cooldown_seconds,
+                )
+
+    await asyncio.gather(*(_prewarm_one(account) for account in primary_pool), return_exceptions=True)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    config = GatewayConfig.from_env()
+    crypto = CredentialCrypto(config.fernet_key)
+    repo = AccountRepository(config.mongodb_uri, config.mongodb_db, crypto)
+    limiter = RuntimeLimiter(
+        max_inflight_per_account=config.max_inflight_per_account,
+        global_inflight_limit=config.global_inflight_limit,
+    )
+    selector = AccountSelector(repo=repo, limiter=limiter, top_n=100)
+    pool = PoeClientPool(repo=repo, default_poe_revision=config.default_poe_revision)
+    refresher = AccountHealthRefresher(
+        repo=repo,
+        pool=pool,
+        depleted_threshold=config.depleted_threshold,
+        refresh_interval_seconds=config.refresh_interval_seconds,
+        recent_active_minutes=config.recent_active_minutes,
+        cooldown_seconds=config.cooldown_seconds,
+    )
+    sessions = SessionManager(repo=repo)
+
+    runtime = GatewayRuntime(
+        config=config,
+        repo=repo,
+        limiter=limiter,
+        selector=selector,
+        pool=pool,
+        refresher=refresher,
+        sessions=sessions,
+    )
+    app.state.runtime = runtime
+
+    await repo.init_indexes()
+    await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
+    refresher.start()
+    await _prewarm_pool(runtime)
+    logger.info("Gateway startup complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    runtime = getattr(app.state, "runtime", None)
+    if not runtime:
+        return
+    await runtime.refresher.stop()
+    await runtime.pool.close_all()
+    await runtime.repo.close()
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = asyncio.get_event_loop().time()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    finally:
+        elapsed_ms = (asyncio.get_event_loop().time() - started) * 1000
+        logger.info(
+            "request_id={} method={} path={} status={} duration_ms={:.2f} key_hash={} session_id={} account_id={} model={}",
+            request_id,
+            request.method,
+            request.url.path,
+            status_code,
+            elapsed_ms,
+            getattr(request.state, "service_key_hash", None),
+            getattr(request.state, "session_id", None),
+            getattr(request.state, "account_id", None),
+            getattr(request.state, "model", None),
+        )
+    response.headers["x-request-id"] = request_id
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        payload = exc.detail
+    else:
+        payload = build_openai_error(exc.status_code, "invalid_request_error", str(exc.detail))
+    return JSONResponse(payload, status_code=exc.status_code)
+
+
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error in path {}: {}", request.url.path, exc)
+    payload = build_openai_error(500, "provider_error", "Internal server error")
+    return JSONResponse(payload, status_code=500)
+
+
+async def require_admin_auth(request: Request) -> None:
+    token = extract_bearer_token(request.headers.get("Authorization", ""))
+    runtime = _runtime()
+    if not token or token != runtime.config.admin_api_key:
+        _openai_http_error(401, "authentication_error", "Invalid admin API key")
+
+
+async def require_service_auth(request: Request) -> None:
+    token = extract_bearer_token(request.headers.get("Authorization", ""))
+    runtime = _runtime()
+    if not token:
+        _openai_http_error(401, "authentication_error", "Missing bearer token")
+    enabled = await runtime.repo.is_service_key_enabled(token)
+    if not enabled:
+        _openai_http_error(401, "authentication_error", "Invalid service API key")
+    request.state.service_key_hash = hash_api_key(token)
+
+
 @app.get("/", response_model=None)
-async def index() -> ORJSONResponse:
-    return ORJSONResponse({"message": "Welcome to Poe Api Wrapper reverse proxy!",
-                            "docs": "See project docs @ https://github.com/snowby666/poe-api-wrapper"})
+async def index() -> JSONResponse:
+    return JSONResponse(
+        {
+            "message": "Poe Mongo Gateway is running",
+            "docs": "OpenAI-compatible endpoints under /v1/*",
+        }
+    )
 
 
-@app.api_route("/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
+@app.get("/healthz", response_model=None)
+async def healthz() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/readyz", response_model=None)
+async def readyz() -> JSONResponse:
+    runtime = _runtime()
+    await asyncio.to_thread(runtime.repo.client.admin.command, "ping")
+    ready_accounts = await runtime.repo.count_ready_accounts()
+    if ready_accounts <= 0:
+        _openai_http_error(503, "overloaded_error", "No ready accounts in pool")
+    return JSONResponse({"status": "ready", "ready_accounts": ready_accounts})
+
+
+@app.post("/admin/accounts/upsert", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_upsert_account(data: AccountUpsertData) -> JSONResponse:
+    runtime = _runtime()
+    account = await runtime.repo.upsert_account(
+        email=data.email,
+        poe_p_b=data.poe_p_b,
+        poe_cf_clearance=data.poe_cf_clearance,
+        poe_cf_bm=data.poe_cf_bm,
+        p_lat=data.p_lat,
+        formkey=data.formkey,
+        poe_revision=data.poe_revision,
+        user_agent=data.user_agent,
+    )
+    logger.info(
+        "Upserted account email={} p_b={} cf_clearance={}",
+        data.email,
+        mask_secret(data.poe_p_b),
+        mask_secret(data.poe_cf_clearance),
+    )
+    return JSONResponse(jsonable_encoder(account))
+
+
+@app.get("/admin/accounts", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_list_accounts(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    status: Optional[str] = Query(default=None),
+    min_balance: Optional[int] = Query(default=None, ge=0),
+    max_balance: Optional[int] = Query(default=None, ge=0),
+) -> JSONResponse:
+    runtime = _runtime()
+    data = await runtime.repo.list_accounts(
+        page=page,
+        page_size=page_size,
+        status=status,
+        min_balance=min_balance,
+        max_balance=max_balance,
+    )
+    return JSONResponse(jsonable_encoder(data))
+
+
 @app.api_route("/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
 @app.api_route("/models", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
+@app.api_route("/v1/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
 @app.api_route("/v1/models", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
-async def list_models(request: Request, model: str = None) -> ORJSONResponse:
+async def list_models(
+    request: Request,
+    model: Optional[str] = None,
+    _auth: None = Depends(require_service_auth),
+) -> JSONResponse:
+    request.state.model = model or "models"
     if model:
         if model not in app.state.models:
-            raise HTTPException(detail={"error": {"message": "Invalid model.", "type": "error", "param": None, "code": 400}}, status_code=400)
-        return ORJSONResponse({"id": model, "object": "model", "created": await helpers.__generate_timestamp(), "owned_by": app.state.models[model]["owned_by"], "tokens": app.state.models[model]["tokens"], "endpoints": app.state.models[model]["endpoints"]})
-    modelsData = [{"id": model, "object": "model", "created": await helpers.__generate_timestamp(), "owned_by": values["owned_by"], "tokens": values["tokens"], "endpoints": values["endpoints"]} for model, values in app.state.models.items()]
-    return ORJSONResponse({"object": "list", "data": modelsData})
+            _openai_http_error(404, "not_found_error", "Model not found")
+        meta = app.state.models[model]
+        return JSONResponse(
+            {
+                "id": model,
+                "object": "model",
+                "created": await helpers.__generate_timestamp(),
+                "owned_by": meta["owned_by"],
+                "tokens": meta["tokens"],
+                "endpoints": meta["endpoints"],
+            }
+        )
+
+    models_data = [
+        {
+            "id": model_name,
+            "object": "model",
+            "created": await helpers.__generate_timestamp(),
+            "owned_by": values["owned_by"],
+            "tokens": values["tokens"],
+            "endpoints": values["endpoints"],
+        }
+        for model_name, values in app.state.models.items()
+    ]
+    return JSONResponse({"object": "list", "data": models_data})
 
 
-@app.api_route("/chat/completions", methods=["POST", "OPTIONS"], response_model=None)
-@app.api_route("/v1/chat/completions", methods=["POST", "OPTIONS"], response_model=None)
-async def chat_completions(request: Request, data: ChatData) -> Union[StreamingResponse, ORJSONResponse]:
-    messages, model, streaming, max_tokens, stream_options, tools, tool_choice = data.messages, data.model, data.stream, data.max_tokens, data.stream_options, data.tools, data.tool_choice
-
-    # Validate messages format
-    if not await helpers.__validate_messages_format(messages):
-        raise HTTPException(detail={"error": {"message": "Invalid messages format.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if model not in app.state.models:
-        raise HTTPException(detail={"error": {"message": "Invalid model.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if tools and len(tools) > 20:
-        raise HTTPException(detail={"error": {"message": "Maximum 20 tools are allowed.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    include_usage = stream_options.get("include_usage", False) if stream_options else False
-    
-    modelData = app.state.models[model]
-    baseModel, tokensLimit, endpoints, premiumModel = modelData["baseModel"], modelData["tokens"], modelData["endpoints"], modelData["premium_model"]
-    
-    if "/v1/chat/completions" not in endpoints:
-        raise HTTPException(detail={"error": {"message": "This model does not support chat completions.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    client, subscription = await rotate_token(app.state.tokens)
-    
-    if premiumModel and not subscription:
-        raise HTTPException(detail={"error": {"message": "Premium model requires a subscription.", "type": "error", "param": None, "code": 402}}, status_code=402)
-    
-    text_messages, image_urls = await helpers.__split_content(messages)
-    
-    response = await message_handler(baseModel, text_messages, tokensLimit)
-    prompt_tokens = await helpers.__tokenize(''.join([str(message) for message in response["message"]]))
-    
-    if prompt_tokens > tokensLimit:
-        raise HTTPException(detail={"error": {"message": f"Your prompt exceeds the maximum context length of {tokensLimit} tokens.", "type": "error", "param": None, "code": 400}}, status_code=400)
-        
-    if max_tokens and sum((max_tokens, prompt_tokens)) > tokensLimit:
-        raise HTTPException(detail={"error": {
-                                        "message": f"This model's maximum context length is {tokensLimit} tokens. However your request exceeds this limit ({max_tokens} in max_tokens, {prompt_tokens} in messages).", 
-                                        "type": "error", 
-                                        "param": None, 
-                                        "code": 400}
-                                    }, status_code=400)
-    
-    raw_tool_calls = None
-    if tools:
-        if not tool_choice:
-            tool_choice = "auto"
-        raw_tool_calls = await call_tools(messages, tools, tool_choice)
-    
-    if raw_tool_calls:
-        response = {"bot": "gpt4_o_mini", "message": ""}
-        prompt_tokens = await helpers.__tokenize(''.join([str(message["content"]) for message in text_messages]))
-        
-    completion_id = await helpers.__generate_completion_id()
-    
-    return await streaming_response(client, response, model, completion_id, prompt_tokens, image_urls, max_tokens, include_usage, raw_tool_calls) \
-        if streaming else await non_streaming_response(client, response, model, completion_id, prompt_tokens, image_urls, max_tokens, raw_tool_calls)
-
-
-@app.api_route("/images/generations", methods=["POST", "OPTIONS"], response_model=None)
-@app.api_route("/v1/images/generations", methods=["POST", "OPTIONS"], response_model=None)
-async def create_images(request: Request, data: ImagesGenData) -> ORJSONResponse:
-    prompt, model, n, size = data.prompt, data.model, data.n, data.size
-    
-    if not isinstance(prompt, str):
-        raise HTTPException(detail={"error": {"message": "Invalid prompt.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if model not in app.state.models:
-        raise HTTPException(detail={"error": {"message": "Invalid model.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if not isinstance(n, int) or n < 1:
-        raise HTTPException(detail={"error": {"message": "Invalid n value.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if size == "1024x1024":
-        aspect_ratio = ""
-    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
-        aspect_ratio = app.state.models[model]["sizes"][size]
-    else:
-        raise HTTPException(detail={"error": {"message": f"Invalid size for {model}. Available sizes: {', '.join(app.state.models[model]['sizes']) if 'sizes' in app.state.models[model] else '1024x1024'}", "type": "error", "param": None, "code": 400}}, status_code=400)
-
-    modelData = app.state.models[model]
-    baseModel, tokensLimit, endpoints, premiumModel = modelData["baseModel"], modelData["tokens"], modelData["endpoints"], modelData["premium_model"]
-    
-    if "/v1/images/generations" not in endpoints:
-        raise HTTPException(detail={"error": {"message": "This model does not support image generation.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    client, subscription = await rotate_token(app.state.tokens)
-    
-    if premiumModel and not subscription:
-        raise HTTPException(detail={"error": {"message": "Premium model requires a subscription.", "type": "error", "param": None, "code": 402}}, status_code=402)
-    
-    response = await image_handler(baseModel, prompt, tokensLimit)
-    
-    urls = []
-    for _ in range(n):
-        image_generation = await generate_image(client, response, aspect_ratio)
-        urls.extend([url for url in image_generation.split() if url.startswith("https://")])
-        if len(urls) >= n:
-            break
-    urls = urls[-n:]
-    
-    if len(urls) == 0:
-        raise HTTPException(detail={"error": {"message": f"The provider for {model} sent an invalid response.", "type": "error", "param": None, "code": 500}}, status_code=500)
-        
-    async with AsyncClient(http2=True) as fetcher:
-        for url in urls:
-            r = await fetcher.get(url)
-            content_type = r.headers.get("Content-Type", "")
-            if not content_type.startswith("image/"):
-                raise HTTPException(detail={"error": {"message": "The content returned was not an image.", "type": "error", "param": None, "code": 500}}, status_code=500)
-
-    return ORJSONResponse({"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]})
-
-
-@app.api_route("/images/edits", methods=["POST", "OPTIONS"], response_model=None)
-@app.api_route("/v1/images/edits", methods=["POST", "OPTIONS"], response_model=None)
-async def edit_images(request: Request, data: ImagesEditData) -> ORJSONResponse:
-    image, prompt, model, n, size = data.image, data.prompt, data.model, data.n, data.size
-    
-    if not (isinstance(image, str) and (os.path.exists(image) or image.startswith("http"))):
-        raise HTTPException(detail={"error": {"message": "Invalid image.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if not isinstance(prompt, str):
-        raise HTTPException(detail={"error": {"message": "Invalid prompt.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if model not in app.state.models:
-        raise HTTPException(detail={"error": {"message": "Invalid model.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if not isinstance(n, int) or n < 1:
-        raise HTTPException(detail={"error": {"message": "Invalid n value.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    if size == "1024x1024":
-        aspect_ratio = ""
-    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
-        aspect_ratio = app.state.models[model]["sizes"][size]
-    else:
-        raise HTTPException(detail={"error": {"message": f"Invalid size for {model}. Available sizes: {', '.join(app.state.models[model]['sizes']) if 'sizes' in app.state.models[model] else '1024x1024'}", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    modelData = app.state.models[model]
-    baseModel, tokensLimit, endpoints, premiumModel = modelData["baseModel"], modelData["tokens"], modelData["endpoints"], modelData["premium_model"]
-    
-    if "/v1/images/edits" not in endpoints:
-        raise HTTPException(detail={"error": {"message": "This model does not support image editing.", "type": "error", "param": None, "code": 400}}, status_code=400)
-    
-    client, subscription = await rotate_token(app.state.tokens)
-    
-    if premiumModel and not subscription:
-        raise HTTPException(detail={"error": {"message": "Premium model requires a subscription.", "type": "error", "param": None, "code": 402}}, status_code=402)
-    
-    response = await image_handler(baseModel, prompt, tokensLimit)
-    
-    urls = []
-    for _ in range(n):
-        image_generation = await generate_image(client, response, aspect_ratio, [image])
-        urls.extend([url for url in image_generation.split() if url.startswith("https://")])
-        if len(urls) >= n:
-            break
-    urls = urls[-n:]
-        
-    if len(urls) == 0:
-        raise HTTPException(detail={"error": {"message": f"The provider for {model} sent an invalid response.", "type": "error", "param": None, "code": 500}}, status_code=500)
-    
-    async with AsyncClient(http2=True) as fetcher:
-        for url in urls:
-            r = await fetcher.get(url)
-            content_type = r.headers.get("Content-Type", "")
-            if not content_type.startswith("image/"):
-                raise HTTPException(detail={"error": {"message": "The content returned was not an image.", "type": "error", "param": None, "code": 500}}, status_code=500)
-            
-    return ORJSONResponse({"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]})
-   
-
-async def image_handler(baseModel: str, prompt: str, tokensLimit: int) -> dict:
+async def call_tools(client, messages, tools, tool_choice):
     try:
-        message = await helpers.__progressive_summarize_text(prompt, min(len(prompt), tokensLimit))
-        return {"bot": baseModel, "message": message}
-    except Exception as e:
-        raise HTTPException(detail={"error": {"message": f"Failed to truncate prompt. Error: {e}", "type": "error", "param": None, "code": 400}}, status_code=400) from e
-   
-   
+        response = await message_handler("gpt4_o_mini", messages, 128000, tools, tool_choice)
+        tool_calls = None
+        async for chunk in client.send_message(bot="gpt4_o_mini", message=response["message"]):
+            try:
+                raw = chunk.get("text", "").strip().replace("\n", "").replace("\\", "")
+                parsed = orjson.loads(raw)
+                if isinstance(parsed, list):
+                    tool_calls = parsed
+                    break
+            except Exception:
+                pass
+        return tool_calls
+    except Exception:
+        return None
+
+
+async def image_handler(base_model: str, prompt: str, tokens_limit: int) -> dict:
+    try:
+        message = await helpers.__progressive_summarize_text(prompt, min(len(prompt), tokens_limit))
+        return {"bot": base_model, "message": message}
+    except Exception as exc:
+        _openai_http_error(400, "invalid_request_error", f"Failed to truncate prompt: {exc}")
+
+
 async def message_handler(
-    baseModel: str, messages: List[Dict[str, str]], tokensLimit: int, tools: list[dict[str, str]] = None, tool_choice = None
+    base_model: str,
+    messages: List[Dict[str, str]],
+    tokens_limit: int,
+    tools: Optional[list[dict[str, str]]] = None,
+    tool_choice: Optional[Union[str, dict]] = None,
 ) -> dict:
-    
     try:
         main_request = messages[-1]["content"]
-        check_user = messages[::-1]
-        for message in check_user:
+        for message in messages[::-1]:
             if message["role"] == "user":
                 main_request = message["content"]
                 break
-        
+
         if tools:
-            rest_tools = await helpers.__convert_functions_format(tools, tool_choice)
+            rest_tools = await helpers.__convert_functions_format(tools, tool_choice or "auto")
             if messages[0]["role"] == "system":
                 messages[0]["content"] += rest_tools
             else:
                 messages.insert(0, {"role": "system", "content": rest_tools})
 
         full_string = await helpers.__stringify_messages(messages=messages)
-        
         history_string = await helpers.__stringify_messages(messages=messages[:-1])
-
         full_tokens = await helpers.__tokenize(full_string)
-        
-        if full_tokens > tokensLimit:
+
+        if full_tokens > tokens_limit:
             history_string = await helpers.__progressive_summarize_text(
-                history_string, tokensLimit - await helpers.__tokenize(main_request) - 100
+                history_string,
+                max(tokens_limit - await helpers.__tokenize(main_request) - 100, 1),
             )
-        
-        message = f"Your current message context: \n{history_string}\n\nReply to most recent message: {main_request}\n\n"
-        return {"bot": baseModel, "message": message}
-    except Exception as e:
-        raise HTTPException(detail={"error": {"message": f"Failed to process messages. Error: {e}", "type": "error", "param": None, "code": 400}}, status_code=400) from e
+
+        message = (
+            f"Your current message context: \n{history_string}\n\n"
+            f"Reply to most recent message: {main_request}\n\n"
+        )
+        return {"bot": base_model, "message": message}
+    except Exception as exc:
+        _openai_http_error(400, "invalid_request_error", f"Failed to process messages: {exc}")
 
 
-async def generate_image(client: AsyncPoeApi, response: dict, aspect_ratio: str, image: list = []) -> str:
+async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
+    image = image or []
     try:
-        async for chunk in client.send_message(bot=response["bot"], message=f"{response['message']} {aspect_ratio}", file_path=image):
+        async for chunk in client.send_message(
+            bot=response["bot"],
+            message=f"{response['message']} {aspect_ratio}",
+            file_path=image,
+        ):
             pass
         return chunk["text"]
-    except Exception as e:
-        raise HTTPException(detail={"error": {"message": f"Failed to generate image. Error: {e}", "type": "error", "param": None, "code": 500}}, status_code=500) from e
-    
-    
+    except Exception as exc:
+        _openai_http_error(500, "provider_error", f"Failed to generate image: {exc}")
+
+
 async def create_completion_data(
-    completion_id: str, created: int, model: str, chunk: str = None, 
-    finish_reason: str = None, include_usage: bool=False,
-    prompt_tokens: int = 0, completion_tokens: int = 0, raw_tool_calls: list[dict[str, str]] = None 
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    chunk: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+    include_usage: bool = False,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    raw_tool_calls: Optional[list[dict[str, Any]]] = None,
 ) -> Dict[str, Union[str, list, float]]:
-    
     completion_data = ChatCompletionChunk(
         id=f"chatcmpl-{completion_id}",
         object="chat.completion.chunk",
@@ -302,171 +596,766 @@ async def create_completion_data(
             ChatCompletionChunkChoice(
                 index=0,
                 delta=MessageResponse(
-                    role="assistant", 
+                    role="assistant",
                     content=chunk,
-                    tool_calls=[ChoiceDeltaToolCall(
-                            index = raw_tool_calls.index(tool_call),
+                    tool_calls=[
+                        ChoiceDeltaToolCall(
+                            index=raw_tool_calls.index(tool_call),
                             id=f"call-{await helpers.__generate_completion_id()}",
-                            function=ChoiceDeltaToolCallFunction(name=tool_call["name"], arguments=orjson.dumps(tool_call["arguments"]))) for tool_call in raw_tool_calls] if raw_tool_calls else None
-                    ),
+                            function=ChoiceDeltaToolCallFunction(
+                                name=tool_call["name"],
+                                arguments=orjson.dumps(tool_call["arguments"]).decode("utf-8"),
+                            ),
+                        )
+                        for tool_call in raw_tool_calls
+                    ]
+                    if raw_tool_calls
+                    else None,
+                ),
                 finish_reason=finish_reason,
             )
         ],
     )
-    
+
     if include_usage:
         completion_data.usage = None
-        if finish_reason in ("stop", "length"):
+        if finish_reason in ("stop", "length", "tool_calls"):
             completion_data.usage = ChatCompletionUsage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens)
-    
+                total_tokens=prompt_tokens + completion_tokens,
+            )
+
     return completion_data.model_dump()
-    
-    
+
+
+async def _finalize_success(runtime: GatewayRuntime, account_id: str) -> None:
+    await runtime.repo.mark_account_success(account_id)
+
+
 async def generate_chunks(
-    client: AsyncPoeApi, response: dict, model: str, completion_id: str, 
-    prompt_tokens: int, image_urls: List[str], max_tokens: int, include_usage:bool, raw_tool_calls: list[dict[str, str]] = None
+    *,
+    runtime: GatewayRuntime,
+    client,
+    response: dict,
+    model: str,
+    completion_id: str,
+    prompt_tokens: int,
+    image_urls: List[str],
+    max_tokens: Optional[int],
+    include_usage: bool,
+    raw_tool_calls: Optional[list[dict[str, Any]]],
+    chat_code: Optional[str],
+    chat_id: Optional[int],
+    session_id: str,
+    persistent_session: bool,
+    account_id: str,
+    lease: AccountLease,
 ) -> AsyncGenerator[bytes, None]:
-    
+    completion_timestamp = await helpers.__generate_timestamp()
+    emitted_done = False
+    completion_tokens = 0
+    finish_reason = "stop"
     try:
-        completion_timestamp = await helpers.__generate_timestamp()
-        finish_reason = "stop"
-        
         if not raw_tool_calls:
-            async for chunk in client.send_message(bot=response["bot"], message=response["message"], file_path=image_urls):
-                chunk_token = await helpers.__tokenize(chunk["text"])
-                
-                if max_tokens and chunk_token >= max_tokens:
+            async for chunk in client.send_message(
+                bot=response["bot"],
+                message=response["message"],
+                file_path=image_urls,
+                chatCode=chat_code,
+                chatId=chat_id,
+            ):
+                if persistent_session:
+                    incoming_chat_code = chunk.get("chatCode") or chat_code
+                    incoming_chat_id = chunk.get("chatId") or chat_id
+                    if incoming_chat_code and incoming_chat_id:
+                        chat_code = incoming_chat_code
+                        chat_id = incoming_chat_id
+                        await runtime.sessions.update_session_chat(
+                            session_id=session_id,
+                            model=model,
+                            account_id=account_id,
+                            chat_code=chat_code,
+                            chat_id=chat_id,
+                        )
+                completion_tokens = await helpers.__tokenize(chunk["text"])
+                if max_tokens and completion_tokens >= max_tokens:
                     await client.cancel_message(chunk)
                     finish_reason = "length"
                     break
-                
+
                 content = await create_completion_data(
-                                                    completion_id=completion_id, 
-                                                    created=completion_timestamp,
-                                                    model=model, 
-                                                    chunk=chunk["response"], 
-                                                    include_usage=include_usage
-                                                    )
-                
+                    completion_id=completion_id,
+                    created=completion_timestamp,
+                    model=model,
+                    chunk=chunk["response"],
+                    include_usage=include_usage,
+                )
                 yield b"data: " + orjson.dumps(content) + b"\n\n"
                 await asyncio.sleep(0.001)
-                
-            end_completion_data = await create_completion_data(
-                                                            completion_id=completion_id, 
-                                                            created=completion_timestamp,
-                                                            model=model, 
-                                                            finish_reason=finish_reason, 
-                                                            include_usage=include_usage, 
-                                                            prompt_tokens=prompt_tokens, 
-                                                            completion_tokens=chunk_token
-                                                            )
-            
-            yield b"data: " +  orjson.dumps(end_completion_data) + b"\n\n"
-            
-        else:
-            chunk_token = await helpers.__tokenize(''.join([str(tool_call["name"]) + str(tool_call["arguments"]) for tool_call in raw_tool_calls]))
-            content = await create_completion_data(
-                                                completion_id=completion_id, 
-                                                created=completion_timestamp,
-                                                model=model, 
-                                                chunk=None,
-                                                finish_reason="tool_calls",
-                                                include_usage=include_usage,
-                                                prompt_tokens=prompt_tokens,
-                                                completion_tokens=chunk_token,
-                                                raw_tool_calls=raw_tool_calls)
-            yield b"data: " + orjson.dumps(content) + b"\n\n"
-            await asyncio.sleep(0.01)
-   
-        yield b"data: [DONE]\n\n"
-    except GeneratorExit:
-        pass
-    except Exception as e:
-        raise HTTPException(detail={"error": {"message": f"Failed to stream response. Error: {e}", "type": "error", "param": None, "code": 500}}, status_code=500) from e
 
-    
+            end_chunk = await create_completion_data(
+                completion_id=completion_id,
+                created=completion_timestamp,
+                model=model,
+                finish_reason=finish_reason,
+                include_usage=include_usage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            yield b"data: " + orjson.dumps(end_chunk) + b"\n\n"
+        else:
+            completion_tokens = await helpers.__tokenize(
+                "".join([str(tool_call["name"]) + str(tool_call["arguments"]) for tool_call in raw_tool_calls])
+            )
+            tool_chunk = await create_completion_data(
+                completion_id=completion_id,
+                created=completion_timestamp,
+                model=model,
+                chunk=None,
+                finish_reason="tool_calls",
+                include_usage=include_usage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                raw_tool_calls=raw_tool_calls,
+            )
+            yield b"data: " + orjson.dumps(tool_chunk) + b"\n\n"
+            await asyncio.sleep(0.01)
+
+        yield b"data: [DONE]\n\n"
+        emitted_done = True
+        await _finalize_success(runtime, account_id)
+    except asyncio.CancelledError:
+        # Client closed the streaming connection; avoid noisy ASGI stack traces.
+        pass
+    except Exception as exc:
+        payload, _ = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
+        yield b"data: " + orjson.dumps(payload) + b"\n\n"
+        if not emitted_done:
+            yield b"data: [DONE]\n\n"
+    finally:
+        runtime.refresher.schedule_refresh(account_id)
+        await lease.release()
+
+
 async def streaming_response(
-    client: AsyncPoeApi, response: dict, model: str, completion_id: str, 
-    prompt_tokens: int, image_urls: List[str], max_tokens: int, include_usage: bool, raw_tool_calls: list[dict[str, str]] = None
+    *,
+    runtime: GatewayRuntime,
+    client,
+    response: dict,
+    model: str,
+    completion_id: str,
+    prompt_tokens: int,
+    image_urls: List[str],
+    max_tokens: Optional[int],
+    include_usage: bool,
+    raw_tool_calls: Optional[list[dict[str, Any]]],
+    chat_code: Optional[str],
+    chat_id: Optional[int],
+    session_id: str,
+    persistent_session: bool,
+    account_id: str,
+    lease: AccountLease,
 ) -> StreamingResponse:
-    
-    return StreamingResponse(content=generate_chunks(client, response, model, completion_id, prompt_tokens, image_urls, max_tokens, include_usage, raw_tool_calls), status_code=200, 
-                             headers={"X-Request-ID": str(uuid.uuid4()), "Content-Type": "text/event-stream"})
+    return StreamingResponse(
+        content=generate_chunks(
+            runtime=runtime,
+            client=client,
+            response=response,
+            model=model,
+            completion_id=completion_id,
+            prompt_tokens=prompt_tokens,
+            image_urls=image_urls,
+            max_tokens=max_tokens,
+            include_usage=include_usage,
+            raw_tool_calls=raw_tool_calls,
+            chat_code=chat_code,
+            chat_id=chat_id,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            account_id=account_id,
+            lease=lease,
+        ),
+        status_code=200,
+        headers={"Content-Type": "text/event-stream", "X-Request-ID": str(uuid.uuid4())},
+    )
 
 
 async def non_streaming_response(
-    client: AsyncPoeApi, response: dict, model: str, completion_id: str,
-    prompt_tokens: int, image_urls: List[str], max_tokens: int, raw_tool_calls: list[dict[str, str]] = None
-) -> ORJSONResponse:
-    
-    if not raw_tool_calls:
-        try:
+    *,
+    runtime: GatewayRuntime,
+    client,
+    response: dict,
+    model: str,
+    completion_id: str,
+    prompt_tokens: int,
+    image_urls: List[str],
+    max_tokens: Optional[int],
+    raw_tool_calls: Optional[list[dict[str, Any]]],
+    chat_code: Optional[str],
+    chat_id: Optional[int],
+    session_id: str,
+    persistent_session: bool,
+    account_id: str,
+    lease: AccountLease,
+) -> JSONResponse:
+    try:
+        if not raw_tool_calls:
             finish_reason = "stop"
-            async for chunk in client.send_message(bot=response["bot"], message=response["message"], file_path=image_urls):
+            async for chunk in client.send_message(
+                bot=response["bot"],
+                message=response["message"],
+                file_path=image_urls,
+                chatCode=chat_code,
+                chatId=chat_id,
+            ):
+                if persistent_session:
+                    incoming_chat_code = chunk.get("chatCode") or chat_code
+                    incoming_chat_id = chunk.get("chatId") or chat_id
+                    if incoming_chat_code and incoming_chat_id:
+                        chat_code = incoming_chat_code
+                        chat_id = incoming_chat_id
+                        await runtime.sessions.update_session_chat(
+                            session_id=session_id,
+                            model=model,
+                            account_id=account_id,
+                            chat_code=chat_code,
+                            chat_id=chat_id,
+                        )
                 if max_tokens and await helpers.__tokenize(chunk["text"]) >= max_tokens:
                     await client.cancel_message(chunk)
                     finish_reason = "length"
                     break
-                pass
-        except Exception as e:
-            raise HTTPException(detail={"error": {"message": f"Failed to generate completion. Error: {e}", "type": "error", "param": None, "code": 500}}, status_code=500) from e
-        
-        completion_tokens = await helpers.__tokenize(chunk["text"])
-        
-    else:
-        completion_tokens = await helpers.__tokenize(''.join([str(tool_call["name"]) + str(tool_call["arguments"]) for tool_call in raw_tool_calls]))
-        chunk = {"text": ""}
-        finish_reason = "tool_calls"
-        
-    content = ChatCompletionResponse(
-        id=f"chatcmpl-{completion_id}",
-        object="chat.completion",
-        created=await helpers.__generate_timestamp(),
-        model=model,
-        usage=ChatCompletionUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-        choices=[
-            ChatCompletionResponseChoice(
-                index=0,
-                message=MessageResponse(role="assistant", content=None if raw_tool_calls else chunk["text"],
-                                        tool_calls=[ChatCompletionMessageToolCall(
-                                            id=f"call-{await helpers.__generate_completion_id()}",
-                                            function=FunctionCall(name=tool_call["name"], arguments=orjson.dumps(tool_call["arguments"]))) for tool_call in raw_tool_calls] if raw_tool_calls else None),
-                finish_reason=finish_reason,
+            completion_tokens = await helpers.__tokenize(chunk["text"])
+            message_content = chunk["text"]
+        else:
+            completion_tokens = await helpers.__tokenize(
+                "".join([str(tool_call["name"]) + str(tool_call["arguments"]) for tool_call in raw_tool_calls])
             )
-        ],  
+            finish_reason = "tool_calls"
+            message_content = None
+
+        content = ChatCompletionResponse(
+            id=f"chatcmpl-{completion_id}",
+            object="chat.completion",
+            created=await helpers.__generate_timestamp(),
+            model=model,
+            usage=ChatCompletionUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=MessageResponse(
+                        role="assistant",
+                        content=message_content,
+                        tool_calls=[
+                            ChatCompletionMessageToolCall(
+                                id=f"call-{await helpers.__generate_completion_id()}",
+                                function=FunctionCall(
+                                    name=tool_call["name"],
+                                    arguments=orjson.dumps(tool_call["arguments"]).decode("utf-8"),
+                                ),
+                            )
+                            for tool_call in raw_tool_calls
+                        ]
+                        if raw_tool_calls
+                        else None,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+        )
+        await _finalize_success(runtime, account_id)
+        return JSONResponse(content.model_dump())
+    except Exception as exc:
+        payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
+        raise HTTPException(status_code=status, detail=payload)
+    finally:
+        runtime.refresher.schedule_refresh(account_id)
+        await lease.release()
+
+
+async def _acquire_account_for_chat(
+    runtime: GatewayRuntime,
+    *,
+    session_id: str,
+    persistent_session: bool,
+    model: str,
+) -> tuple[dict[str, Any], AccountLease, Optional[str], Optional[int]]:
+    if persistent_session:
+        session = await runtime.sessions.get_session(session_id)
+        if session:
+            if session.get("state") == "broken":
+                _openai_http_error(
+                    409,
+                    "invalid_request_error",
+                    "Session is broken. Create a new session_id and retry.",
+                    {"session_id": session_id},
+                )
+            account_id = session.get("account_id")
+            if not account_id:
+                _openai_http_error(409, "invalid_request_error", "Session has no bound account")
+            account_doc = await runtime.repo.get_account_by_id(account_id)
+            if not account_doc or account_doc.get("status") != "active":
+                await runtime.sessions.break_session(session_id, "bound account unavailable")
+                _openai_http_error(
+                    409,
+                    "invalid_request_error",
+                    "Bound account is unavailable. Create a new session_id and retry.",
+                    {"session_id": session_id},
+                )
+            if not await runtime.limiter.try_acquire(account_id):
+                _openai_http_error(429, "rate_limit_error", "Session account is busy, retry later")
+            lease = AccountLease(account_id=account_id, limiter=runtime.limiter)
+            await runtime.repo.touch_session(session_id)
+            return account_doc, lease, session.get("chat_code"), session.get("chat_id")
+
+    try:
+        account_doc, lease = await runtime.selector.select_account()
+    except NoAccountAvailableError:
+        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+    except CapacityLimitError:
+        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
+
+    account_id = str(account_doc["_id"])
+    if persistent_session:
+        await runtime.sessions.bind_session(
+            session_id=session_id,
+            model=model,
+            account_id=account_id,
+            chat_code=None,
+            chat_id=None,
+        )
+    return account_doc, lease, None, None
+
+
+@app.api_route("/chat/completions", methods=["POST", "OPTIONS"], response_model=None)
+@app.api_route("/v1/chat/completions", methods=["POST", "OPTIONS"], response_model=None)
+async def chat_completions(
+    request: Request,
+    data: ChatData,
+    _auth: None = Depends(require_service_auth),
+) -> Union[StreamingResponse, JSONResponse]:
+    return await _chat_completions_impl(request, data)
+
+
+async def _chat_completions_impl(
+    request: Request,
+    data: ChatData,
+) -> Union[StreamingResponse, JSONResponse]:
+    runtime = _runtime()
+    messages = data.messages
+    model = data.model
+    streaming = bool(data.stream)
+    max_tokens = data.max_completion_tokens or data.max_tokens
+    stream_options = data.stream_options
+    tools = data.tools
+    tool_choice = data.tool_choice
+    metadata = data.metadata
+    user = data.user
+    request.state.model = model
+
+    if not await helpers.__validate_messages_format(messages):
+        _openai_http_error(400, "invalid_request_error", "Invalid messages format")
+    if model not in app.state.models:
+        _openai_http_error(404, "not_found_error", "Invalid model")
+    if data.n not in (None, 1):
+        _openai_http_error(400, "invalid_request_error", "n must be exactly 1")
+    if tools and len(tools) > 20:
+        _openai_http_error(400, "invalid_request_error", "Maximum 20 tools are allowed")
+
+    include_usage = stream_options.get("include_usage", False) if stream_options else False
+    model_data = app.state.models[model]
+    base_model = model_data["baseModel"]
+    tokens_limit = model_data["tokens"]
+    endpoints = model_data["endpoints"]
+    premium_model = bool(model_data.get("premium_model", False))
+
+    if "/v1/chat/completions" not in endpoints:
+        _openai_http_error(400, "invalid_request_error", "This model does not support chat completions")
+
+    session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
+    request.state.session_id = session_id
+
+    account_doc, lease, chat_code, chat_id = await _acquire_account_for_chat(
+        runtime,
+        session_id=session_id,
+        persistent_session=persistent_session,
+        model=model,
     )
-    
-    return ORJSONResponse(content.model_dump())
+    account_id = str(account_doc["_id"])
+    request.state.account_id = account_id
+
+    if premium_model and not bool(account_doc.get("subscription_active", False)):
+        await runtime.refresher.refresh_account(account_id)
+        refreshed = await runtime.repo.get_account_by_id(account_id)
+        if not refreshed or not refreshed.get("subscription_active", False):
+            await lease.release()
+            _openai_http_error(
+                402,
+                "insufficient_credits",
+                "Premium model requires an active subscription on selected account",
+            )
+        account_doc = refreshed
+
+    try:
+        client = await runtime.pool.get_client(account_doc)
+    except Exception as exc:
+        payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
+        await lease.release()
+        raise HTTPException(status_code=status, detail=payload)
+
+    text_messages, image_urls = await helpers.__split_content(messages)
+    response = await message_handler(base_model, text_messages, tokens_limit)
+    prompt_tokens = await helpers.__tokenize("".join([str(message) for message in response["message"]]))
+
+    if prompt_tokens > tokens_limit:
+        await lease.release()
+        _openai_http_error(
+            413,
+            "request_too_large",
+            f"Your prompt exceeds the maximum context length of {tokens_limit} tokens",
+        )
+    if max_tokens and (max_tokens + prompt_tokens) > tokens_limit:
+        await lease.release()
+        _openai_http_error(
+            413,
+            "request_too_large",
+            (
+                f"This model's maximum context length is {tokens_limit}. "
+                f"Request exceeds limit ({max_tokens} in max_tokens, {prompt_tokens} in prompt)"
+            ),
+        )
+
+    raw_tool_calls = None
+    if tools:
+        raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
+    if raw_tool_calls:
+        response = {"bot": "gpt4_o_mini", "message": ""}
+        prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
+
+    completion_id = await helpers.__generate_completion_id()
+
+    if streaming:
+        return await streaming_response(
+            runtime=runtime,
+            client=client,
+            response=response,
+            model=model,
+            completion_id=completion_id,
+            prompt_tokens=prompt_tokens,
+            image_urls=image_urls,
+            max_tokens=max_tokens,
+            include_usage=include_usage,
+            raw_tool_calls=raw_tool_calls,
+            chat_code=chat_code,
+            chat_id=chat_id,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            account_id=account_id,
+            lease=lease,
+        )
+
+    return await non_streaming_response(
+        runtime=runtime,
+        client=client,
+        response=response,
+        model=model,
+        completion_id=completion_id,
+        prompt_tokens=prompt_tokens,
+        image_urls=image_urls,
+        max_tokens=max_tokens,
+        raw_tool_calls=raw_tool_calls,
+        chat_code=chat_code,
+        chat_id=chat_id,
+        session_id=session_id,
+        persistent_session=persistent_session,
+        account_id=account_id,
+        lease=lease,
+    )
 
 
-async def rotate_token(tokens) -> Tuple[AsyncPoeApi, bool]:
-    if len(tokens) == 0:
-        raise HTTPException(detail={"error": {"message": "All tokens have been used. Please add more tokens.", "type": "error", "param": None, "code": 402}}, status_code=402)
-    token = random.choice(tokens)
-    client = await AsyncPoeApi(token).create()
-    settings = await client.get_settings()
-    if settings["messagePointInfo"]["messagePointBalance"] <= 20:
-        tokens.remove(token)
-        return await rotate_token(tokens)
-    subscriptions = settings["subscription"]["isActive"]
-    return client, subscriptions
+@app.api_route("/images/generations", methods=["POST", "OPTIONS"], response_model=None)
+@app.api_route("/v1/images/generations", methods=["POST", "OPTIONS"], response_model=None)
+async def create_images(
+    request: Request,
+    data: ImagesGenData,
+    _auth: None = Depends(require_service_auth),
+) -> JSONResponse:
+    runtime = _runtime()
+    prompt, model, n, size = data.prompt, data.model, data.n, data.size
+    request.state.model = model
+
+    if not isinstance(prompt, str):
+        _openai_http_error(400, "invalid_request_error", "Invalid prompt")
+    if model not in app.state.models:
+        _openai_http_error(404, "not_found_error", "Invalid model")
+    if not isinstance(n, int) or n < 1:
+        _openai_http_error(400, "invalid_request_error", "Invalid n value")
+
+    if size == "1024x1024":
+        aspect_ratio = ""
+    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
+        aspect_ratio = app.state.models[model]["sizes"][size]
+    else:
+        _openai_http_error(400, "invalid_request_error", f"Invalid size for model {model}")
+
+    model_data = app.state.models[model]
+    base_model = model_data["baseModel"]
+    tokens_limit = model_data["tokens"]
+    endpoints = model_data["endpoints"]
+    premium_model = bool(model_data.get("premium_model", False))
+    if "/v1/images/generations" not in endpoints:
+        _openai_http_error(400, "invalid_request_error", "Model does not support image generation")
+
+    try:
+        account_doc, lease = await runtime.selector.select_account()
+    except NoAccountAvailableError:
+        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+    except CapacityLimitError:
+        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
+    account_id = str(account_doc["_id"])
+    request.state.account_id = account_id
+
+    if premium_model and not bool(account_doc.get("subscription_active", False)):
+        await lease.release()
+        _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
+
+    try:
+        client = await runtime.pool.get_client(account_doc)
+        response = await image_handler(base_model, prompt, tokens_limit)
+
+        urls: list[str] = []
+        for _ in range(n):
+            image_generation = await generate_image(client, response, aspect_ratio)
+            urls.extend([url for url in image_generation.split() if url.startswith("https://")])
+            if len(urls) >= n:
+                break
+        urls = urls[-n:]
+        if len(urls) == 0:
+            _openai_http_error(500, "provider_error", f"Provider for {model} sent invalid response")
+
+        async with AsyncClient(http2=True, timeout=20) as fetcher:
+            for url in urls:
+                resp = await fetcher.get(url)
+                content_type = resp.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    _openai_http_error(500, "provider_error", "The content returned was not an image")
+
+        await _finalize_success(runtime, account_id)
+        return JSONResponse(
+            {"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]}
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        payload, status = await _account_error_payload(runtime, account_id, "ephemeral", False, exc)
+        raise HTTPException(status_code=status, detail=payload)
+    finally:
+        runtime.refresher.schedule_refresh(account_id)
+        await lease.release()
+
+
+@app.api_route("/images/edits", methods=["POST", "OPTIONS"], response_model=None)
+@app.api_route("/v1/images/edits", methods=["POST", "OPTIONS"], response_model=None)
+async def edit_images(
+    request: Request,
+    data: ImagesEditData,
+    _auth: None = Depends(require_service_auth),
+) -> JSONResponse:
+    runtime = _runtime()
+    image, prompt, model, n, size = data.image, data.prompt, data.model, data.n, data.size
+    request.state.model = model
+
+    if not (isinstance(image, str) and (os.path.exists(image) or image.startswith("http"))):
+        _openai_http_error(400, "invalid_request_error", "Invalid image input")
+    if not isinstance(prompt, str):
+        _openai_http_error(400, "invalid_request_error", "Invalid prompt")
+    if model not in app.state.models:
+        _openai_http_error(404, "not_found_error", "Invalid model")
+    if not isinstance(n, int) or n < 1:
+        _openai_http_error(400, "invalid_request_error", "Invalid n value")
+
+    if size == "1024x1024":
+        aspect_ratio = ""
+    elif "sizes" in app.state.models[model] and size in app.state.models[model]["sizes"]:
+        aspect_ratio = app.state.models[model]["sizes"][size]
+    else:
+        _openai_http_error(400, "invalid_request_error", f"Invalid size for model {model}")
+
+    model_data = app.state.models[model]
+    base_model = model_data["baseModel"]
+    tokens_limit = model_data["tokens"]
+    endpoints = model_data["endpoints"]
+    premium_model = bool(model_data.get("premium_model", False))
+    if "/v1/images/edits" not in endpoints:
+        _openai_http_error(400, "invalid_request_error", "Model does not support image edits")
+
+    try:
+        account_doc, lease = await runtime.selector.select_account()
+    except NoAccountAvailableError:
+        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+    except CapacityLimitError:
+        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
+    account_id = str(account_doc["_id"])
+    request.state.account_id = account_id
+
+    if premium_model and not bool(account_doc.get("subscription_active", False)):
+        await lease.release()
+        _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
+
+    try:
+        client = await runtime.pool.get_client(account_doc)
+        response = await image_handler(base_model, prompt, tokens_limit)
+
+        urls: list[str] = []
+        for _ in range(n):
+            image_generation = await generate_image(client, response, aspect_ratio, [image])
+            urls.extend([url for url in image_generation.split() if url.startswith("https://")])
+            if len(urls) >= n:
+                break
+        urls = urls[-n:]
+        if len(urls) == 0:
+            _openai_http_error(500, "provider_error", f"Provider for {model} sent invalid response")
+
+        async with AsyncClient(http2=True, timeout=20) as fetcher:
+            for url in urls:
+                resp = await fetcher.get(url)
+                content_type = resp.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    _openai_http_error(500, "provider_error", "The content returned was not an image")
+
+        await _finalize_success(runtime, account_id)
+        return JSONResponse(
+            {"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]}
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        payload, status = await _account_error_payload(runtime, account_id, "ephemeral", False, exc)
+        raise HTTPException(status_code=status, detail=payload)
+    finally:
+        runtime.refresher.schedule_refresh(account_id)
+        await lease.release()
+
+
+def _normalize_responses_input(input_data: Any) -> list[dict[str, Any]]:
+    if isinstance(input_data, str):
+        return [{"role": "user", "content": input_data}]
+    if not isinstance(input_data, list):
+        return [{"role": "user", "content": str(input_data)}]
+
+    messages: list[dict[str, Any]] = []
+    for item in input_data:
+        if isinstance(item, dict) and "role" in item and "content" in item:
+            content = item["content"]
+            if isinstance(content, list):
+                parts: list[dict[str, Any]] = []
+                for sub in content:
+                    if not isinstance(sub, dict):
+                        continue
+                    subtype = sub.get("type")
+                    if subtype in ("input_text", "output_text", "text"):
+                        parts.append({"type": "text", "text": sub.get("text", "")})
+                    elif subtype in ("image_url",):
+                        parts.append({"type": "image_url", "image_url": sub.get("image_url")})
+                messages.append({"role": item["role"], "content": parts or ""})
+            else:
+                messages.append({"role": item["role"], "content": content})
+        elif isinstance(item, dict) and item.get("type") in ("input_text", "output_text", "text"):
+            messages.append({"role": "user", "content": item.get("text", "")})
+        elif isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+    return messages or [{"role": "user", "content": ""}]
+
+
+@app.api_route("/responses", methods=["POST", "OPTIONS"], response_model=None)
+@app.api_route("/v1/responses", methods=["POST", "OPTIONS"], response_model=None)
+async def create_responses(
+    request: Request,
+    data: ResponsesData,
+    _auth: None = Depends(require_service_auth),
+) -> Union[StreamingResponse, JSONResponse]:
+    chat_payload = ChatData(
+        model=data.model,
+        messages=_normalize_responses_input(data.input),
+        stream=data.stream,
+        max_tokens=data.max_output_tokens,
+        metadata=data.metadata,
+        user=data.user,
+    )
+    chat_response = await _chat_completions_impl(request, chat_payload)
+
+    if data.stream:
+        if isinstance(chat_response, StreamingResponse):
+            chat_response.headers["x-poe-responses-compat"] = "chat-completion-stream"
+        return chat_response
+
+    if not isinstance(chat_response, JSONResponse):
+        return chat_response
+
+    payload = orjson.loads(chat_response.body)
+    assistant_text = ""
+    if payload.get("choices"):
+        assistant_text = payload["choices"][0].get("message", {}).get("content") or ""
+    usage = payload.get("usage", {})
+    responses_payload = {
+        "id": f"resp_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": await helpers.__generate_timestamp(),
+        "status": "completed",
+        "model": data.model,
+        "output": [
+            {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": assistant_text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+    return JSONResponse(responses_payload, headers=dict(chat_response.headers))
+
+
+@app.api_route(
+    "/v1/{full_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    response_model=None,
+)
+async def unsupported_v1_path(
+    full_path: str,
+    _auth: None = Depends(require_service_auth),
+) -> JSONResponse:
+    _openai_http_error(
+        400,
+        "not_supported_error",
+        f"/v1/{full_path} is not supported by this gateway yet",
+    )
 
 
 if __name__ == "__main__":
-    CommandLineInterface().run(["api:app", "--bind", "127.0.0.1", "--port", "8000"])
-    
-    
-def start_server(tokens: list, address: str="127.0.0.1", port: str="8000"):
-    if not isinstance(tokens, list):
-        raise TypeError("Tokens must be a list.")
-    if not all(isinstance(token, dict) for token in tokens):
-        raise TypeError("Tokens must be a list of dictionaries.")
-    app.state.tokens = tokens
-    CommandLineInterface().run(["poe_api_wrapper.openai.api:app", "--bind", f"{address}", "--port", f"{port}"])
+    uvicorn.run("poe_api_wrapper.openai.api:app", host="127.0.0.1", port=8000, workers=1)
+
+
+def start_server(tokens: Optional[list] = None, address: str = "127.0.0.1", port: str = "8000"):
+    if tokens is not None:
+        logger.warning(
+            "The `tokens` argument is ignored in Mongo gateway mode. "
+            "Use /admin/accounts/upsert to manage accounts."
+        )
+    uvicorn.run("poe_api_wrapper.openai.api:app", host=address, port=int(port), workers=1)
+

@@ -314,8 +314,10 @@ class AsyncPoeApi:
             except Exception as e:
                 logger.error(f"Failed to run websocket. Reason: {e}")
             finally:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-                self.loop.close()
+                # Never stop/close the application's running event loop from this worker thread.
+                # Doing so can crash uvicorn/asyncio with:
+                # "RuntimeError: Cannot close a running event loop".
+                pass
              
     async def connect_ws(self, timeout=20):
          
@@ -454,9 +456,24 @@ class AsyncPoeApi:
             self.refresh_ws()
             
     def refresh_ws(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_in_executor(None, self.connect_ws())
+        if self.ws_connecting:
+            return
+
+        target_loop = getattr(self, "loop", None)
+        if target_loop and target_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.connect_ws(), target_loop)
+
+            def _done_callback(fut):
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.error(f"Failed to refresh websocket. Reason: {e}")
+
+            future.add_done_callback(_done_callback)
+            return
+
+        # Fallback: no running loop available to schedule reconnect.
+        logger.warning("Skipping websocket refresh: no running event loop available.")
             
     async def delete_queues(self, chatId: int):
         if chatId in self.message_queues:
