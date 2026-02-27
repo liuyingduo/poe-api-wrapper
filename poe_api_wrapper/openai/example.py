@@ -7,33 +7,33 @@ http_client = httpx.Client(
 )
 client = openai.OpenAI(
     api_key="svc_app_zaiwen",
-    base_url="http://127.0.0.1:8003/v1/",
+    base_url="http://207.180.218.216:8003/v1/",
     http_client=http_client,
 )
 
-# Non-Streaming Example
-response = client.chat.completions.create(
-    model="gpt-3.5-turbo", 
-    messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Hello!"}
-            ]
-)
+# # Non-Streaming Example
+# response = client.chat.completions.create(
+#     model="gpt-3.5-turbo", 
+#     messages = [
+#                 {"role": "system", "content": "You are a helpful assistant."},
+#                 {"role": "user", "content": "Hello!"}
+#             ]
+# )
 
-print(response.choices[0].message.content)
+# print(response.choices[0].message.content)
 
-# Streaming Example
-stream = client.chat.completions.create(
-    model="gpt-3.5-turbo", 
-    messages = [
-                {"role": "user", "content": "this is a test request, write a short poem"}
-            ],
-    stream=True
-)
+# # Streaming Example
+# stream = client.chat.completions.create(
+#     model="gpt-3.5-turbo", 
+#     messages = [
+#                 {"role": "user", "content": "this is a test request, write a short poem"}
+#             ],
+#     stream=True
+# )
 
-for chunk in stream:
-    if chunk.choices[0].delta.content is not None:
-        print(chunk.choices[0].delta.content, end="")
+# for chunk in stream:
+#     if chunk.choices[0].delta.content is not None:
+#         print(chunk.choices[0].delta.content, end="")
         
 image_input = client.chat.completions.create(
     model="GPT-4o",
@@ -44,7 +44,7 @@ image_input = client.chat.completions.create(
                 {"type": "text", "text": "What's in this image?"},
                 {
                     "type": "image_url",
-                    "image_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+                    "image_url": "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg",
                 },
             ],
         }

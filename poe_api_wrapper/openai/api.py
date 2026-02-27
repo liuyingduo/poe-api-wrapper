@@ -145,6 +145,8 @@ class GatewayConfig:
     service_api_keys_bootstrap: list[str]
     poe_proxy_urls: list[str]
     poe_request_retry_limit: int
+    poe_chat_timeout_seconds: int
+    poe_media_timeout_seconds: int
     max_inflight_per_account: int
     global_inflight_limit: int
     depleted_threshold: int
@@ -170,6 +172,8 @@ class GatewayConfig:
             service_api_keys_bootstrap=_split_csv(os.getenv("SERVICE_API_KEYS_BOOTSTRAP", "")),
             poe_proxy_urls=_split_csv(os.getenv("POE_PROXY_URLS", "")),
             poe_request_retry_limit=_env_int("POE_REQUEST_RETRY_LIMIT", 4),
+            poe_chat_timeout_seconds=_env_int("POE_CHAT_TIMEOUT_SECONDS", 30),
+            poe_media_timeout_seconds=_env_int("POE_MEDIA_TIMEOUT_SECONDS", 120),
             max_inflight_per_account=_env_int("MAX_INFLIGHT_PER_ACCOUNT", 2),
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
@@ -521,11 +525,15 @@ async def list_models(
     return JSONResponse({"object": "list", "data": models_data})
 
 
-async def call_tools(client, messages, tools, tool_choice):
+async def call_tools(client, messages, tools, tool_choice, timeout_seconds: int):
     try:
         response = await message_handler("gpt4_o_mini", messages, 128000, tools, tool_choice)
         tool_calls = None
-        async for chunk in client.send_message(bot="gpt4_o_mini", message=response["message"]):
+        async for chunk in client.send_message(
+            bot="gpt4_o_mini",
+            message=response["message"],
+            timeout=max(5, int(timeout_seconds)),
+        ):
             try:
                 raw = chunk.get("text", "").strip().replace("\n", "").replace("\\", "")
                 parsed = orjson.loads(raw)
@@ -674,13 +682,20 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     return resolved_paths, temp_files
 
 
-async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
+async def generate_image(
+    client,
+    response: dict,
+    aspect_ratio: str,
+    image: list = None,
+    timeout_seconds: int = 120,
+) -> str:
     image = image or []
     try:
         async for chunk in client.send_message(
             bot=response["bot"],
             message=f"{response['message']} {aspect_ratio}",
             file_path=image,
+            timeout=max(5, int(timeout_seconds)),
         ):
             pass
         return chunk["text"]
@@ -764,6 +779,7 @@ async def generate_chunks(
     session_id: str,
     persistent_session: bool,
     account_id: str,
+    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
@@ -778,6 +794,7 @@ async def generate_chunks(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
+                timeout=max(5, int(message_timeout_seconds)),
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -871,6 +888,7 @@ async def streaming_response(
     session_id: str,
     persistent_session: bool,
     account_id: str,
+    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> StreamingResponse:
     return StreamingResponse(
@@ -891,6 +909,7 @@ async def streaming_response(
             session_id=session_id,
             persistent_session=persistent_session,
             account_id=account_id,
+            message_timeout_seconds=message_timeout_seconds,
             lease=lease,
         ),
         status_code=200,
@@ -915,6 +934,7 @@ async def non_streaming_response(
     session_id: str,
     persistent_session: bool,
     account_id: str,
+    message_timeout_seconds: int,
     lease: AccountLease,
 ) -> JSONResponse:
     try:
@@ -926,6 +946,7 @@ async def non_streaming_response(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
+                timeout=max(5, int(message_timeout_seconds)),
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -1151,7 +1172,13 @@ async def _chat_completions_impl(
 
     raw_tool_calls = None
     if tools:
-        raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
+        raw_tool_calls = await call_tools(
+            client,
+            text_messages,
+            tools,
+            tool_choice,
+            int(runtime.config.poe_chat_timeout_seconds),
+        )
     if raw_tool_calls:
         response = {"bot": "gpt4_o_mini", "message": ""}
         prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
@@ -1174,6 +1201,13 @@ async def _chat_completions_impl(
                 f"Failed to process image_url attachments: {exc}",
             )
 
+    message_timeout_seconds = int(runtime.config.poe_chat_timeout_seconds)
+    if attachment_paths:
+        message_timeout_seconds = max(
+            message_timeout_seconds,
+            int(runtime.config.poe_media_timeout_seconds),
+        )
+
     if streaming:
         return await streaming_response(
             runtime=runtime,
@@ -1192,6 +1226,7 @@ async def _chat_completions_impl(
             session_id=session_id,
             persistent_session=persistent_session,
             account_id=account_id,
+            message_timeout_seconds=message_timeout_seconds,
             lease=lease,
         )
 
@@ -1211,6 +1246,7 @@ async def _chat_completions_impl(
         session_id=session_id,
         persistent_session=persistent_session,
         account_id=account_id,
+        message_timeout_seconds=message_timeout_seconds,
         lease=lease,
     )
 
@@ -1267,7 +1303,12 @@ async def create_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio)
+            image_generation = await generate_image(
+                client,
+                response,
+                aspect_ratio,
+                timeout_seconds=int(runtime.config.poe_media_timeout_seconds),
+            )
             urls.extend([url for url in image_generation.split() if url.startswith("https://")])
             if len(urls) >= n:
                 break
@@ -1358,7 +1399,13 @@ async def edit_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio, [edit_attachment])
+            image_generation = await generate_image(
+                client,
+                response,
+                aspect_ratio,
+                [edit_attachment],
+                timeout_seconds=int(runtime.config.poe_media_timeout_seconds),
+            )
             urls.extend([url for url in image_generation.split() if url.startswith("https://")])
             if len(urls) >= n:
                 break
