@@ -1,5 +1,15 @@
-import openai 
-client = openai.OpenAI(api_key="svc_app_zaiwen", base_url="http://127.0.0.1:8003/v1/")
+import httpx
+import openai
+
+http_client = httpx.Client(
+    trust_env=False,  # Do not route localhost calls through HTTP_PROXY/HTTPS_PROXY.
+    timeout=httpx.Timeout(60.0, connect=5.0),
+)
+client = openai.OpenAI(
+    api_key="svc_app_zaiwen",
+    base_url="http://127.0.0.1:8003/v1/",
+    http_client=http_client,
+)
 
 # Non-Streaming Example
 response = client.chat.completions.create(

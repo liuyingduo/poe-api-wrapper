@@ -143,6 +143,8 @@ class GatewayConfig:
     fernet_key: str
     admin_api_key: str
     service_api_keys_bootstrap: list[str]
+    poe_proxy_urls: list[str]
+    poe_request_retry_limit: int
     max_inflight_per_account: int
     global_inflight_limit: int
     depleted_threshold: int
@@ -150,6 +152,9 @@ class GatewayConfig:
     recent_active_minutes: int
     cooldown_seconds: int
     prewarm_concurrency: int
+    daily_reset_timezone: str
+    daily_reset_hour: int
+    daily_reset_point_balance: int
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -163,6 +168,8 @@ class GatewayConfig:
             fernet_key=_require_env("FERNET_KEY"),
             admin_api_key=_require_env("ADMIN_API_KEY"),
             service_api_keys_bootstrap=_split_csv(os.getenv("SERVICE_API_KEYS_BOOTSTRAP", "")),
+            poe_proxy_urls=_split_csv(os.getenv("POE_PROXY_URLS", "")),
+            poe_request_retry_limit=_env_int("POE_REQUEST_RETRY_LIMIT", 4),
             max_inflight_per_account=_env_int("MAX_INFLIGHT_PER_ACCOUNT", 2),
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
@@ -170,6 +177,9 @@ class GatewayConfig:
             recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
             prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
+            daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
+            daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
+            daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 3000),
         )
 
 
@@ -298,7 +308,12 @@ async def startup_event() -> None:
         global_inflight_limit=config.global_inflight_limit,
     )
     selector = AccountSelector(repo=repo, limiter=limiter, top_n=100)
-    pool = PoeClientPool(repo=repo, default_poe_revision=config.default_poe_revision)
+    pool = PoeClientPool(
+        repo=repo,
+        default_poe_revision=config.default_poe_revision,
+        proxy_urls=config.poe_proxy_urls,
+        request_retry_limit=config.poe_request_retry_limit,
+    )
     refresher = AccountHealthRefresher(
         repo=repo,
         pool=pool,
@@ -306,6 +321,9 @@ async def startup_event() -> None:
         refresh_interval_seconds=config.refresh_interval_seconds,
         recent_active_minutes=config.recent_active_minutes,
         cooldown_seconds=config.cooldown_seconds,
+        daily_reset_timezone=config.daily_reset_timezone,
+        daily_reset_hour=config.daily_reset_hour,
+        daily_reset_point_balance=config.daily_reset_point_balance,
     )
     sessions = SessionManager(repo=repo)
 

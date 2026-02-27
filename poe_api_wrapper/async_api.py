@@ -1,6 +1,7 @@
-from httpx import AsyncClient, ConnectError, ReadTimeout
+from httpx import AsyncClient, ConnectError, ReadTimeout, ConnectTimeout, ProxyError
 import asyncio, orjson, random, ssl, threading, websocket, string, secrets, os, hashlib, re, aiofiles, uuid
 from typing import AsyncIterator, Optional
+from urllib.parse import urlparse, unquote
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
 
@@ -35,7 +36,14 @@ class AsyncPoeApi:
     HEADERS = HEADERS
     MAX_CONCURRENT_MESSAGES = 3
     
-    def __init__(self, tokens: dict={}, proxy: list=[], auto_proxy: bool=False, headers: dict=None):
+    def __init__(
+        self,
+        tokens: dict = {},
+        proxy: list = [],
+        auto_proxy: bool = False,
+        headers: dict = None,
+        request_retry_limit: Optional[int] = None,
+    ):
         self.client = None
         if 'p-b' not in tokens:
             raise ValueError("Please provide a valid p-b cookie")
@@ -54,31 +62,16 @@ class AsyncPoeApi:
         self.ws_refresh: int = 3
         self.ws_heartbeat_interval: int = 25
         self.groups: dict = {}
-        self.proxies: dict = {}
+        self.proxies: str = ""
         self.bundle: PoeBundle = None
         self.loop: asyncio.AbstractEventLoop = None
         self._ws_heartbeat_task: Optional[asyncio.Task] = None
+        self._extra_headers = headers or {}
+        env_retry_limit = os.getenv("POE_REQUEST_RETRY_LIMIT", "4").strip()
+        self.request_retry_limit: int = request_retry_limit if request_retry_limit is not None else int(env_retry_limit or "4")
+        self.request_retry_limit = max(1, self.request_retry_limit)
         
-        self.client = AsyncClient(headers=self.HEADERS.copy(), timeout=60, http2=True)
-        if headers:
-            self.client.headers.update(headers)
-        self.client.cookies.update({
-                                'p-b': self.tokens['p-b'],
-                                })
-        if 'p-lat' in self.tokens and self.tokens['p-lat']:
-            self.client.cookies.update({
-                'p-lat': self.tokens['p-lat']
-            })
-        
-          
-        cloudflare_cookies = {}
-        if '__cf_bm' in tokens and tokens['__cf_bm']:
-            cloudflare_cookies['__cf_bm'] = tokens['__cf_bm']
-        if 'cf_clearance' in tokens and tokens['cf_clearance']:
-            cloudflare_cookies['cf_clearance'] = tokens['cf_clearance']
-        if cloudflare_cookies:
-            self.client.cookies.update(cloudflare_cookies)
-            
+        self.client = self._build_http_client()
         if 'formkey' in tokens:
             self.formkey = tokens['formkey']
             self.client.headers.update({
@@ -88,6 +81,59 @@ class AsyncPoeApi:
             self.client.headers.update({
                 'Poe-Revision': tokens['poe-revision'],
             })
+
+    def _proxy_to_url(self, proxy_item) -> str:
+        if isinstance(proxy_item, str):
+            return proxy_item.strip()
+        if isinstance(proxy_item, dict):
+            return str(proxy_item.get("http://") or proxy_item.get("https://") or "").strip()
+        return ""
+
+    def _build_http_client(self, proxy_url: str = "") -> AsyncClient:
+        kwargs = {
+            "headers": self.HEADERS.copy(),
+            "timeout": 60,
+            "http2": True,
+        }
+        if proxy_url:
+            try:
+                client = AsyncClient(proxy=proxy_url, **kwargs)
+            except TypeError:
+                client = AsyncClient(proxies=proxy_url, **kwargs)
+        else:
+            client = AsyncClient(**kwargs)
+
+        if self._extra_headers:
+            client.headers.update(self._extra_headers)
+        client.cookies.update({'p-b': self.tokens['p-b']})
+        if self.tokens.get('p-lat'):
+            client.cookies.update({'p-lat': self.tokens['p-lat']})
+        if self.tokens.get('__cf_bm'):
+            client.cookies.update({'__cf_bm': self.tokens['__cf_bm']})
+        if self.tokens.get('cf_clearance'):
+            client.cookies.update({'cf_clearance': self.tokens['cf_clearance']})
+        if self.formkey:
+            client.headers.update({'Poe-Formkey': self.formkey})
+        if self.tokens.get('poe-revision'):
+            client.headers.update({'Poe-Revision': self.tokens['poe-revision']})
+        return client
+
+    def _ws_proxy_kwargs(self) -> dict:
+        if not self.proxies:
+            return {}
+        try:
+            parsed = urlparse(self.proxies)
+            if not parsed.hostname:
+                return {}
+            kwargs = {
+                "http_proxy_host": parsed.hostname,
+                "http_proxy_port": parsed.port or (443 if parsed.scheme == "https" else 80),
+            }
+            if parsed.username:
+                kwargs["http_proxy_auth"] = (unquote(parsed.username), unquote(parsed.password or ""))
+            return kwargs
+        except Exception:
+            return {}
         
     async def create(self):
         if self.formkey == "":
@@ -126,15 +172,22 @@ class AsyncPoeApi:
                 raise ValueError("Please install ballyregan for auto proxy")
             proxies = fetch_proxy()
         elif proxy != [] and auto_proxy == False:
-            proxies = proxy
+            if isinstance(proxy, list):
+                proxies = proxy
+            else:
+                proxies = [proxy]
         else:
             raise ValueError("Please provide a valid proxy list or set auto_proxy to False")
         for p in range(len(proxies)):
             try:
-                self.proxies = proxies[p]
-                self.client.proxies = self.proxies
+                proxy_url = self._proxy_to_url(proxies[p])
+                if not proxy_url:
+                    raise ValueError("Invalid proxy value")
+                self.proxies = proxy_url
+                await self.client.aclose()
+                self.client = self._build_http_client(proxy_url)
                 await self.connect_ws()
-                logger.info(f"Connection established with {proxies[p]}")
+                logger.info(f"Connection established with proxy #{p+1}")
                 break
             except:
                 logger.info(f"Connection failed with {proxies[p]}. Trying {p+1}/{len(proxies)} ...")
@@ -235,8 +288,10 @@ class AsyncPoeApi:
             status_code = response.status_code
             
             if status_code == 403:
-                if ratelimit < 2:
-                    logger.warning(f"Received 403 status code, retrying... (attempt {ratelimit + 1}/2)")
+                if ratelimit < self.request_retry_limit:
+                    logger.warning(
+                        f"Received 403 status code, retrying... (attempt {ratelimit + 1}/{self.request_retry_limit})"
+                    )
                     return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
                 else:
                     raise Exception(f"Max retries reached after receiving 403 status code")
@@ -281,12 +336,20 @@ class AsyncPoeApi:
                     logger.error(f"Failed to send message {variables['query']} due to ReadTimeout")
                     raise e
                 else:
-                    logger.error(f"Automatic retrying request {query_name} due to ReadTimeout")
-                    return await self.send_request(path, query_name, variables, file_form)
+                    if ratelimit < self.request_retry_limit:
+                        logger.warning(
+                            f"Automatic retrying request {query_name} due to ReadTimeout ({ratelimit + 1}/{self.request_retry_limit})"
+                        )
+                        return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
+                    logger.error(f"ReadTimeout retries exhausted for request {query_name}")
+                    raise e
 
             if (
-                isinstance(e, ConnectError) or 500 <= status_code < 600
-            ) and ratelimit < 2:
+                isinstance(e, (ConnectError, ConnectTimeout, ProxyError)) or 500 <= status_code < 600
+            ) and ratelimit < self.request_retry_limit:
+                logger.warning(
+                    f"Retrying request {query_name} after network/provider error ({ratelimit + 1}/{self.request_retry_limit}): {e}"
+                )
                 return await self.send_request(path, query_name, variables, file_form, ratelimit=ratelimit + 1)
 
             error_code = f"status_code:{status_code}, " if status_code else ""
@@ -315,6 +378,7 @@ class AsyncPoeApi:
                 "ping_interval": 20,
                 "ping_timeout": 10,
             }
+            kwargs.update(self._ws_proxy_kwargs())
             try:
                 self.ws.run_forever(**kwargs)
             except Exception as e:

@@ -9,6 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import orjson
 from cryptography.fernet import Fernet
@@ -509,6 +510,36 @@ class AccountRepository:
 
         return await self._run(_op)
 
+    async def daily_reset_point_balance(
+        self,
+        *,
+        point_balance: int = 3000,
+        reset_statuses: Optional[list[str]] = None,
+    ) -> int:
+        now = utc_now()
+        target_statuses = reset_statuses or ["active", "depleted", "cooldown"]
+        health_score = min(100.0, float(point_balance) / 10.0)
+
+        def _op() -> int:
+            result = self.accounts.update_many(
+                {"status": {"$in": target_statuses}},
+                {
+                    "$set": {
+                        "message_point_balance": int(point_balance),
+                        "status": "active",
+                        "cooldown_until": None,
+                        "error_count": 0,
+                        "last_error": None,
+                        "health_score": health_score,
+                        "last_refresh_at": now,
+                        "updated_at": now,
+                    }
+                },
+            )
+            return int(result.modified_count)
+
+        return await self._run(_op)
+
     async def close(self) -> None:
         await self._run(self.client.close)
 
@@ -627,9 +658,17 @@ class AccountSelector:
 
 
 class PoeClientPool:
-    def __init__(self, repo: AccountRepository, default_poe_revision: Optional[str] = None):
+    def __init__(
+        self,
+        repo: AccountRepository,
+        default_poe_revision: Optional[str] = None,
+        proxy_urls: Optional[list[str]] = None,
+        request_retry_limit: int = 4,
+    ):
         self.repo = repo
         self.default_poe_revision = (default_poe_revision or "").strip()
+        self.proxy_urls = [item.strip() for item in (proxy_urls or []) if item and item.strip()]
+        self.request_retry_limit = max(1, int(request_retry_limit))
         self._clients: dict[str, AsyncPoeApi] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
@@ -666,7 +705,15 @@ class PoeClientPool:
     async def _create_client(self, creds: dict[str, Any]) -> AsyncPoeApi:
         tokens = self._build_tokens(creds)
         headers = self._build_headers(creds)
-        return await AsyncPoeApi(tokens=tokens, headers=headers).create()
+        proxy_config = []
+        if self.proxy_urls:
+            proxy_config = [{"http://": proxy, "https://": proxy} for proxy in self.proxy_urls]
+        return await AsyncPoeApi(
+            tokens=tokens,
+            headers=headers,
+            proxy=proxy_config,
+            request_retry_limit=self.request_retry_limit,
+        ).create()
 
     async def _create_client_with_fallback(self, account_id: str, creds: dict[str, Any]) -> AsyncPoeApi:
         try:
@@ -733,6 +780,9 @@ class AccountHealthRefresher:
         refresh_interval_seconds: int,
         recent_active_minutes: int,
         cooldown_seconds: int,
+        daily_reset_timezone: str = "America/Los_Angeles",
+        daily_reset_hour: int = 0,
+        daily_reset_point_balance: int = 3000,
         error_threshold: int = 3,
     ):
         self.repo = repo
@@ -741,10 +791,23 @@ class AccountHealthRefresher:
         self.refresh_interval_seconds = refresh_interval_seconds
         self.recent_active_minutes = recent_active_minutes
         self.cooldown_seconds = cooldown_seconds
+        self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"
+        self.daily_reset_hour = max(0, min(int(daily_reset_hour), 23))
+        self.daily_reset_point_balance = max(0, int(daily_reset_point_balance))
         self.error_threshold = error_threshold
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self._refresh_semaphore = asyncio.Semaphore(10)
+        try:
+            self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
+        except Exception:
+            logger.warning(
+                "Invalid DAILY_RESET_TIMEZONE='{}'. Fallback to America/Los_Angeles",
+                self.daily_reset_timezone,
+            )
+            self.daily_reset_timezone = "America/Los_Angeles"
+            self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
+        self._next_daily_reset_utc = self._compute_next_daily_reset_utc()
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -763,6 +826,36 @@ class AccountHealthRefresher:
 
     def schedule_refresh(self, account_id: str) -> None:
         asyncio.create_task(self.refresh_account(account_id))
+
+    def _compute_next_daily_reset_utc(self, now_utc: Optional[datetime] = None) -> datetime:
+        now_utc = now_utc or utc_now()
+        local_now = now_utc.astimezone(self._daily_reset_tz)
+        target_local = local_now.replace(
+            hour=self.daily_reset_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if local_now >= target_local:
+            target_local += timedelta(days=1)
+        return target_local.astimezone(timezone.utc)
+
+    async def _run_daily_point_reset_if_due(self, now_utc: datetime) -> None:
+        if now_utc < self._next_daily_reset_utc:
+            return
+        modified_count = await self.repo.daily_reset_point_balance(
+            point_balance=self.daily_reset_point_balance,
+            reset_statuses=["active", "depleted", "cooldown"],
+        )
+        logger.info(
+            "Daily Poe point reset executed at {} (tz={} {}:00). modified_accounts={}, point_balance={}",
+            now_utc.isoformat(),
+            self.daily_reset_timezone,
+            self.daily_reset_hour,
+            modified_count,
+            self.daily_reset_point_balance,
+        )
+        self._next_daily_reset_utc = self._compute_next_daily_reset_utc(now_utc + timedelta(seconds=1))
 
     def _looks_like_depleted(self, error: str) -> bool:
         lower = error.lower()
@@ -814,12 +907,22 @@ class AccountHealthRefresher:
 
     async def _loop(self) -> None:
         while not self._stopped.is_set():
+            now_utc = utc_now()
+            seconds_until_reset = max(1.0, (self._next_daily_reset_utc - now_utc).total_seconds())
+            sleep_timeout = max(1.0, min(float(self.refresh_interval_seconds), seconds_until_reset))
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=self.refresh_interval_seconds)
+                await asyncio.wait_for(self._stopped.wait(), timeout=sleep_timeout)
                 if self._stopped.is_set():
                     break
             except asyncio.TimeoutError:
                 pass
+
+            now_utc = utc_now()
+            try:
+                await self._run_daily_point_reset_if_due(now_utc)
+            except Exception as exc:
+                logger.warning("Daily point reset failed: {}", exc)
+                self._next_daily_reset_utc = utc_now() + timedelta(minutes=1)
 
             recent_accounts = await self.repo.list_recent_active_accounts(
                 minutes=self.recent_active_minutes,
