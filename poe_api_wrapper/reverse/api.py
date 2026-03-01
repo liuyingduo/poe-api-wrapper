@@ -117,6 +117,26 @@ class PoeApi:
         if self.client:
             self.client.close()
 
+    def _log_load_bundle_failure(
+        self,
+        stage: str,
+        exc: Exception,
+        *,
+        status_code: Optional[int] = None,
+        content_type: str = "",
+        body_preview: str = "",
+    ) -> None:
+        logger.error(
+            "load_bundle stage={} failed; exc_type={} exc_repr={} status_code={} content_type={} body_preview={}",
+            stage,
+            type(exc).__name__,
+            repr(exc),
+            status_code,
+            content_type or "",
+            body_preview or "",
+        )
+        logger.exception("load_bundle traceback (stage={})", stage)
+
     def _get_homepage_without_poe_headers(self):
         removed_headers: dict[str, str] = {}
         for key in ("Poe-Revision", "Poe-Formkey", "Poe-Tchannel"):
@@ -130,28 +150,103 @@ class PoeApi:
                 self.client.headers.update(removed_headers)
         
     def load_bundle(self):
+        logger.debug(
+            "load_bundle start: has_formkey={} has_tchannel={} has_p_b={} has_cf_clearance={} has_cf_bm={}",
+            bool(self.formkey),
+            bool(self.tchannel_data),
+            bool(self.client.cookies.get("p-b")),
+            bool(self.client.cookies.get("cf_clearance")),
+            bool(self.client.cookies.get("__cf_bm")),
+        )
+
         try:
             web_data = self._get_homepage_without_poe_headers()
-            if web_data.status_code != 200:
-                raise RuntimeError(f"Failed to load Poe homepage. status_code:{web_data.status_code}")
-
-            html = web_data.text
-            if self.formkey == "":
-                self.bundle = PoeBundle(html)
-                self.formkey = self.bundle.get_form_key()
-                self.client.headers.update({
-                    'Poe-Formkey': self.formkey,
-                })
-
-            self.tchannel_data = extract_tchannel_data_from_html(html)
-            self._build_channel_url_from_tchannel()
-        except Exception as e:
-            logger.error(f"Failed to load bundle. Reason: {e}")
+        except Exception as exc:
+            self._log_load_bundle_failure("fetch_homepage", exc)
             logger.warning(
                 "Failed to initialize formkey/tchannelData from homepage. "
                 "Please provide a valid formkey manually."
                 if self.formkey == ""
                 else "Continuing with provided formkey"
+            )
+            return
+
+        status_code = web_data.status_code
+        content_type = web_data.headers.get("content-type", "")
+        html = web_data.text or ""
+        body_preview = html[:220].replace("\n", " ").replace("\r", " ")
+        logger.debug(
+            "load_bundle homepage response: status_code={} content_type={} final_url={} body_preview={!r}",
+            status_code,
+            content_type,
+            str(web_data.url),
+            body_preview,
+        )
+        if status_code != 200:
+            self._log_load_bundle_failure(
+                "fetch_homepage_non_200",
+                RuntimeError(f"Failed to load Poe homepage. status_code:{status_code}"),
+                status_code=status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+            )
+            logger.warning(
+                "Failed to initialize formkey/tchannelData from homepage. "
+                "Please provide a valid formkey manually."
+                if self.formkey == ""
+                else "Continuing with provided formkey"
+            )
+            return
+
+        if self.formkey == "":
+            try:
+                self.bundle = PoeBundle(html)
+                self.formkey = self.bundle.get_form_key()
+                self.client.headers.update({
+                    'Poe-Formkey': self.formkey,
+                })
+                logger.debug("load_bundle extract_formkey success; formkey_len={}", len(self.formkey))
+            except Exception as exc:
+                self._log_load_bundle_failure(
+                    "extract_formkey",
+                    exc,
+                    status_code=status_code,
+                    content_type=content_type,
+                    body_preview=body_preview,
+                )
+        else:
+            logger.debug("load_bundle skip extract_formkey; using existing formkey")
+
+        try:
+            self.tchannel_data = extract_tchannel_data_from_html(html)
+            self._build_channel_url_from_tchannel()
+            logger.debug(
+                "load_bundle extract_tchannelData success; baseHost={} boxName={} minSeq={} channel_len={}",
+                self.tchannel_data.get("baseHost"),
+                self.tchannel_data.get("boxName"),
+                self.tchannel_data.get("minSeq"),
+                len(str(self.tchannel_data.get("channel", ""))),
+            )
+        except Exception as exc:
+            self._log_load_bundle_failure(
+                "extract_tchannelData",
+                exc,
+                status_code=status_code,
+                content_type=content_type,
+                body_preview=body_preview,
+            )
+            logger.warning(
+                "Failed to initialize formkey/tchannelData from homepage. "
+                "Please provide a valid formkey manually."
+                if self.formkey == ""
+                else "Continuing with provided formkey"
+            )
+            return
+
+        if not self.formkey:
+            logger.warning(
+                "load_bundle completed but formkey is empty; tchannelData exists={}",
+                bool(self.tchannel_data),
             )
 
     def _build_channel_url_from_tchannel(self):
