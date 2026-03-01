@@ -68,7 +68,7 @@ IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2
 import concurrent.futures
 import time
 
-TOTAL_REQUESTS = 100
+TOTAL_REQUESTS = 20
 PROMPT = "A cute girl with a little flower"
 MODEL = "flux-2-klein-9b-base"
 

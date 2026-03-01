@@ -37,6 +37,7 @@ from poe_api_wrapper.openai.gateway import (
     SessionManager,
     build_openai_error,
     extract_bearer_token,
+    fetch_poe_revision,
     hash_api_key,
     mask_secret,
 )
@@ -172,10 +173,7 @@ class GatewayConfig:
     @classmethod
     def from_env(cls) -> "GatewayConfig":
         return cls(
-            default_poe_revision=os.getenv(
-                "POE_REVISION",
-                "b759a4647fa291beba4792e9139bc4c014399434",
-            ).strip(),
+            default_poe_revision=os.getenv("POE_REVISION", "").strip(),
             mongodb_uri=_require_env("MONGODB_URI"),
             mongodb_db=_require_env("MONGODB_DB"),
             fernet_key=_require_env("FERNET_KEY"),
@@ -312,6 +310,16 @@ async def _prewarm_pool(runtime: GatewayRuntime) -> None:
 @app.on_event("startup")
 async def startup_event() -> None:
     config = GatewayConfig.from_env()
+
+    # 若未在环境变量中配置 POE_REVISION，则自动从 poe.com/login 页面抓取
+    if not config.default_poe_revision:
+        fetched = await fetch_poe_revision()
+        if fetched:
+            config.default_poe_revision = fetched
+            logger.info("自动获取 poe-revision: {}", fetched)
+        else:
+            logger.warning("未能自动获取 poe-revision，客户端将不携带该请求头")
+
     crypto = CredentialCrypto(config.fernet_key)
     repo = AccountRepository(config.mongodb_uri, config.mongodb_db, crypto)
     limiter = RuntimeLimiter(
@@ -543,6 +551,43 @@ async def admin_refresh_account_points(request: Request) -> JSONResponse:
         )
     except Exception as exc:
         _openai_http_error(502, "provider_error", f"Failed to fetch points from Poe: {exc}")
+
+
+@app.post("/admin/accounts/refresh-all", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
+    """并发刷新所有账号（或指定状态的账号）的实时积分，返回汇总结果。
+
+    可选请求体（JSON）：
+    - statuses: list[str]  要刷新的账号状态列表，默认 ["active","depleted","cooldown","invalid"]
+    - concurrency: int     并发刷新数量，默认 10
+    """
+    runtime = _runtime()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    raw_statuses = body.get("statuses")
+    statuses: Optional[list[str]] = None
+    if isinstance(raw_statuses, list) and raw_statuses:
+        statuses = [str(s).strip() for s in raw_statuses if str(s).strip()]
+
+    raw_concurrency = body.get("concurrency", 10)
+    try:
+        concurrency = max(1, min(int(raw_concurrency), 50))
+    except (TypeError, ValueError):
+        concurrency = 10
+
+    logger.info(
+        "admin_refresh_all_account_points triggered: statuses={} concurrency={}",
+        statuses,
+        concurrency,
+    )
+    result = await runtime.refresher.refresh_all_accounts(
+        statuses=statuses,
+        concurrency=concurrency,
+    )
+    return JSONResponse(result)
 
 
 @app.api_route("/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)

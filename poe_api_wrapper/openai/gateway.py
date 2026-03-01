@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import statistics
 import uuid
 from collections import defaultdict
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import orjson
 from cryptography.fernet import Fernet
+import httpx
 from loguru import logger
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -28,6 +30,49 @@ DEFAULT_USER_AGENT = (
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_POE_REVISION_RE = re.compile(r'poecdn\.net/assets/translations/([a-f0-9]{40})/')
+
+
+async def fetch_poe_revision(
+    *,
+    timeout: float = 15.0,
+    retries: int = 2,
+) -> Optional[str]:
+    """从 https://poe.com/login 页面的 HTML 中解析当前 poe-revision 哈希值。
+
+    返回 40 位十六进制字符串，失败时返回 None。
+    """
+    url = "https://poe.com/login?redirect_url=%2F"
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    for attempt in range(1, retries + 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                match = _POE_REVISION_RE.search(resp.text)
+                if match:
+                    return match.group(1)
+                logger.warning(
+                    "fetch_poe_revision: 未在响应 HTML 中找到 revision（尝试 {}/{}）",
+                    attempt,
+                    retries + 1,
+                )
+        except Exception as exc:
+            logger.warning(
+                "fetch_poe_revision: 请求失败（尝试 {}/{}）: {}",
+                attempt,
+                retries + 1,
+                exc,
+            )
+        if attempt <= retries:
+            await asyncio.sleep(2.0 * attempt)
+    return None
 
 
 def hash_api_key(raw_key: str) -> str:
@@ -324,6 +369,29 @@ class AccountRepository:
             "total": total,
             "data": [self._sanitize_account(doc) for doc in docs],
         }
+
+    async def list_all_accounts_for_refresh(
+        self,
+        *,
+        statuses: Optional[list[str]] = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """返回所有账号（或指定状态的账号）的最小字段列表，用于批量刷新积分。"""
+        query: dict[str, Any] = {}
+        if statuses:
+            query["status"] = {"$in": statuses}
+
+        def _op():
+            return list(
+                self.accounts.find(
+                    query,
+                    {"_id": 1},
+                )
+                .sort("_id", ASCENDING)
+                .limit(limit)
+            )
+
+        return await self._run(_op)
 
     async def list_candidate_accounts(self, limit: int = 1000) -> list[dict[str, Any]]:
         now = utc_now()
@@ -960,6 +1028,59 @@ class AccountHealthRefresher:
                     cooldown_seconds=self.cooldown_seconds,
                     error_threshold=self.error_threshold,
                 )
+
+    async def refresh_all_accounts(
+        self,
+        *,
+        statuses: Optional[list[str]] = None,
+        concurrency: int = 10,
+    ) -> dict[str, Any]:
+        """立即刷新所有账号（或指定状态的账号）的积分，返回汇总结果。"""
+        target_statuses = statuses or ["active", "depleted", "cooldown", "invalid"]
+        all_docs = await self.repo.list_all_accounts_for_refresh(
+            statuses=target_statuses,
+            limit=5000,
+        )
+        total = len(all_docs)
+        if total == 0:
+            return {"total": 0, "succeeded": 0, "failed": 0, "errors": []}
+
+        logger.info(
+            "refresh_all_accounts: starting refresh for {} accounts (statuses={})",
+            total,
+            target_statuses,
+        )
+
+        succeeded = 0
+        failed = 0
+        errors: list[dict[str, str]] = []
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _do_refresh(account_doc: dict[str, Any]) -> None:
+            nonlocal succeeded, failed
+            account_id = str(account_doc["_id"])
+            async with sem:
+                try:
+                    await self.refresh_account(account_id)
+                    succeeded += 1
+                except Exception as exc:
+                    failed += 1
+                    errors.append({"account_id": account_id, "error": str(exc)})
+
+        await asyncio.gather(*(_do_refresh(doc) for doc in all_docs), return_exceptions=True)
+
+        logger.info(
+            "refresh_all_accounts: done. total={} succeeded={} failed={}",
+            total,
+            succeeded,
+            failed,
+        )
+        return {
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors[:50],  # 最多返回前 50 条错误
+        }
 
     async def _loop(self) -> None:
         while not self._stopped.is_set():
