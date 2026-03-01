@@ -75,6 +75,8 @@ class PoeApi:
         self.groups: dict = {}
         self.proxies: dict = {}
         self.bundle: PoeBundle = None
+        self.tchannel_data: Optional[dict] = None
+        self.channel_url: str = ""
         self._ws_heartbeat_stop = threading.Event()
         self._ws_heartbeat_thread: Optional[threading.Thread] = None
         
@@ -107,7 +109,7 @@ class PoeApi:
                 'Poe-Revision': tokens['poe-revision'],
             })
         
-        if self.formkey == "":
+        if self.formkey == "" or not self.tchannel_data:
             self.load_bundle()
         self.connect_ws() 
         
@@ -117,15 +119,39 @@ class PoeApi:
         
     def load_bundle(self):
         try:
-            webData = self.client.get(self.BASE_URL)
-            self.bundle = PoeBundle(webData.text)
-            self.formkey = self.bundle.get_form_key()
-            self.client.headers.update({
-                'Poe-Formkey': self.formkey,
-            })
+            web_data = self.client.get(self.BASE_URL, headers=self.HEADERS, follow_redirects=True)
+            if web_data.status_code != 200:
+                raise RuntimeError(f"Failed to load Poe homepage. status_code:{web_data.status_code}")
+
+            html = web_data.text
+            if self.formkey == "":
+                self.bundle = PoeBundle(html)
+                self.formkey = self.bundle.get_form_key()
+                self.client.headers.update({
+                    'Poe-Formkey': self.formkey,
+                })
+
+            self.tchannel_data = extract_tchannel_data_from_html(html)
+            self._build_channel_url_from_tchannel()
         except Exception as e:
             logger.error(f"Failed to load bundle. Reason: {e}")
-            logger.warning("Failed to get formkey from bundle. Please provide a valid formkey manually." if self.formkey == "" else "Continuing with provided formkey")
+            logger.warning(
+                "Failed to initialize formkey/tchannelData from homepage. "
+                "Please provide a valid formkey manually."
+                if self.formkey == ""
+                else "Continuing with provided formkey"
+            )
+
+    def _build_channel_url_from_tchannel(self):
+        if not self.tchannel_data:
+            raise RuntimeError("Missing tchannelData. Call load_bundle() first.")
+        self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
+        self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
+        self.channel_url = (
+            f'wss://{self.ws_domain}.tch.{self.tchannel_data["baseHost"]}/up/'
+            f'{self.tchannel_data["boxName"]}/updates?min_seq={self.tchannel_data["minSeq"]}'
+            f'&channel={self.tchannel_data["channel"]}&hash={self.tchannel_data["channelHash"]}'
+        )
             
     def _extract_file_hash_jwt(self, raw_text: str):
         token_pattern = re.compile(r"^[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+$")
@@ -264,17 +290,9 @@ class PoeApi:
             )
     
     def get_channel_settings(self):
-        response = self.client.get(self.BASE_URL, headers=self.HEADERS, follow_redirects=True)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Failed to load Poe homepage for channel settings. status_code:{response.status_code}"
-            )
-        response_json = extract_tchannel_data_from_html(response.text)
-        self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
-        self.tchannel_data = response_json
-        self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
-        self.channel_url = f'wss://{self.ws_domain}.tch.{self.tchannel_data["baseHost"]}/up/{self.tchannel_data["boxName"]}/updates?min_seq={self.tchannel_data["minSeq"]}&channel={self.tchannel_data["channel"]}&hash={self.tchannel_data["channelHash"]}'
-        self.subscribe()
+        if not self.tchannel_data:
+            raise RuntimeError("Missing tchannelData. Call load_bundle() first.")
+        self._build_channel_url_from_tchannel()
     
     def subscribe(self):
         response_json = self.send_request('gql_POST', "SubscriptionsMutation", SubscriptionsMutation)
@@ -303,6 +321,10 @@ class PoeApi:
         self.ws_connecting = True
         self.ws_connected = False
         self.ws_refresh = 3
+
+        if not self.tchannel_data:
+            self.load_bundle()
+        self._build_channel_url_from_tchannel()
         
         while True:
             self.ws_refresh -= 1
@@ -310,10 +332,10 @@ class PoeApi:
                 self.ws_refresh = 3
                 raise RuntimeError("Rate limit exceeded for sending requests to poe.com. Please try again later.")
             try:
-                self.get_channel_settings()
+                self.subscribe()
                 break
             except Exception as e:
-                logger.error(f"Failed to get channel settings. Reason: {e}")
+                logger.error(f"Failed to subscribe websocket channel. Reason: {e}")
                 sleep(1)
                 continue
 

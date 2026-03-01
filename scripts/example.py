@@ -36,39 +36,39 @@ client = openai.OpenAI(
 # # print()
 
 # # # ── Vision / Image-Input Example ───────────────────────────────────────────────
-IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
+# IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
 
-image_input = client.chat.completions.create(
-    model="GPT-4o",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What's in this image?"},
-                {"type": "image_url", "image_url": {"url": IMAGE_URL}},
-            ],
-        }
-    ],
-)
-print(image_input.choices[0].message.content)
+# image_input = client.chat.completions.create(
+#     model="GPT-4o",
+#     messages=[
+#         {
+#             "role": "user",
+#             "content": [
+#                 {"type": "text", "text": "What's in this image?"},
+#                 {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+#             ],
+#         }
+#     ],
+# )
+# print(image_input.choices[0].message.content)
 
 # ── Image-Edit Example ─────────────────────────────────────────────────────────
 # Download the reference image and pass it as a file-like object.
-image_bytes = http_client.get(IMAGE_URL).content
-edit_resp = client.images.edit(
-    model="flux-2-klein-9b-base",
-    image=("reference.jpg", image_bytes, "image/jpeg"),
-    prompt="add a little flower",
-    n=1,
-    size="1024x1024",
-)
-print(edit_resp.data[0].url)
+# image_bytes = http_client.get(IMAGE_URL).content
+# edit_resp = client.images.edit(
+#     model="flux-2-klein-9b-base",
+#     image=("reference.jpg", image_bytes, "image/jpeg"),
+#     prompt="add a little flower",
+#     n=1,
+#     size="1024x1024",
+# )
+# print(edit_resp.data[0].url)
 
 
 import concurrent.futures
 import time
 
-TOTAL_REQUESTS = 1
+TOTAL_REQUESTS = 20
 PROMPT = "A cute girl with a little flower"
 MODEL = "flux-2-klein-9b-base"
 
