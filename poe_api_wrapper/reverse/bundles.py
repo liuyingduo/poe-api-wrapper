@@ -10,6 +10,7 @@ except ImportError:
     execjs = None
 
 class PoeBundle:
+    SCRIPT_FETCH_TIMEOUT_SECONDS = 20.0
     form_key_pattern = r"window\.([a-zA-Z0-9_]+)=function\(\)\{return window"
     seeded_call_pattern = r'window\.([a-zA-Z0-9_]+)\(\s*["\']([^"\']{16,})["\']\s*\)'
     window_secret_pattern = r'let useFormkeyDecode=[\s\S]*?(window\.[\w]+="[^"]+")'
@@ -72,7 +73,7 @@ class PoeBundle:
 
     @staticmethod
     def load_src_script(src: str) -> str:
-        with Client() as client:
+        with Client(timeout=PoeBundle.SCRIPT_FETCH_TIMEOUT_SECONDS) as client:
             resp = client.get(src)
         if resp.status_code != 200:
             logger.warning(f"Failed to load script {src}, status code: {resp.status_code}")
