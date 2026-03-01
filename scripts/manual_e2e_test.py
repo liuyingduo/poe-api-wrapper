@@ -1,4 +1,4 @@
-from poe_api_wrapper import PoeApi
+from poe_api_wrapper.reverse import PoeApi
 import unittest, random, string, loguru
 
 loguru.logger.disable('poe_api_wrapper')

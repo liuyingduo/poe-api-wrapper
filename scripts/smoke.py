@@ -1,12 +1,13 @@
 import os
 from pathlib import Path
-from poe_api_wrapper import PoeApi
+
+from poe_api_wrapper.reverse import PoeApi
 
 
-def load_dotenv(path: str = ".env") -> None:
+def load_dotenv(path: str) -> bool:
     env_path = Path(path)
     if not env_path.exists():
-        return
+        return False
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -22,8 +23,12 @@ def load_dotenv(path: str = ".env") -> None:
 
         os.environ.setdefault(key, value)
 
+    return True
 
-load_dotenv()
+
+# Prefer the single shared config file. Keep .env as fallback for compatibility.
+if not load_dotenv(".env.gateway"):
+    load_dotenv(".env")
 
 
 def parse_env_list(var_name: str, sep: str = "|") -> list[str]:

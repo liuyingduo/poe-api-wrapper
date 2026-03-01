@@ -1,25 +1,29 @@
-import os, socket
+"""Top-level exports without import-time side effects."""
 
-def is_using_proxy(address, port):
-    try:
-        socket.create_connection((address, port), timeout=5)
-        return True
-    except Exception as e:
-        return False
+from __future__ import annotations
 
-if is_using_proxy("127.0.0.1", "7890"):
-    print("""
-        3rd party proxy client detected. 
-        Updating environment variables ...
-        """)
+from typing import Any
 
-    os.environ["http_proxy"] = "http://127.0.0.1:7890"
-    os.environ["https_proxy"] = "http://127.0.0.1:7890"
+__all__ = [
+    "PoeApi",
+    "AsyncPoeApi",
+    "PoeExample",
+    "PoeServer",
+    "LLM_PACKAGE",
+    "app",
+    "start_server",
+]
 
-from .api import PoeApi
-from .async_api import AsyncPoeApi
-from .example import PoeExample
 
-from .llm import LLM_PACKAGE
-if LLM_PACKAGE:
-    from .llm import PoeServer
+def __getattr__(name: str) -> Any:
+    if name in {"PoeApi", "AsyncPoeApi", "PoeExample"}:
+        from . import reverse as _reverse
+
+        return getattr(_reverse, name)
+
+    if name in {"PoeServer", "LLM_PACKAGE", "app", "start_server"}:
+        from . import service as _service
+
+        return getattr(_service, name)
+
+    raise AttributeError(f"module 'poe_api_wrapper' has no attribute {name!r}")

@@ -1,6 +1,6 @@
 import pytest
 
-from poe_api_wrapper.openai.gateway import (
+from poe_api_wrapper.service.gateway import (
     AccountSelector,
     CapacityLimitError,
     NoAccountAvailableError,
@@ -62,4 +62,3 @@ async def test_select_account_capacity_limit():
     with pytest.raises(CapacityLimitError):
         await selector.select_account()
     await lease.release()
-

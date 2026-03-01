@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -9,17 +9,42 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from zoneinfo import ZoneInfo
 
-import orjson
+try:
+    import orjson
+except ImportError:
+    import json as _json
+
+    class _OrjsonCompat:
+        @staticmethod
+        def dumps(obj):
+            return _json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+        @staticmethod
+        def loads(data):
+            if isinstance(data, (bytes, bytearray)):
+                data = data.decode("utf-8")
+            return _json.loads(data)
+
+    orjson = _OrjsonCompat()
 from cryptography.fernet import Fernet
 import httpx
 from loguru import logger
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from ..async_api import AsyncPoeApi
+try:
+    from curl_cffi import requests as cffi_requests
+
+    HAS_CURL_CFFI = True
+except Exception:
+    cffi_requests = None
+    HAS_CURL_CFFI = False
+
+if TYPE_CHECKING:
+    from poe_api_wrapper.reverse import AsyncPoeApi
 
 
 DEFAULT_USER_AGENT = (
@@ -32,7 +57,8 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-_POE_REVISION_RE = re.compile(r'poecdn\.net/assets/translations/([a-f0-9]{40})/')
+_POE_REVISION_RE_OLD = re.compile(r"poecdn\.net/assets/translations/([a-f0-9]{40})/")
+_POE_REVISION_RE_NEW = re.compile(r"poecdn\.net/assets/_next/static/([^/]+)/(?:chunks|css)/")
 
 _BROWSE_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
@@ -57,63 +83,185 @@ async def fetch_poe_revision(
     timeout: float = 15.0,
     retries: int = 2,
 ) -> Optional[str]:
-    """两步获取 poe-revision：
-    1. 请求 https://poe.com/ 取得 set-cookie 中的 p-b
-    2. 携带 p-b cookie 请求 https://poe.com/login?redirect_url=%2F，解析 HTML 中的 revision hash
+    """Fetch poe-revision/build-id from poe.com home/login responses."""
 
-    返回 40 位十六进制字符串，失败时返回 None。
-    """
+    def _resolve_proxy() -> str:
+        return (
+            os.getenv("POE_FETCH_PROXY", "").strip()
+            or os.getenv("HTTPS_PROXY", "").strip()
+            or os.getenv("https_proxy", "").strip()
+            or os.getenv("HTTP_PROXY", "").strip()
+            or os.getenv("http_proxy", "").strip()
+            or os.getenv("ALL_PROXY", "").strip()
+            or os.getenv("all_proxy", "").strip()
+        )
+
+    def _resolve_cf_clearance() -> str:
+        return (
+            os.getenv("POE_FETCH_CF_CLEARANCE", "").strip()
+            or os.getenv("POE_CF_CLEARANCE", "").strip()
+        )
+
+    def _extract_revision(html: str, link_header: str) -> Optional[str]:
+        for pattern in (_POE_REVISION_RE_NEW, _POE_REVISION_RE_OLD):
+            m = pattern.search(link_header or "")
+            if m:
+                return m.group(1)
+            m = pattern.search(html or "")
+            if m:
+                return m.group(1)
+        return None
+
+    def _extract_cookie_from_headers(set_cookie_values: list[str], name: str) -> str:
+        prefix = f"{name}="
+        for sc in set_cookie_values:
+            if sc.startswith(prefix):
+                return sc.split(";", 1)[0].split("=", 1)[1]
+        return ""
+
+    def _fetch_once_with_curl_cffi(*, timeout_sec: float, proxy_url: str) -> Optional[str]:
+        session_kwargs: dict[str, Any] = {
+            "impersonate": os.getenv("POE_FETCH_IMPERSONATE", "chrome131").strip() or "chrome131",
+            "timeout": timeout_sec,
+        }
+        if proxy_url:
+            session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+
+        with cffi_requests.Session(**session_kwargs) as session:
+            home = session.get("https://poe.com/", headers=_BROWSE_HEADERS, allow_redirects=False)
+            p_b = session.cookies.get("p-b", "") or home.cookies.get("p-b", "")
+            cf_bm = session.cookies.get("__cf_bm", "") or home.cookies.get("__cf_bm", "")
+            cf_clearance = _resolve_cf_clearance() or session.cookies.get("cf_clearance", "")
+
+            logger.debug(
+                "fetch_poe_revision(curl_cffi): home status={} p_b={} cf_bm={}",
+                home.status_code,
+                bool(p_b),
+                bool(cf_bm),
+            )
+
+            revision = _extract_revision("", home.headers.get("link", ""))
+            if revision:
+                return revision
+
+            cookies: dict[str, str] = {}
+            if p_b:
+                cookies["p-b"] = p_b
+            if cf_bm:
+                cookies["__cf_bm"] = cf_bm
+            if cf_clearance:
+                cookies["cf_clearance"] = cf_clearance
+
+            login = session.get(
+                "https://poe.com/login?redirect_url=%2F",
+                headers=_BROWSE_HEADERS,
+                cookies=cookies if cookies else None,
+                allow_redirects=False,
+            )
+            logger.debug(
+                "fetch_poe_revision(curl_cffi): login status={} content_type={}",
+                login.status_code,
+                login.headers.get("content-type", ""),
+            )
+            return _extract_revision(login.text, login.headers.get("link", ""))
+
+    proxy_url = _resolve_proxy()
     for attempt in range(1, retries + 2):
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=True,
-            ) as client:
-                # 第一步：请求首页，获取 p-b cookie
-                home_resp = await client.get("https://poe.com/", headers=_BROWSE_HEADERS)
-                p_b = client.cookies.get("p-b") or home_resp.cookies.get("p-b")
-                if not p_b:
-                    # 尝试从 set-cookie 头里手动解析
-                    for sc in home_resp.headers.get_list("set-cookie"):
-                        if sc.startswith("p-b="):
-                            p_b = sc.split(";")[0][4:]
-                            break
-
-                if p_b:
-                    logger.debug("fetch_poe_revision: 获取到 p-b cookie（尝试 {}）", attempt)
-                else:
-                    logger.warning("fetch_poe_revision: 未获取到 p-b cookie（尝试 {}/{}）", attempt, retries + 1)
-
-                # 第二步：携带 p-b 请求 login 页
-                login_headers = dict(_BROWSE_HEADERS)
-                login_headers["Sec-Fetch-Site"] = "same-origin"
-                resp = await client.get(
-                    "https://poe.com/login?redirect_url=%2F",
-                    headers=login_headers,
-                    cookies={"p-b": p_b} if p_b else None,
+            if HAS_CURL_CFFI:
+                revision = await asyncio.to_thread(
+                    _fetch_once_with_curl_cffi,
+                    timeout_sec=timeout,
+                    proxy_url=proxy_url,
                 )
-                resp.raise_for_status()
-
-                match = _POE_REVISION_RE.search(resp.text)
-                if match:
-                    return match.group(1)
-
+                if revision:
+                    return revision
                 logger.warning(
-                    "fetch_poe_revision: 未在响应 HTML 中找到 revision（尝试 {}/{}）",
+                    "fetch_poe_revision: revision not found via curl_cffi (attempt {}/{})",
                     attempt,
                     retries + 1,
                 )
+            else:
+                client_kwargs: dict[str, Any] = {
+                    "timeout": timeout,
+                    "follow_redirects": False,
+                }
+                if proxy_url:
+                    client_kwargs["proxy"] = proxy_url
+
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    home_resp = await client.get("https://poe.com/", headers=_BROWSE_HEADERS)
+                    set_cookies = home_resp.headers.get_list("set-cookie")
+                    p_b = (
+                        client.cookies.get("p-b")
+                        or home_resp.cookies.get("p-b")
+                        or _extract_cookie_from_headers(set_cookies, "p-b")
+                    )
+                    cf_bm = (
+                        client.cookies.get("__cf_bm")
+                        or home_resp.cookies.get("__cf_bm")
+                        or _extract_cookie_from_headers(set_cookies, "__cf_bm")
+                    )
+                    cf_clearance = (
+                        _resolve_cf_clearance()
+                        or client.cookies.get("cf_clearance")
+                        or home_resp.cookies.get("cf_clearance")
+                        or _extract_cookie_from_headers(set_cookies, "cf_clearance")
+                    )
+
+                    logger.debug(
+                        "fetch_poe_revision(httpx): home status={} p_b={} cf_bm={} (attempt {}/{})",
+                        home_resp.status_code,
+                        bool(p_b),
+                        bool(cf_bm),
+                        attempt,
+                        retries + 1,
+                    )
+
+                    revision = _extract_revision("", home_resp.headers.get("link", ""))
+                    if revision:
+                        return revision
+
+                    login_cookies: dict[str, str] = {}
+                    if p_b:
+                        login_cookies["p-b"] = p_b
+                    if cf_bm:
+                        login_cookies["__cf_bm"] = cf_bm
+                    if cf_clearance:
+                        login_cookies["cf_clearance"] = cf_clearance
+
+                    login_resp = await client.get(
+                        "https://poe.com/login?redirect_url=%2F",
+                        headers=_BROWSE_HEADERS,
+                        cookies=login_cookies if login_cookies else None,
+                    )
+                    logger.debug(
+                        "fetch_poe_revision(httpx): login status={} content_type={} (attempt {}/{})",
+                        login_resp.status_code,
+                        login_resp.headers.get("content-type", ""),
+                        attempt,
+                        retries + 1,
+                    )
+                    revision = _extract_revision(login_resp.text, login_resp.headers.get("link", ""))
+                    if revision:
+                        return revision
+                    logger.warning(
+                        "fetch_poe_revision: revision not found via httpx (login_status={}, attempt {}/{})",
+                        login_resp.status_code,
+                        attempt,
+                        retries + 1,
+                    )
         except Exception as exc:
             logger.warning(
-                "fetch_poe_revision: 请求失败（尝试 {}/{}）: {}",
+                "fetch_poe_revision: request failed (attempt {}/{}): {}",
                 attempt,
                 retries + 1,
                 exc,
             )
+
         if attempt <= retries:
             await asyncio.sleep(2.0 * attempt)
     return None
-
 
 def hash_api_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -416,7 +564,7 @@ class AccountRepository:
         statuses: Optional[list[str]] = None,
         limit: int = 5000,
     ) -> list[dict[str, Any]]:
-        """返回所有账号（或指定状态的账号）的最小字段列表，用于批量刷新积分。"""
+        """Return minimal account docs for bulk refresh."""
         query: dict[str, Any] = {}
         if statuses:
             query["status"] = {"$in": statuses}
@@ -841,7 +989,7 @@ class PoeClientPool:
     ):
         self.repo = repo
         self.default_poe_revision = (default_poe_revision or "").strip()
-        self._clients: dict[str, AsyncPoeApi] = {}
+        self._clients: dict[str, "AsyncPoeApi"] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
 
@@ -874,12 +1022,14 @@ class PoeClientPool:
             "Origin": "https://poe.com",
         }
 
-    async def _create_client(self, creds: dict[str, Any]) -> AsyncPoeApi:
+    async def _create_client(self, creds: dict[str, Any]) -> "AsyncPoeApi":
+        from poe_api_wrapper.reverse import AsyncPoeApi
+
         tokens = self._build_tokens(creds)
         headers = self._build_headers(creds)
         return await AsyncPoeApi(tokens=tokens, headers=headers).create()
 
-    async def _create_client_with_fallback(self, account_id: str, creds: dict[str, Any]) -> AsyncPoeApi:
+    async def _create_client_with_fallback(self, account_id: str, creds: dict[str, Any]) -> "AsyncPoeApi":
         try:
             return await self._create_client(creds)
         except Exception as first_error:
@@ -896,7 +1046,7 @@ class PoeClientPool:
                 await self.repo.update_account_formkey(account_id, client.formkey)
             return client
 
-    async def get_client(self, account_doc: dict[str, Any]) -> AsyncPoeApi:
+    async def get_client(self, account_doc: dict[str, Any]) -> "AsyncPoeApi":
         account_id = str(account_doc["_id"])
         existing = self._clients.get(account_id)
         if existing:
@@ -917,7 +1067,7 @@ class PoeClientPool:
         if client:
             await self._close_client(client)
 
-    async def _close_client(self, client: AsyncPoeApi) -> None:
+    async def _close_client(self, client: "AsyncPoeApi") -> None:
         try:
             client.disconnect_ws()
         except Exception:
@@ -1075,7 +1225,7 @@ class AccountHealthRefresher:
         statuses: Optional[list[str]] = None,
         concurrency: int = 10,
     ) -> dict[str, Any]:
-        """立即刷新所有账号（或指定状态的账号）的积分，返回汇总结果。"""
+        """Immediately refresh points for all accounts (or selected statuses)."""
         target_statuses = statuses or ["active", "depleted", "cooldown", "invalid"]
         all_docs = await self.repo.list_all_accounts_for_refresh(
             statuses=target_statuses,
@@ -1119,7 +1269,7 @@ class AccountHealthRefresher:
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
-            "errors": errors[:50],  # 最多返回前 50 条错误
+            "errors": errors[:50],  # Return only first 50 errors.
         }
 
     async def _loop(self) -> None:
@@ -1208,3 +1358,5 @@ class SessionManager:
 
     async def break_session(self, session_id: str, reason: str) -> None:
         await self.repo.mark_session_broken(session_id, reason)
+
+

@@ -27,4 +27,5 @@ dependencies = [
     "openai>=2.24.0",
     "tzdata>=2025.3",
     "python-multipart>=0.0.22",
+    "curl-cffi>=0.14.0",
 ]

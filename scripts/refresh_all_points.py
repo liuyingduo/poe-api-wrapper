@@ -1,16 +1,11 @@
-"""
-refresh_all_points.py
----------------------
-独立脚本：直接连接 MongoDB，并发刷新所有 Poe 账号的可用积分。
-无需 FastAPI 服务运行。
+﻿"""Refresh all account points directly from Mongo + Poe.
 
-用法
-----
-python refresh_all_points.py
-python refresh_all_points.py --statuses active depleted cooldown
-python refresh_all_points.py --concurrency 20
-python refresh_all_points.py --env-file /path/to/.env.gateway
-python refresh_all_points.py --dry-run        # 只列出账号，不实际刷新
+Usage:
+  python scripts/refresh_all_points.py
+  python scripts/refresh_all_points.py --statuses active depleted cooldown
+  python scripts/refresh_all_points.py --concurrency 20
+  python scripts/refresh_all_points.py --env-file /path/to/.env.gateway
+  python scripts/refresh_all_points.py --dry-run
 """
 
 from __future__ import annotations
@@ -22,17 +17,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# ---------------------------------------------------------------------------
-# 自动加载 .env.gateway / .env
-# ---------------------------------------------------------------------------
 
 def _load_dotenv(path: Path) -> bool:
     if not path.exists():
         return False
+
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
@@ -41,35 +35,26 @@ def _load_dotenv(path: Path) -> bool:
         ):
             value = value[1:-1]
         os.environ.setdefault(key, value)
+
     return True
 
 
 def _bootstrap_env(explicit_path: Optional[str] = None) -> None:
     if explicit_path:
-        p = Path(explicit_path)
-        if _load_dotenv(p):
-            print(f"[env] 已加载配置文件: {p}")
+        explicit = Path(explicit_path)
+        if _load_dotenv(explicit):
+            print(f"[env] loaded: {explicit}")
             return
-        else:
-            print(f"[warn] 指定的配置文件不存在: {p}", file=sys.stderr)
+        print(f"[warn] env file not found: {explicit}", file=sys.stderr)
 
     script_dir = Path(__file__).resolve().parent
-    pkg_dir = script_dir / "poe_api_wrapper" / "openai"
+    project_root = script_dir.parent
 
-    for candidate in (
-        script_dir / ".env.gateway",
-        script_dir / ".env",
-        pkg_dir / ".env.gateway",
-        pkg_dir / ".env",
-    ):
+    for candidate in (project_root / ".env.gateway",):
         if _load_dotenv(candidate):
-            print(f"[env] 已加载配置文件: {candidate}")
+            print(f"[env] loaded: {candidate}")
             break
 
-
-# ---------------------------------------------------------------------------
-# 主逻辑
-# ---------------------------------------------------------------------------
 
 async def run(
     statuses: list[str],
@@ -77,70 +62,63 @@ async def run(
     dry_run: bool,
     depleted_threshold: int,
 ) -> None:
-    # 延迟导入，确保 env 已加载
-    from poe_api_wrapper.openai.gateway import (
+    from poe_api_wrapper.service.gateway import (
         AccountRepository,
         CredentialCrypto,
         PoeClientPool,
+        fetch_poe_revision,
         mask_secret,
         utc_now,
     )
 
     def _require(name: str) -> str:
-        v = os.environ.get(name, "").strip()
-        if not v:
-            print(f"[error] 缺少必要环境变量: {name}", file=sys.stderr)
-            sys.exit(1)
-        return v
+        value = os.environ.get(name, "").strip()
+        if not value:
+            print(f"[error] missing required env var: {name}", file=sys.stderr)
+            raise SystemExit(1)
+        return value
 
     mongodb_uri = _require("MONGODB_URI")
     mongodb_db = _require("MONGODB_DB")
     fernet_key = _require("FERNET_KEY")
     poe_revision = os.environ.get("POE_REVISION", "").strip()
 
-    print(f"[config] MongoDB: {mongodb_uri}  db={mongodb_db}")
-    print(f"[config] 刷新状态范围: {statuses}")
-    print(f"[config] 并发数: {concurrency}  耗尽阈值: {depleted_threshold}")
-    print(f"[config] dry_run: {dry_run}")
+    print(f"[config] mongodb={mongodb_uri} db={mongodb_db}")
+    print(f"[config] statuses={statuses}")
+    print(f"[config] concurrency={concurrency} depleted_threshold={depleted_threshold}")
+    print(f"[config] dry_run={dry_run}")
     print("-" * 60)
 
-    # 若未在环境变量中配置 POE_REVISION，则自动从 poe.com/login 页面抓取
     if not poe_revision:
-        from poe_api_wrapper.openai.gateway import fetch_poe_revision
-        print("[info] POE_REVISION 未配置，正在从 poe.com/login 自动获取...")
+        print("[info] POE_REVISION not set, fetching from poe.com/login ...")
         poe_revision = await fetch_poe_revision() or ""
         if poe_revision:
-            print(f"[info] 自动获取 poe-revision: {poe_revision}")
+            print(f"[info] fetched poe-revision: {poe_revision}")
         else:
-            print("[warn] 未能自动获取 poe-revision，将不携带该请求头")
+            print("[warn] failed to fetch poe-revision, requests will continue without it")
 
     crypto = CredentialCrypto(fernet_key)
     repo = AccountRepository(mongodb_uri, mongodb_db, crypto)
     pool = PoeClientPool(repo=repo, default_poe_revision=poe_revision)
 
     try:
-        # 查询目标账号
-        all_docs = await repo.list_all_accounts_for_refresh(
-            statuses=statuses,
-            limit=5000,
-        )
+        all_docs = await repo.list_all_accounts_for_refresh(statuses=statuses, limit=5000)
         total = len(all_docs)
-        print(f"[info] 共找到 {total} 个账号需要刷新")
+        print(f"[info] matched accounts={total}")
 
         if total == 0:
-            print("[info] 没有符合条件的账号，退出。")
+            print("[info] no accounts to refresh")
             return
 
         if dry_run:
-            print("[dry-run] 以下账号将被刷新（仅列出，不实际操作）：")
+            print("[dry-run] accounts that would be refreshed:")
             for doc in all_docs:
                 print(f"  - {doc['_id']}")
             return
 
-        # 并发刷新
         succeeded = 0
         failed = 0
-        errors: list[dict] = []
+        errors: list[dict[str, str]] = []
         sem = asyncio.Semaphore(concurrency)
         lock = asyncio.Lock()
 
@@ -151,15 +129,15 @@ async def run(
                 try:
                     account_doc = await repo.get_account_by_id(account_id)
                     if not account_doc:
-                        raise RuntimeError("账号记录不存在")
+                        raise RuntimeError("account not found")
 
                     client = await pool.get_client(account_doc)
                     settings = await client.get_settings()
                     message_info = settings.get("messagePointInfo", {})
                     subscription = settings.get("subscription", {})
-                    balance = int(
-                        message_info.get("subscriptionPointBalance", 0) or 0
-                    ) + int(message_info.get("addonPointBalance", 0) or 0)
+                    balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+                        message_info.get("addonPointBalance", 0) or 0
+                    )
                     subscription_active = bool(subscription.get("isActive", False))
 
                     await repo.update_account_health(
@@ -176,84 +154,72 @@ async def run(
                         done = succeeded + failed
                         print(
                             f"  [{done}/{total}] {mask_secret(account_id, 8)} "
-                            f"积分={balance}  订阅={subscription_active}  状态={status_tag}"
+                            f"points={balance} subscription={subscription_active} status={status_tag}"
                         )
                 except Exception as exc:
                     async with lock:
                         failed += 1
                         done = succeeded + failed
-                        err_msg = str(exc)
-                        errors.append({"account_id": account_id, "error": err_msg})
-                        print(
-                            f"  [{done}/{total}] {mask_secret(account_id, 8)} "
-                            f"[FAILED] {err_msg[:120]}"
-                        )
+                        errors.append({"account_id": account_id, "error": str(exc)})
+                        print(f"  [{done}/{total}] {mask_secret(account_id, 8)} [FAILED] {str(exc)[:160]}")
 
-        print(f"[info] 开始刷新（并发={concurrency}）...")
+        print(f"[info] refreshing accounts (concurrency={concurrency}) ...")
         start_at = utc_now()
         await asyncio.gather(*(_refresh_one(doc) for doc in all_docs))
         elapsed = (utc_now() - start_at).total_seconds()
 
         print("-" * 60)
-        print(f"[done] 耗时 {elapsed:.1f}s")
-        print(f"       总计={total}  成功={succeeded}  失败={failed}")
+        print(f"[done] elapsed={elapsed:.1f}s total={total} succeeded={succeeded} failed={failed}")
         if errors:
-            print(f"[errors] 前 {min(len(errors), 20)} 条失败详情：")
-            for e in errors[:20]:
-                print(f"  account_id={e['account_id']}  error={e['error']}")
-
+            print(f"[errors] showing first {min(len(errors), 20)} errors:")
+            for item in errors[:20]:
+                print(f"  account_id={item['account_id']} error={item['error']}")
     finally:
         await pool.close_all()
         await repo.close()
 
 
-# ---------------------------------------------------------------------------
-# CLI 入口
-# ---------------------------------------------------------------------------
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="刷新所有 Poe 账号的可用积分（直连 MongoDB，无需服务运行）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Refresh Poe account points directly from MongoDB (without running FastAPI service)."
     )
     parser.add_argument(
         "--statuses",
         nargs="+",
-        default=["active", "depleted", "cooldown", "invalid"],
+        default=["depleted", "cooldown", "invalid"],
         metavar="STATUS",
-        help="要刷新的账号状态，空格分隔（默认：active depleted cooldown invalid）",
+        help="Account statuses to refresh (default: depleted cooldown invalid)",
     )
     parser.add_argument(
         "--concurrency",
         type=int,
         default=10,
         metavar="N",
-        help="并发刷新账号数量（默认：10，上限：50）",
+        help="Concurrent refresh workers (default: 10, max: 50)",
     )
     parser.add_argument(
         "--depleted-threshold",
         type=int,
         default=None,
         metavar="N",
-        help="积分低于此值视为耗尽（默认读取 DEPLETED_THRESHOLD 环境变量，fallback=20）",
+        help="Balance <= threshold is considered depleted (default from DEPLETED_THRESHOLD or 20)",
     )
     parser.add_argument(
         "--env-file",
         default=None,
         metavar="PATH",
-        help="手动指定 .env.gateway 文件路径",
+        help="Optional explicit .env.gateway path",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="只列出账号，不实际调用 Poe API",
+        help="Only list accounts, do not call Poe API",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-
     _bootstrap_env(args.env_file)
 
     concurrency = max(1, min(args.concurrency, 50))

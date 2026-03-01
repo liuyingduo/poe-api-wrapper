@@ -7,12 +7,29 @@ import os
 import re
 import tempfile
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-import orjson
+try:
+    import orjson
+except ImportError:
+    import json as _json
+
+    class _OrjsonCompat:
+        @staticmethod
+        def dumps(obj):
+            return _json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+        @staticmethod
+        def loads(data):
+            if isinstance(data, (bytes, bytearray)):
+                data = data.decode("utf-8")
+            return _json.loads(data)
+
+    orjson = _OrjsonCompat()
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -23,8 +40,8 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from httpx import AsyncClient
 from loguru import logger
 
-from poe_api_wrapper.openai import helpers
-from poe_api_wrapper.openai.gateway import (
+from . import helpers
+from .gateway import (
     AccountHealthRefresher,
     AccountLease,
     AccountRepository,
@@ -41,7 +58,7 @@ from poe_api_wrapper.openai.gateway import (
     hash_api_key,
     mask_secret,
 )
-from poe_api_wrapper.openai.type import (
+from .types import (
     AccountUpsertData,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
@@ -97,7 +114,7 @@ def _bootstrap_env() -> None:
     # Priority:
     # 1) Existing process environment
     # 2) Explicit config file via GATEWAY_CONFIG_FILE
-    # 3) .env.gateway / .env in cwd and package dir
+    # 3) .env.gateway in cwd (single local source of truth)
     explicit_path = os.getenv("GATEWAY_CONFIG_FILE", "").strip()
     loaded_from: list[Path] = []
     if explicit_path:
@@ -105,12 +122,7 @@ def _bootstrap_env() -> None:
         if _load_dotenv_file(p):
             loaded_from.append(p)
 
-    for candidate in (
-        Path.cwd() / ".env.gateway",
-        Path.cwd() / ".env",
-        DIR / ".env.gateway",
-        DIR / ".env",
-    ):
+    for candidate in (Path.cwd() / ".env.gateway",):
         if _load_dotenv_file(candidate):
             loaded_from.append(candidate)
 
@@ -127,6 +139,15 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise RuntimeError(f"Environment variable {name} must be an integer")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"Environment variable {name} must be a boolean (true/false, 1/0)")
 
 
 def _require_env(name: str) -> str:
@@ -166,6 +187,9 @@ class GatewayConfig:
     recent_active_minutes: int
     cooldown_seconds: int
     prewarm_concurrency: int
+    prewarm_on_startup: bool
+    prewarm_account_timeout_seconds: int
+    auto_fetch_poe_revision: bool
     daily_reset_timezone: str
     daily_reset_hour: int
     daily_reset_point_balance: int
@@ -186,6 +210,9 @@ class GatewayConfig:
             recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
             prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
+            prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
+            prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
+            auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
             daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 3000),
@@ -294,8 +321,17 @@ async def _prewarm_pool(runtime: GatewayRuntime) -> None:
         account_id = str(account_doc["_id"])
         async with semaphore:
             try:
-                await runtime.pool.get_client(account_doc)
+                await asyncio.wait_for(
+                    runtime.pool.get_client(account_doc),
+                    timeout=max(1, runtime.config.prewarm_account_timeout_seconds),
+                )
                 logger.info("Prewarmed account {}", mask_secret(account_id))
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Prewarm timed out for account {} after {}s",
+                    mask_secret(account_id),
+                    runtime.config.prewarm_account_timeout_seconds,
+                )
             except Exception as exc:
                 logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
                 await runtime.repo.record_account_error(
@@ -312,13 +348,15 @@ async def startup_event() -> None:
     config = GatewayConfig.from_env()
 
     # 若未在环境变量中配置 POE_REVISION，则自动从 poe.com/login 页面抓取
-    if not config.default_poe_revision:
+    if not config.default_poe_revision and config.auto_fetch_poe_revision:
         fetched = await fetch_poe_revision()
         if fetched:
             config.default_poe_revision = fetched
             logger.info("自动获取 poe-revision: {}", fetched)
         else:
             logger.warning("未能自动获取 poe-revision，客户端将不携带该请求头")
+    elif not config.default_poe_revision and not config.auto_fetch_poe_revision:
+        logger.info("POE_REVISION 未配置，且 AUTO_FETCH_POE_REVISION=false，跳过自动抓取")
 
     crypto = CredentialCrypto(config.fernet_key)
     repo = AccountRepository(config.mongodb_uri, config.mongodb_db, crypto)
@@ -358,7 +396,11 @@ async def startup_event() -> None:
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
     refresher.start()
-    await _prewarm_pool(runtime)
+    app.state.prewarm_task = None
+    if config.prewarm_on_startup:
+        app.state.prewarm_task = asyncio.create_task(_prewarm_pool(runtime), name="startup-prewarm")
+    else:
+        logger.info("Startup prewarm disabled (PREWARM_ON_STARTUP=false)")
     logger.info("Gateway startup complete")
 
 
@@ -367,6 +409,11 @@ async def shutdown_event() -> None:
     runtime = getattr(app.state, "runtime", None)
     if not runtime:
         return
+    prewarm_task = getattr(app.state, "prewarm_task", None)
+    if prewarm_task and not prewarm_task.done():
+        prewarm_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await prewarm_task
     await runtime.refresher.stop()
     await runtime.pool.close_all()
     await runtime.repo.close()
@@ -1680,7 +1727,7 @@ async def unsupported_v1_path(
 
 
 if __name__ == "__main__":
-    uvicorn.run("poe_api_wrapper.openai.api:app", host="127.0.0.1", port=8000, workers=1)
+    uvicorn.run("poe_api_wrapper.service.gateway_api:app", host="127.0.0.1", port=8000, workers=1)
 
 
 def start_server(tokens: Optional[list] = None, address: str = "127.0.0.1", port: str = "8000"):
@@ -1689,5 +1736,4 @@ def start_server(tokens: Optional[list] = None, address: str = "127.0.0.1", port
             "The `tokens` argument is ignored in Mongo gateway mode. "
             "Use /admin/accounts/upsert to manage accounts."
         )
-    uvicorn.run("poe_api_wrapper.openai.api:app", host=address, port=int(port), workers=1)
-
+    uvicorn.run("poe_api_wrapper.service.gateway_api:app", host=address, port=int(port), workers=1)

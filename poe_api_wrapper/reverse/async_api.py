@@ -1,8 +1,29 @@
 from httpx import AsyncClient
-import asyncio, orjson, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid
+import asyncio, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid
 from typing import AsyncIterator, Optional
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
+
+try:
+    import orjson
+except ImportError:
+    import json as _json
+
+    class _OrjsonCompat:
+        OPT_INDENT_2 = 2
+
+        @staticmethod
+        def dumps(obj, option=None):
+            indent = 2 if option == 2 else None
+            return _json.dumps(obj, ensure_ascii=False, indent=indent).encode("utf-8")
+
+        @staticmethod
+        def loads(data):
+            if isinstance(data, (bytes, bytearray)):
+                data = data.decode("utf-8")
+            return _json.loads(data)
+
+    orjson = _OrjsonCompat()
 
 # Allow multi-threading for asyncio
 import nest_asyncio
@@ -34,13 +55,15 @@ class AsyncPoeApi:
     
     def __init__(
         self,
-        tokens: dict = {},
-        proxy: list = [],
+        tokens: Optional[dict] = None,
+        proxy: Optional[list] = None,
         auto_proxy: bool = False,
-        headers: dict = None,
+        headers: Optional[dict] = None,
         request_retry_limit: Optional[int] = None,
     ):
         self.client = None
+        tokens = tokens or {}
+        proxy = proxy or []
         if 'p-b' not in tokens:
             raise ValueError("Please provide a valid p-b cookie")
 
@@ -180,7 +203,16 @@ class AsyncPoeApi:
             file_hash_jwts.append(file_hash_jwt)
         return file_hash_jwts
 
-    async def send_request(self, path: str, query_name: str="", variables: dict={}, file_form: list=[], knowledge: bool=False):
+    async def send_request(
+        self,
+        path: str,
+        query_name: str = "",
+        variables: Optional[dict] = None,
+        file_form: Optional[list] = None,
+        knowledge: bool = False,
+    ):
+        variables = variables or {}
+        file_form = file_form or []
         status_code = 0
         resolved_query_name = resolve_query_name(query_name)
         
@@ -850,7 +882,18 @@ class AsyncPoeApi:
         await self.delete_queues(chatId)
         self.retry_attempts = 3
         
-    async def send_message(self, bot: str, message: str, chatId: int=None, chatCode: str=None, msgPrice: int=20, file_path: list=[], suggest_replies: bool=False, timeout: int=5) -> AsyncIterator[dict]:
+    async def send_message(
+        self,
+        bot: str,
+        message: str,
+        chatId: int = None,
+        chatCode: str = None,
+        msgPrice: int = 20,
+        file_path: Optional[list] = None,
+        suggest_replies: bool = False,
+        timeout: int = 5,
+    ) -> AsyncIterator[dict]:
+        file_path = file_path or []
         self.retry_attempts = 3
         while None in self.active_messages.values() and len(self.active_messages) > self.MAX_CONCURRENT_MESSAGES:
             await asyncio.sleep(0.01)
@@ -1308,7 +1351,13 @@ class AsyncPoeApi:
         logger.info(f"Found {len(sources_ids)} unique knowledge sources out of {int(total_sources)+1} sources from {botName}")
         return sources_ids
 
-    async def upload_knowledge(self, file_path: list=[], text_knowledge: list=[]):
+    async def upload_knowledge(
+        self,
+        file_path: Optional[list] = None,
+        text_knowledge: Optional[list] = None,
+    ):
+        file_path = file_path or []
+        text_knowledge = text_knowledge or []
         ids = {}
         if text_knowledge != []:
             for text in text_knowledge:
@@ -1689,7 +1738,8 @@ class AsyncPoeApi:
             logger.error(f'An error occurred while importing the chat')
             return None
         
-    async def create_group(self, group_name: str=None, bots: list = []): 
+    async def create_group(self, group_name: str = None, bots: Optional[list] = None):
+        bots = bots or []
         if group_name == None:
             group_name = ''.join(secrets.choice(string.ascii_letters + string.digits) for i in range(10))
         else:

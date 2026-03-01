@@ -1,4 +1,4 @@
-from poe_api_wrapper.openai.gateway import build_openai_error, extract_bearer_token, hash_api_key, SessionManager
+from poe_api_wrapper.service.gateway import build_openai_error, extract_bearer_token, hash_api_key, SessionManager
 
 
 def test_extract_bearer_token():
@@ -33,4 +33,3 @@ def test_session_id_resolution():
     session_id, persistent = SessionManager.resolve_session_id(None, None)
     assert session_id.startswith("ephemeral-")
     assert persistent is False
-

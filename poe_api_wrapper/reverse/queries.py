@@ -1,4 +1,16 @@
-import orjson, random
+import random
+
+try:
+    import orjson
+except ImportError:
+    import json as _json
+
+    class _OrjsonCompat:
+        @staticmethod
+        def dumps(obj):
+            return _json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+    orjson = _OrjsonCompat()
 
 QUERIES = {
   "RegenerateMessageMutation": "c57eb11b407a486eb95d94eb698707b66509e1f8b59e08b8e8bb8e1e51bcf426",

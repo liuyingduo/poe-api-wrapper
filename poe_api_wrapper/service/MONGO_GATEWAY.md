@@ -5,18 +5,18 @@
 You can use either:
 
 1. Process environment variables, or
-2. A config file (`.env.gateway` / `.env`) loaded automatically at startup.
+2. A config file (`.env.gateway`) loaded automatically at startup.
 
 Recommended: copy template and fill values.
 
 ```bash
-cp poe_api_wrapper/openai/.env.gateway.example .env.gateway
+cp .env.gateway.example .env.gateway
 ```
 
 The server loads config from:
 
 - `GATEWAY_CONFIG_FILE` (if specified), then
-- `./.env.gateway`, `./.env`, `poe_api_wrapper/openai/.env.gateway`, `poe_api_wrapper/openai/.env`
+- `./.env.gateway`
 
 ```bash
 MONGODB_URI=mongodb://127.0.0.1:27017
@@ -37,6 +37,11 @@ REFRESH_INTERVAL_SECONDS=600
 RECENT_ACTIVE_MINUTES=120
 COOLDOWN_SECONDS=120
 PREWARM_CONCURRENCY=5
+
+# Startup behavior controls
+PREWARM_ON_STARTUP=true
+PREWARM_ACCOUNT_TIMEOUT_SECONDS=20
+AUTO_FETCH_POE_REVISION=true
 ```
 
 ### What are `ADMIN_API_KEY` and `SERVICE_API_KEYS_BOOTSTRAP`?
@@ -72,7 +77,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ## 2) Start Service (tmux)
 
 ```bash
-tmux new -s poe-gateway "uvicorn poe_api_wrapper.openai.api:app --host 0.0.0.0 --port 8000 --workers 1"
+tmux new -s poe-gateway "uvicorn poe_api_wrapper.service.gateway_api:app --host 0.0.0.0 --port 8000 --workers 1"
 ```
 
 ## 3) Add / Update Account
