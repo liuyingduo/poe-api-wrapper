@@ -4,6 +4,7 @@ import asyncio
 import math
 import mimetypes
 import os
+import re
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -490,6 +491,60 @@ async def admin_list_accounts(
     return JSONResponse(jsonable_encoder(data))
 
 
+@app.get("/admin/accounts/summary", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_accounts_summary() -> JSONResponse:
+    """List all accounts with email / availability / balance, plus total & available counts."""
+    runtime = _runtime()
+    data = await runtime.repo.get_accounts_summary()
+    return JSONResponse(data)
+
+
+@app.post("/admin/accounts/refresh-points", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_refresh_account_points(request: Request) -> JSONResponse:
+    """Fetch real-time points for a specific account from Poe and update the database."""
+    runtime = _runtime()
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    if not email:
+        _openai_http_error(400, "invalid_request_error", "Field 'email' is required")
+
+    account_doc = await runtime.repo.get_account_by_email(email)
+    if not account_doc:
+        _openai_http_error(404, "not_found_error", f"Account with email '{email}' not found")
+
+    account_id = str(account_doc["_id"])
+    try:
+        client = await runtime.pool.get_client(account_doc)
+        settings = await client.get_settings()
+        message_info = settings.get("messagePointInfo", {})
+        subscription = settings.get("subscription", {})
+        balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+            message_info.get("addonPointBalance", 0) or 0
+        )
+        subscription_active = bool(subscription.get("isActive", False))
+        await runtime.repo.update_account_health(
+            account_id,
+            balance=balance,
+            subscription_active=subscription_active,
+            depleted_threshold=runtime.config.depleted_threshold,
+        )
+        await runtime.repo.mark_account_success(account_id)
+        return JSONResponse(
+            {
+                "email": email,
+                "message_point_balance": balance,
+                "subscription_active": subscription_active,
+                "status": "depleted" if balance <= runtime.config.depleted_threshold else "active",
+                "raw": {
+                    "subscriptionPointBalance": message_info.get("subscriptionPointBalance"),
+                    "addonPointBalance": message_info.get("addonPointBalance"),
+                },
+            }
+        )
+    except Exception as exc:
+        _openai_http_error(502, "provider_error", f"Failed to fetch points from Poe: {exc}")
+
+
 @app.api_route("/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
 @app.api_route("/models", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
 @app.api_route("/v1/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
@@ -723,10 +778,14 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
 
 async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
     image = image or []
+    message = (response.get("message") or "").strip()
+    normalized_aspect = (aspect_ratio or "").strip()
+    if normalized_aspect and not re.search(r"(^|\s)--aspect(\s+|$)", message, flags=re.IGNORECASE):
+        message = f"{message} {normalized_aspect}".strip()
     try:
         async for chunk in client.send_message(
             bot=response["bot"],
-            message=f"{response['message']} {aspect_ratio}",
+            message=message,
             file_path=image,
         ):
             pass

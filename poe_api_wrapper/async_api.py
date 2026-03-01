@@ -257,7 +257,7 @@ class AsyncPoeApi:
         self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
         self.tchannel_data = response_json["tchannelData"]
         self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
-        self.channel_url = f'ws://{self.ws_domain}.tch.{self.tchannel_data["baseHost"]}/up/{self.tchannel_data["boxName"]}/updates?min_seq={self.tchannel_data["minSeq"]}&channel={self.tchannel_data["channel"]}&hash={self.tchannel_data["channelHash"]}'
+        self.channel_url = f'wss://{self.ws_domain}.tch.{self.tchannel_data["baseHost"]}/up/{self.tchannel_data["boxName"]}/updates?min_seq={self.tchannel_data["minSeq"]}&channel={self.tchannel_data["channel"]}&hash={self.tchannel_data["channelHash"]}'
         await self.subscribe()
     
     async def subscribe(self):

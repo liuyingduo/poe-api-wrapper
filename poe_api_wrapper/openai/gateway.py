@@ -195,6 +195,74 @@ class AccountRepository:
 
         return await self._run(_op)
 
+    async def get_account_by_email(self, email: str) -> Optional[dict[str, Any]]:
+        def _op():
+            return self.accounts.find_one({"email": email})
+
+        return await self._run(_op)
+
+    async def get_accounts_summary(self) -> dict[str, Any]:
+        """Return all accounts with key fields only, plus total / available counts."""
+        now = utc_now()
+
+        def _op():
+            docs = list(
+                self.accounts.find(
+                    {},
+                    {
+                        "email": 1,
+                        "status": 1,
+                        "message_point_balance": 1,
+                        "subscription_active": 1,
+                        "cooldown_until": 1,
+                        "last_success_at": 1,
+                        "updated_at": 1,
+                    },
+                ).sort("message_point_balance", DESCENDING)
+            )
+            return docs, now
+
+        docs, query_time = await self._run(_op)
+
+        accounts = []
+        available_count = 0
+        for doc in docs:
+            cooldown_until = doc.get("cooldown_until")
+            in_cooldown = bool(
+                cooldown_until
+                and isinstance(cooldown_until, datetime)
+                and cooldown_until > query_time
+            )
+            status = str(doc.get("status", "unknown"))
+            is_available = status == "active" and not in_cooldown
+            if is_available:
+                available_count += 1
+            accounts.append(
+                {
+                    "email": doc.get("email"),
+                    "status": status,
+                    "available": is_available,
+                    "message_point_balance": int(doc.get("message_point_balance", 0) or 0),
+                    "subscription_active": bool(doc.get("subscription_active", False)),
+                    "cooldown_until": doc["cooldown_until"].isoformat() if in_cooldown else None,
+                    "last_success_at": (
+                        doc["last_success_at"].isoformat()
+                        if doc.get("last_success_at")
+                        else None
+                    ),
+                    "updated_at": (
+                        doc["updated_at"].isoformat() if doc.get("updated_at") else None
+                    ),
+                }
+            )
+
+        return {
+            "total": len(accounts),
+            "available": available_count,
+            "unavailable": len(accounts) - available_count,
+            "accounts": accounts,
+        }
+
     def _object_id(self, account_id: str):
         from bson import ObjectId
 
