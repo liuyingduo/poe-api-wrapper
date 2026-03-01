@@ -355,53 +355,73 @@ class AsyncPoeApi:
             return
 
         if self.ws_connecting:
-            while not self.ws_connected:
-                await asyncio.sleep(0.01)
+            waited = 0.0
+            while self.ws_connecting and not self.ws_connected and waited < 30.0:
+                await asyncio.sleep(0.05)
+                waited += 0.05
+            if self.ws_connected:
+                return
+            if self.ws_connecting:
+                logger.warning("connect_ws wait timed out; resetting stale ws_connecting state")
+                self.ws_connecting = False
+            else:
+                return
+
+        if self.ws_connecting:
             return
 
         self.ws_connecting = True
         self.ws_connected = False
         self.ws_refresh = 3
 
-        if not self.tchannel_data:
-            await self.load_bundle()
-        self._build_channel_url_from_tchannel()
-        
-        while True:
-            self.ws_refresh -= 1
-            if self.ws_refresh == 0:
-                self.ws_refresh = 3
-                raise RuntimeError("Rate limit exceeded for sending requests to poe.com. Please try again later.")
-            try:
-                await self.subscribe()
-                break
-            except Exception as e:
-                logger.error(f"Failed to subscribe websocket channel. Reason: {e}")
-                await asyncio.sleep(1)
-                continue
-        
-        self.loop = asyncio.get_event_loop()
-                    
-        self.ws = await self.loop.run_in_executor(
-            None,
-            lambda: websocket.WebSocketApp(self.channel_url,
-                                           header={
-                                                "Origin": f"{self.BASE_URL}",
-                                                "Pragma": "no-cache",
-                                                "Cache-Control": "no-cache",
-                                            },
-                                            on_message=lambda ws, msg: self.on_message(ws, msg), 
-                                            on_open=lambda ws: self.on_ws_connect(ws), 
-                                            on_error=lambda ws, error: self.on_ws_error(ws, error), 
-                                            on_close=lambda ws, close_status_code, close_message: self.on_ws_close(ws, close_status_code, close_message))
-        )
+        try:
+            if not self.tchannel_data:
+                await self.load_bundle()
+            self._build_channel_url_from_tchannel()
 
-        t = threading.Thread(target=self.ws_run_thread, daemon=True)
-        t.start()
+            while True:
+                self.ws_refresh -= 1
+                if self.ws_refresh == 0:
+                    self.ws_refresh = 3
+                    raise RuntimeError("Rate limit exceeded for sending requests to poe.com. Please try again later.")
+                try:
+                    await self.subscribe()
+                    break
+                except Exception as e:
+                    logger.error(f"Failed to subscribe websocket channel. Reason: {e}")
+                    await asyncio.sleep(1)
+                    continue
 
-        while not self.ws_connected:
-            await asyncio.sleep(0.01)
-        self._start_ws_heartbeat()
+            self.loop = asyncio.get_event_loop()
+
+            self.ws = await self.loop.run_in_executor(
+                None,
+                lambda: websocket.WebSocketApp(self.channel_url,
+                                               header={
+                                                    "Origin": f"{self.BASE_URL}",
+                                                    "Pragma": "no-cache",
+                                                    "Cache-Control": "no-cache",
+                                                },
+                                                on_message=lambda ws, msg: self.on_message(ws, msg), 
+                                                on_open=lambda ws: self.on_ws_connect(ws), 
+                                                on_error=lambda ws, error: self.on_ws_error(ws, error), 
+                                                on_close=lambda ws, close_status_code, close_message: self.on_ws_close(ws, close_status_code, close_message))
+            )
+
+            t = threading.Thread(target=self.ws_run_thread, daemon=True)
+            t.start()
+
+            waited = 0.0
+            while not self.ws_connected and waited < 30.0:
+                await asyncio.sleep(0.05)
+                waited += 0.05
+            if not self.ws_connected:
+                raise RuntimeError("Timed out while waiting websocket connection to open")
+            self._start_ws_heartbeat()
+        except Exception:
+            self.ws_connecting = False
+            self.ws_connected = False
+            raise
 
     def disconnect_ws(self):
         self.ws_connecting = False
