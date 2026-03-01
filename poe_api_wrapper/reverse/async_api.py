@@ -134,10 +134,22 @@ class AsyncPoeApi:
     def __del__(self):
         if self.client:
             asyncio.get_event_loop().run_until_complete(self.client.aclose())
+
+    async def _get_homepage_without_poe_headers(self):
+        removed_headers: dict[str, str] = {}
+        for key in ("Poe-Revision", "Poe-Formkey", "Poe-Tchannel"):
+            value = self.client.headers.pop(key, None)
+            if value is not None:
+                removed_headers[key] = value
+        try:
+            return await self.client.get(self.BASE_URL, headers=self.HEADERS, follow_redirects=True)
+        finally:
+            if removed_headers:
+                self.client.headers.update(removed_headers)
     
     async def load_bundle(self):
         try:
-            web_data = await self.client.get(self.BASE_URL, headers=self.HEADERS, follow_redirects=True)
+            web_data = await self._get_homepage_without_poe_headers()
             if web_data.status_code != 200:
                 raise RuntimeError(f"Failed to load Poe homepage. status_code:{web_data.status_code}")
 
