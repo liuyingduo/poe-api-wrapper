@@ -1,7 +1,8 @@
-import os, string, secrets, base64
+import os, string, secrets, base64, json, re
 from urllib.parse import urlparse
 from httpx import Client
 from loguru import logger
+from typing import Any, Optional
 
 BASE_URL = 'https://poe.com'
 HEADERS = {
@@ -195,3 +196,98 @@ def generate_file(file_path: list, proxy: dict=None):
                 files.append((file_name, file_data, content_type))
                 file_size += len(file_data)
     return files, file_size
+
+
+_NEXT_DATA_SCRIPT_RE = re.compile(
+    r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(?P<json>.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _deep_find_tchannel_data(obj: Any) -> Optional[dict]:
+    if isinstance(obj, dict):
+        candidate = obj.get("tchannelData")
+        if isinstance(candidate, dict):
+            required = {"minSeq", "channel", "channelHash", "boxName", "baseHost"}
+            if required.issubset(candidate.keys()):
+                return candidate
+        for value in obj.values():
+            found = _deep_find_tchannel_data(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _deep_find_tchannel_data(value)
+            if found:
+                return found
+    return None
+
+
+def _extract_balanced_json_object(source: str, start_idx: int) -> str:
+    depth = 0
+    in_string = False
+    escaped = False
+    buf: list[str] = []
+
+    for idx in range(start_idx, len(source)):
+        ch = source[idx]
+        buf.append(ch)
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(buf)
+
+    raise RuntimeError("Failed to extract balanced JSON object for tchannelData")
+
+
+def extract_tchannel_data_from_html(html: str) -> dict:
+    if not html or not html.strip():
+        raise RuntimeError("Empty HTML response while extracting tchannelData")
+
+    match = _NEXT_DATA_SCRIPT_RE.search(html)
+    if match:
+        raw_json = match.group("json").strip()
+        try:
+            payload = json.loads(raw_json)
+            tchannel_data = _deep_find_tchannel_data(payload)
+            if tchannel_data:
+                return tchannel_data
+        except Exception as exc:
+            logger.warning("Failed parsing __NEXT_DATA__ JSON: {}", exc)
+
+    key = '"tchannelData"'
+    key_idx = html.find(key)
+    if key_idx < 0:
+        raise RuntimeError("tchannelData not found in Poe HTML response")
+
+    brace_start = html.find("{", key_idx)
+    if brace_start < 0:
+        raise RuntimeError("tchannelData key found but JSON object start missing")
+
+    raw_obj = _extract_balanced_json_object(html, brace_start)
+    try:
+        tchannel_data = json.loads(raw_obj)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse tchannelData JSON object: {exc}") from exc
+
+    required = {"minSeq", "channel", "channelHash", "boxName", "baseHost"}
+    if not required.issubset(tchannel_data.keys()):
+        raise RuntimeError(
+            f"Incomplete tchannelData fields: expected {sorted(required)}, got {sorted(tchannel_data.keys())}"
+        )
+    return tchannel_data

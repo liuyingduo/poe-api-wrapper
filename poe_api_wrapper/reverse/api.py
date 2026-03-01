@@ -33,7 +33,8 @@ from .utils import (
                     REVERSE_BOTS_LIST, 
                     bot_map, 
                     generate_nonce, 
-                    generate_file
+                    generate_file,
+                    extract_tchannel_data_from_html,
                     )
 from .queries import generate_payload, resolve_query_name
 from .bundles import PoeBundle
@@ -263,9 +264,14 @@ class PoeApi:
             )
     
     def get_channel_settings(self):
-        response_json = orjson.loads(self.client.get(f'{self.BASE_URL}/api/settings', headers=self.HEADERS, follow_redirects=True).text)
+        response = self.client.get(self.BASE_URL, headers=self.HEADERS, follow_redirects=True)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to load Poe homepage for channel settings. status_code:{response.status_code}"
+            )
+        response_json = extract_tchannel_data_from_html(response.text)
         self.ws_domain = f"tch{random.randint(1, int(1e6))}"[:11]
-        self.tchannel_data = response_json["tchannelData"]
+        self.tchannel_data = response_json
         self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
         self.channel_url = f'wss://{self.ws_domain}.tch.{self.tchannel_data["baseHost"]}/up/{self.tchannel_data["boxName"]}/updates?min_seq={self.tchannel_data["minSeq"]}&channel={self.tchannel_data["channel"]}&hash={self.tchannel_data["channelHash"]}'
         self.subscribe()

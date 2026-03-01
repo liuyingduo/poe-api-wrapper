@@ -8,31 +8,31 @@ http_client = httpx.Client(
 )
 client = openai.OpenAI(
     api_key="svc_app_zaiwen",
-    base_url="http://127.0.0.1:8003/v1/",
+    base_url="http://207.180.218.216:8003/v1/",
     http_client=http_client,
 )
 
 # ── Non-Streaming Example ──────────────────────────────────────────────────────
-response = client.chat.completions.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Hello!"},
-    ],
-)
-print(response.choices[0].message.content)
+# response = client.chat.completions.create(
+#     model="gpt-3.5-turbo",
+#     messages=[
+#         {"role": "system", "content": "You are a helpful assistant."},
+#         {"role": "user", "content": "Hello!"},
+#     ],
+# )
+# print(response.choices[0].message.content)
 
-# ── Streaming Example ──────────────────────────────────────────────────────────
-stream = client.chat.completions.create(
-    model="gpt-3.5-turbo",
-    messages=[
-        {"role": "user", "content": "this is a test request, write a short poem"},
-    ],
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content is not None:
-        print(chunk.choices[0].delta.content, end="")
+# # ── Streaming Example ──────────────────────────────────────────────────────────
+# stream = client.chat.completions.create(
+#     model="gpt-3.5-turbo",
+#     messages=[
+#         {"role": "user", "content": "this is a test request, write a short poem"},
+#     ],
+#     stream=True,
+# )
+# for chunk in stream:
+#     if chunk.choices[0].delta.content is not None:
+#         print(chunk.choices[0].delta.content, end="")
 # # print()
 
 # # # ── Vision / Image-Input Example ───────────────────────────────────────────────
@@ -62,7 +62,7 @@ edit_resp = client.images.edit(
     n=1,
     size="1024x1024",
 )
-# print(edit_resp.data[0].url)
+print(edit_resp.data[0].url)
 
 
 import concurrent.futures

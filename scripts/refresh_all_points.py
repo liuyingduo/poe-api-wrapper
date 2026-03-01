@@ -17,6 +17,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Ensure project root is importable when running as: python scripts/xxx.py
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 def _load_dotenv(path: Path) -> bool:
     if not path.exists():
