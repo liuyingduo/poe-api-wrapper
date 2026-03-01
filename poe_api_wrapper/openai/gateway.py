@@ -34,30 +34,70 @@ def utc_now() -> datetime:
 
 _POE_REVISION_RE = re.compile(r'poecdn\.net/assets/translations/([a-f0-9]{40})/')
 
+_BROWSE_HEADERS = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Priority": "u=0, i",
+    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 
 async def fetch_poe_revision(
     *,
     timeout: float = 15.0,
     retries: int = 2,
 ) -> Optional[str]:
-    """从 https://poe.com/login 页面的 HTML 中解析当前 poe-revision 哈希值。
+    """两步获取 poe-revision：
+    1. 请求 https://poe.com/ 取得 set-cookie 中的 p-b
+    2. 携带 p-b cookie 请求 https://poe.com/login?redirect_url=%2F，解析 HTML 中的 revision hash
 
     返回 40 位十六进制字符串，失败时返回 None。
     """
-    url = "https://poe.com/login?redirect_url=%2F"
-    headers = {
-        "User-Agent": DEFAULT_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
     for attempt in range(1, retries + 2):
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+            ) as client:
+                # 第一步：请求首页，获取 p-b cookie
+                home_resp = await client.get("https://poe.com/", headers=_BROWSE_HEADERS)
+                p_b = client.cookies.get("p-b") or home_resp.cookies.get("p-b")
+                if not p_b:
+                    # 尝试从 set-cookie 头里手动解析
+                    for sc in home_resp.headers.get_list("set-cookie"):
+                        if sc.startswith("p-b="):
+                            p_b = sc.split(";")[0][4:]
+                            break
+
+                if p_b:
+                    logger.debug("fetch_poe_revision: 获取到 p-b cookie（尝试 {}）", attempt)
+                else:
+                    logger.warning("fetch_poe_revision: 未获取到 p-b cookie（尝试 {}/{}）", attempt, retries + 1)
+
+                # 第二步：携带 p-b 请求 login 页
+                login_headers = dict(_BROWSE_HEADERS)
+                login_headers["Sec-Fetch-Site"] = "same-origin"
+                resp = await client.get(
+                    "https://poe.com/login?redirect_url=%2F",
+                    headers=login_headers,
+                    cookies={"p-b": p_b} if p_b else None,
+                )
                 resp.raise_for_status()
+
                 match = _POE_REVISION_RE.search(resp.text)
                 if match:
                     return match.group(1)
+
                 logger.warning(
                     "fetch_poe_revision: 未在响应 HTML 中找到 revision（尝试 {}/{}）",
                     attempt,
