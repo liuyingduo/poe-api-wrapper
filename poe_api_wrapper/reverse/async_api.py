@@ -41,7 +41,7 @@ from .utils import (
                     extract_tchannel_data_from_html,
                     )
 from .queries import generate_payload, resolve_query_name
-from .bundles import PoeBundle
+from .bundles import AsyncPoeBundle
 
 """
 This API is modified and maintained by @snowby666
@@ -81,7 +81,7 @@ class AsyncPoeApi:
         self.ws_heartbeat_interval: int = 25
         self.groups: dict = {}
         self.proxies: str = ""
-        self.bundle: PoeBundle = None
+        self.bundle: Optional[AsyncPoeBundle] = None
         self.tchannel_data: Optional[dict] = None
         self.channel_url: str = ""
         self.loop: asyncio.AbstractEventLoop = None
@@ -218,8 +218,11 @@ class AsyncPoeApi:
 
         if self.formkey == "":
             try:
-                self.bundle = PoeBundle(html)
-                self.formkey = self.bundle.get_form_key()
+                self.bundle = await AsyncPoeBundle.create(
+                    html,
+                    fetch_client=self.client,
+                )
+                self.formkey = await asyncio.to_thread(self.bundle.get_form_key)
                 self.client.headers.update({
                     'Poe-Formkey': self.formkey,
                 })
