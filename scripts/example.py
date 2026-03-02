@@ -68,7 +68,7 @@ client = openai.OpenAI(
 import concurrent.futures
 import time
 
-TOTAL_REQUESTS = 5
+TOTAL_REQUESTS = 50
 PROMPT = "A cute girl with a little flower"
 MODEL = "flux-2-klein-9b-base"
 

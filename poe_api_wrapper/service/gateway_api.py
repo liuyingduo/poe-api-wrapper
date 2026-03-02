@@ -190,6 +190,7 @@ class GatewayConfig:
     prewarm_max_accounts: int
     prewarm_on_startup: bool
     prewarm_account_timeout_seconds: int
+    prewarm_scan_interval_seconds: int
     acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
@@ -215,6 +216,7 @@ class GatewayConfig:
             prewarm_max_accounts=_env_int("PREWARM_MAX_ACCOUNTS", 300),
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
+            prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
@@ -232,6 +234,124 @@ class GatewayRuntime:
     pool: PoeClientPool
     refresher: AccountHealthRefresher
     sessions: SessionManager
+
+
+class PrewarmQueueCoordinator:
+    def __init__(self, runtime: GatewayRuntime):
+        self.runtime = runtime
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queued_ids: set[str] = set()
+        self._queued_ids_lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
+        self._producer_task: Optional[asyncio.Task] = None
+        self._consumer_tasks: list[asyncio.Task] = []
+
+    async def enqueue_account(self, account_id: str) -> bool:
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return False
+        async with self._queued_ids_lock:
+            if account_id in self._queued_ids:
+                return False
+            self._queued_ids.add(account_id)
+        await self.queue.put(account_id)
+        return True
+
+    async def _dequeue_mark_done(self, account_id: str) -> None:
+        async with self._queued_ids_lock:
+            self._queued_ids.discard(account_id)
+
+    async def _prewarm_account(self, account_id: str) -> None:
+        if self.runtime.pool.has_client(account_id):
+            return
+        account_doc = await self.runtime.repo.get_account_by_id(account_id)
+        if not account_doc:
+            return
+        if str(account_doc.get("status", "active")) != "active":
+            return
+        try:
+            await asyncio.wait_for(
+                self.runtime.pool.get_client(account_doc),
+                timeout=max(1, self.runtime.config.prewarm_account_timeout_seconds),
+            )
+            logger.info("Prewarmed account {}", mask_secret(account_id))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Prewarm timed out for account {} after {}s",
+                mask_secret(account_id),
+                self.runtime.config.prewarm_account_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
+            await self.runtime.repo.record_account_error(
+                account_id,
+                f"prewarm_error: {exc}",
+                cooldown_seconds=self.runtime.config.cooldown_seconds,
+            )
+
+    async def _producer_loop(self) -> None:
+        scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
+        while not self._stop_event.is_set():
+            try:
+                candidates = await self.runtime.repo.list_candidate_accounts(limit=0)
+                enqueue_count = 0
+                for account_doc in candidates:
+                    account_id = str(account_doc["_id"])
+                    if self.runtime.pool.has_client(account_id):
+                        continue
+                    queued = await self.enqueue_account(account_id)
+                    if queued:
+                        enqueue_count += 1
+                if enqueue_count > 0:
+                    logger.info(
+                        "Prewarm producer queued {} account(s); queue_size={}",
+                        enqueue_count,
+                        self.queue.qsize(),
+                    )
+            except Exception as exc:
+                logger.warning("Prewarm producer loop failed: {}", exc)
+
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=scan_interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _consumer_loop(self, worker_idx: int) -> None:
+        while not self._stop_event.is_set():
+            try:
+                account_id = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                await self._prewarm_account(account_id)
+            except Exception as exc:
+                logger.warning("Prewarm consumer {} unexpected error: {}", worker_idx, exc)
+            finally:
+                await self._dequeue_mark_done(account_id)
+                self.queue.task_done()
+
+    def start(self) -> None:
+        if self._producer_task and not self._producer_task.done():
+            return
+        self._stop_event.clear()
+        self._producer_task = asyncio.create_task(self._producer_loop(), name="prewarm-producer")
+        worker_count = max(1, int(self.runtime.config.prewarm_concurrency))
+        self._consumer_tasks = [
+            asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
+            for i in range(worker_count)
+        ]
+        logger.info("Started prewarm coordinator with {} consumers", worker_count)
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        tasks = [task for task in [self._producer_task, *self._consumer_tasks] if task]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._producer_task = None
+        self._consumer_tasks = []
 
 
 with (DIR / "models.json").open("rb") as f:
@@ -416,9 +536,11 @@ async def startup_event() -> None:
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
     refresher.start()
-    app.state.prewarm_task = None
+    app.state.prewarm_coordinator = None
     if config.prewarm_on_startup:
-        app.state.prewarm_task = asyncio.create_task(_prewarm_pool(runtime), name="startup-prewarm")
+        prewarm_coordinator = PrewarmQueueCoordinator(runtime)
+        prewarm_coordinator.start()
+        app.state.prewarm_coordinator = prewarm_coordinator
     else:
         logger.info("Startup prewarm disabled (PREWARM_ON_STARTUP=false)")
     logger.info("Gateway startup complete")
@@ -429,11 +551,9 @@ async def shutdown_event() -> None:
     runtime = getattr(app.state, "runtime", None)
     if not runtime:
         return
-    prewarm_task = getattr(app.state, "prewarm_task", None)
-    if prewarm_task and not prewarm_task.done():
-        prewarm_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await prewarm_task
+    prewarm_coordinator = getattr(app.state, "prewarm_coordinator", None)
+    if prewarm_coordinator:
+        await prewarm_coordinator.stop()
     await runtime.refresher.stop()
     await runtime.pool.close_all()
     await runtime.repo.close()
@@ -538,6 +658,17 @@ async def admin_upsert_account(data: AccountUpsertData) -> JSONResponse:
         poe_revision=data.poe_revision,
         user_agent=data.user_agent,
     )
+    account_id = str(account.get("id", "")).strip()
+    if account_id:
+        await runtime.pool.invalidate_client(account_id)
+        prewarm_coordinator = getattr(app.state, "prewarm_coordinator", None)
+        if prewarm_coordinator:
+            queued = await prewarm_coordinator.enqueue_account(account_id)
+            if queued:
+                logger.info(
+                    "Queued account {} for async prewarm after upsert",
+                    mask_secret(account_id),
+                )
     logger.info(
         "Upserted account email={} p_b={} cf_clearance={}",
         data.email,

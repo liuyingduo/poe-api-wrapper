@@ -593,17 +593,16 @@ class AccountRepository:
         }
 
         def _op():
-            return list(
-                self.accounts.find(query)
-                .sort(
-                    [
-                        ("health_score", DESCENDING),
-                        ("message_point_balance", DESCENDING),
-                        ("last_success_at", DESCENDING),
-                    ]
-                )
-                .limit(limit)
+            cursor = self.accounts.find(query).sort(
+                [
+                    ("health_score", DESCENDING),
+                    ("message_point_balance", DESCENDING),
+                    ("last_success_at", DESCENDING),
+                ]
             )
+            if limit > 0:
+                cursor = cursor.limit(limit)
+            return list(cursor)
 
         return await self._run(_op)
 
