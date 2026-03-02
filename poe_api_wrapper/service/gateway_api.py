@@ -4,10 +4,12 @@ import asyncio
 import math
 import mimetypes
 import os
+import queue as thread_queue
 import re
 import tempfile
+import threading
+import time
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
@@ -238,15 +240,42 @@ class GatewayRuntime:
 
 
 class PrewarmQueueCoordinator:
+    """Prewarm accounts on a **dedicated background thread + event loop**.
+
+    This isolates the heavy I/O work (HTTP to poe.com, WebSocket handshake)
+    from the main uvicorn event loop so that user requests are never delayed
+    by ongoing prewarm activity.
+
+    Architecture:
+      main loop (uvicorn)          prewarm loop (background thread)
+      ========================     ===================================
+      enqueue_account() -------->  _enqueue_q (thread-safe Queue)
+                                        |
+                                   _consumer_loop picks up account_id
+                                        |
+                                   _prewarm_account():
+                                     - repo.get_account_by_id()
+                                     - pool._create_client_with_fallback()
+                                     - client.migrate_to_loop(main_loop)
+                                     - pool.store_prewarmed_client()
+                                        |
+      pool._clients[id] = client  <---- done
+    """
+
     def __init__(self, runtime: GatewayRuntime):
         self.runtime = runtime
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        # Thread-safe queue for cross-loop enqueue.
+        self._enqueue_q: thread_queue.Queue[str] = thread_queue.Queue()
         self._queued_ids: set[str] = set()
-        self._queued_ids_lock = asyncio.Lock()
+        self._queued_ids_lock = threading.Lock()
         self._failed_backoff_until: dict[str, float] = {}
-        self._stop_event = asyncio.Event()
-        self._producer_task: Optional[asyncio.Task] = None
-        self._consumer_tasks: list[asyncio.Task] = []
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._prewarm_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_ready = threading.Event()
+
+    # -- helpers ---------------------------------------------------------------
 
     def _target_count(self) -> int:
         return max(1, int(self.runtime.config.prewarm_max_accounts))
@@ -257,13 +286,12 @@ class PrewarmQueueCoordinator:
         return max(scan_interval, min(cooldown, 300))
 
     def _cleanup_failure_backoff(self, now: float) -> None:
-        expired = [account_id for account_id, until in self._failed_backoff_until.items() if until <= now]
-        for account_id in expired:
-            self._failed_backoff_until.pop(account_id, None)
+        expired = [aid for aid, until in self._failed_backoff_until.items() if until <= now]
+        for aid in expired:
+            self._failed_backoff_until.pop(aid, None)
 
     def _mark_failure_backoff(self, account_id: str) -> None:
-        loop = asyncio.get_running_loop()
-        self._failed_backoff_until[account_id] = loop.time() + self._failure_backoff_seconds()
+        self._failed_backoff_until[account_id] = time.monotonic() + self._failure_backoff_seconds()
 
     def _clear_failure_backoff(self, account_id: str) -> None:
         self._failed_backoff_until.pop(account_id, None)
@@ -272,22 +300,27 @@ class PrewarmQueueCoordinator:
         until = self._failed_backoff_until.get(account_id)
         return bool(until and until > now)
 
+    # -- public API (called from main loop) ------------------------------------
+
     async def enqueue_account(self, account_id: str) -> bool:
+        """Enqueue an account for prewarm.  Called from main loop."""
         account_id = str(account_id or "").strip()
         if not account_id:
             return False
-        async with self._queued_ids_lock:
+        with self._queued_ids_lock:
             if account_id in self._queued_ids or self.runtime.pool.has_client(account_id):
                 return False
             if (len(self.runtime.pool.cached_account_ids()) + len(self._queued_ids)) >= self._target_count():
                 return False
             self._queued_ids.add(account_id)
-        await self.queue.put(account_id)
+        self._enqueue_q.put(account_id)
         return True
 
-    async def _dequeue_mark_done(self, account_id: str) -> None:
-        async with self._queued_ids_lock:
+    def _dequeue_mark_done(self, account_id: str) -> None:
+        with self._queued_ids_lock:
             self._queued_ids.discard(account_id)
+
+    # -- prewarm logic (runs on background loop) -------------------------------
 
     async def _prewarm_account(self, account_id: str) -> None:
         if self.runtime.pool.has_client(account_id):
@@ -299,12 +332,17 @@ class PrewarmQueueCoordinator:
         if str(account_doc.get("status", "active")) != "active":
             return
         try:
-            await asyncio.wait_for(
-                self.runtime.pool.get_client(account_doc),
+            creds = await self.runtime.repo.get_account_credentials(account_doc)
+            client = await asyncio.wait_for(
+                self.runtime.pool._create_client_with_fallback(account_id, creds),
                 timeout=max(1, self.runtime.config.prewarm_account_timeout_seconds),
             )
+            # Migrate the client's event-loop binding to the main (uvicorn) loop
+            # so that subsequent send_message / on_message traffic runs there.
+            client.migrate_to_loop(self._main_loop)
+            self.runtime.pool.store_prewarmed_client(account_id, client)
             self._clear_failure_backoff(account_id)
-            logger.info("Prewarmed account {}", mask_secret(account_id))
+            logger.info("Prewarmed account {} (background loop)", mask_secret(account_id))
         except asyncio.TimeoutError:
             logger.warning(
                 "Prewarm timed out for account {} after {}s",
@@ -327,18 +365,15 @@ class PrewarmQueueCoordinator:
         while not self._stop_event.is_set():
             try:
                 cached_count = len(self.runtime.pool.cached_account_ids())
-                async with self._queued_ids_lock:
+                with self._queued_ids_lock:
                     queued_count = len(self._queued_ids)
                 deficit = target_count - cached_count - queued_count
                 if deficit <= 0:
-                    try:
-                        await asyncio.wait_for(self._stop_event.wait(), timeout=scan_interval)
-                    except asyncio.TimeoutError:
-                        pass
+                    await asyncio.sleep(scan_interval)
                     continue
 
                 candidates = await self.runtime.repo.list_candidate_accounts(limit=0)
-                now = asyncio.get_running_loop().time()
+                now = time.monotonic()
                 self._cleanup_failure_backoff(now)
                 enqueue_count = 0
                 for account_doc in candidates:
@@ -349,14 +384,18 @@ class PrewarmQueueCoordinator:
                         continue
                     if self._in_failure_backoff(account_id, now):
                         continue
-                    queued = await self.enqueue_account(account_id)
-                    if queued:
-                        enqueue_count += 1
+                    with self._queued_ids_lock:
+                        if account_id in self._queued_ids:
+                            continue
+                        if (cached_count + len(self._queued_ids)) >= target_count:
+                            break
+                        self._queued_ids.add(account_id)
+                    self._enqueue_q.put(account_id)
+                    enqueue_count += 1
                 if enqueue_count > 0:
                     logger.info(
-                        "Prewarm producer queued {} account(s); queue_size={} target={} cached={} queued={}",
+                        "Prewarm producer queued {} account(s); target={} cached={} queued={}",
                         enqueue_count,
-                        self.queue.qsize(),
                         target_count,
                         cached_count,
                         queued_count + enqueue_count,
@@ -364,56 +403,100 @@ class PrewarmQueueCoordinator:
             except Exception as exc:
                 logger.warning("Prewarm producer loop failed: {}", exc)
 
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=scan_interval)
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(scan_interval)
 
     async def _consumer_loop(self, worker_idx: int) -> None:
+        loop = asyncio.get_running_loop()
         while not self._stop_event.is_set():
+            # Poll the thread-safe queue with a timeout so we can check the
+            # stop event periodically.
             try:
-                account_id = await self.queue.get()
+                account_id = await loop.run_in_executor(
+                    None, lambda: self._enqueue_q.get(timeout=1.0),
+                )
+            except thread_queue.Empty:
+                continue
             except asyncio.CancelledError:
                 break
             try:
                 if (
                     not self.runtime.pool.has_client(account_id)
-                    and len(self.runtime.pool.cached_account_ids()) >= self._target_count()
+                    and len(self.runtime.pool.cached_account_ids()) < self._target_count()
                 ):
-                    continue
-                await self._prewarm_account(account_id)
+                    await self._prewarm_account(account_id)
             except Exception as exc:
                 logger.warning("Prewarm consumer {} unexpected error: {}", worker_idx, exc)
             finally:
-                await self._dequeue_mark_done(account_id)
-                self.queue.task_done()
+                self._dequeue_mark_done(account_id)
 
-    def start(self) -> None:
-        if self._producer_task and not self._producer_task.done():
-            return
-        self._stop_event.clear()
-        self._producer_task = asyncio.create_task(self._producer_loop(), name="prewarm-producer")
+    # -- background thread entry point -----------------------------------------
+
+    def _run_prewarm_loop(self) -> None:
+        """Thread target: create and run a dedicated asyncio event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._prewarm_loop = loop
+        self._loop_ready.set()
+        try:
+            loop.run_until_complete(self._prewarm_main())
+        except Exception:
+            logger.exception("Prewarm background loop crashed")
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+            self._prewarm_loop = None
+
+    async def _prewarm_main(self) -> None:
         worker_count = max(1, int(self.runtime.config.prewarm_concurrency))
-        self._consumer_tasks = [
+        producer = asyncio.create_task(self._producer_loop(), name="prewarm-producer")
+        consumers = [
             asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
             for i in range(worker_count)
         ]
         logger.info(
-            "Started prewarm coordinator with {} consumers; target_prewarmed_accounts={}",
+            "Started prewarm coordinator on dedicated loop with {} consumers; target_prewarmed_accounts={}",
             worker_count,
             self._target_count(),
         )
+        # Block until the coordinator is asked to stop.
+        while not self._stop_event.is_set():
+            await asyncio.sleep(0.5)
+        # Graceful shutdown of all tasks on this loop.
+        producer.cancel()
+        for c in consumers:
+            c.cancel()
+        await asyncio.gather(producer, *consumers, return_exceptions=True)
+
+    # -- lifecycle -------------------------------------------------------------
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._main_loop = asyncio.get_running_loop()
+        self._stop_event.clear()
+        self._loop_ready.clear()
+        self._thread = threading.Thread(
+            target=self._run_prewarm_loop,
+            daemon=True,
+            name="prewarm-loop-thread",
+        )
+        self._thread.start()
+        # Wait for the background loop to be ready (up to 5 s).
+        self._loop_ready.wait(timeout=5.0)
+        logger.info("Prewarm background thread started")
 
     async def stop(self) -> None:
         self._stop_event.set()
-        tasks = [task for task in [self._producer_task, *self._consumer_tasks] if task]
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with suppress(asyncio.CancelledError):
-                await task
-        self._producer_task = None
-        self._consumer_tasks = []
+        thread = self._thread
+        if thread and thread.is_alive():
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: thread.join(timeout=15),
+            )
+        self._thread = None
+        self._prewarm_loop = None
 
 
 with (DIR / "models.json").open("rb") as f:

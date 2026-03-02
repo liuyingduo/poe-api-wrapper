@@ -1070,6 +1070,15 @@ class PoeClientPool:
     def has_client(self, account_id: str) -> bool:
         return account_id in self._clients
 
+    def store_prewarmed_client(self, account_id: str, client: "AsyncPoeApi") -> None:
+        """Store a client that was prewarmed on a separate event loop.
+
+        Thread-safe at the CPython GIL level (simple dict assignment).
+        The caller is responsible for having already called
+        ``client.migrate_to_loop(main_loop)`` before invoking this.
+        """
+        self._clients[account_id] = client
+
     async def get_client_for_account(
         self,
         account_doc: dict[str, Any],

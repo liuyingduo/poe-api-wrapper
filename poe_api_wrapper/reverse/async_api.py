@@ -536,6 +536,25 @@ class AsyncPoeApi:
             self.ws_connected = False
             raise
 
+    def migrate_to_loop(self, target_loop: asyncio.AbstractEventLoop) -> None:
+        """Rebind this client from its current event loop to *target_loop*.
+
+        Used when the client was prewarmed on a background event loop and
+        needs to serve real requests on the main (uvicorn) event loop.
+        After migration, WebSocket on_message callbacks will forward data
+        to the target loop, and heartbeat will run there as well.
+        """
+        if self.loop is target_loop:
+            return
+        # Cancel heartbeat task that lives on the old (prewarm) loop.
+        self._stop_ws_heartbeat()
+        # Switch loop reference – all future run_coroutine_threadsafe calls
+        # (e.g. from on_message / refresh_ws) will target the new loop.
+        self.loop = target_loop
+        # Restart heartbeat on the new loop.
+        if self.ws_connected:
+            self._schedule_start_ws_heartbeat()
+
     def disconnect_ws(self):
         self.ws_connecting = False
         self.ws_connected = False
