@@ -30,6 +30,7 @@ except ImportError:
             return _json.loads(data)
 
     orjson = _OrjsonCompat()
+import aiofiles
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -981,6 +982,12 @@ def _cleanup_temp_files(paths: List[str]) -> None:
             logger.warning("Failed to remove temp file: {}", file_path)
 
 
+def _create_temp_file_path(*, prefix: str, suffix: str) -> str:
+    fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    os.close(fd)
+    return tmp_path
+
+
 def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
     # `auto` means "let provider choose default size/aspect", so we do not force any aspect.
     normalized_size = (size or "").strip().lower()
@@ -1065,10 +1072,10 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
                     )
 
                 suffix = _guess_suffix_from_content_type(content_type) or _guess_suffix_from_url(remote_url) or ".jpg"
-                fd, tmp_path = tempfile.mkstemp(prefix="poe_img_", suffix=suffix)
-                with os.fdopen(fd, "wb") as tmp:
-                    tmp.write(resp.content)
+                tmp_path = _create_temp_file_path(prefix="poe_img_", suffix=suffix)
                 temp_files.append(tmp_path)
+                async with aiofiles.open(tmp_path, "wb") as tmp:
+                    await tmp.write(resp.content)
                 remote_to_local[remote_url] = tmp_path
     except Exception:
         _cleanup_temp_files(temp_files)
@@ -1777,14 +1784,14 @@ async def edit_images(
             if not suffix:
                 ctype = (image.content_type or "").split(";", 1)[0].strip().lower()
                 suffix = _guess_suffix_from_content_type(ctype) or ".jpg"
-            fd, tmp_path = tempfile.mkstemp(prefix="poe_edit_", suffix=suffix)
-            with os.fdopen(fd, "wb") as tmp:
+            tmp_path = _create_temp_file_path(prefix="poe_edit_", suffix=suffix)
+            edit_temp_files.append(tmp_path)
+            async with aiofiles.open(tmp_path, "wb") as tmp:
                 while True:
                     chunk = await image.read(1024 * 1024)
                     if not chunk:
                         break
-                    tmp.write(chunk)
-            edit_temp_files.append(tmp_path)
+                    await tmp.write(chunk)
             edit_attachment = tmp_path
         elif isinstance(image, str) and image.lower().startswith(("http://", "https://")):
             materialized_paths, remote_temp_files = await _materialize_remote_attachments([image])

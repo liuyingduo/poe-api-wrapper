@@ -1,21 +1,11 @@
-import random, string, time
+import random, string, threading, time
 from heapq import nlargest
 from loguru import logger
+from functools import lru_cache
 
 from nltk.data import find as resource_find
 from nltk import download as nltk_download
 
-try:
-    resource_find('corpora/stopwords')
-except LookupError:
-    logger.warning("NLTK stopwords not found. Downloading...")
-    nltk_download('stopwords')
-try:
-    resource_find('tokenizers/punkt')
-except LookupError:
-    logger.warning("NLTK punkt not found. Downloading...")
-    nltk_download('punkt')
-    
 from nltk.corpus import stopwords
 from nltk.probability import FreqDist
 from nltk.stem import PorterStemmer
@@ -23,38 +13,82 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 import tiktoken
 from fastapi import HTTPException
 
-async def __progressive_summarize_text(text, max_length, initial_reduction_ratio=0.8, step=0.1):
-    current_tokens = await __tokenize(text)
+_NLTK_READY = False
+_NLTK_READY_LOCK = threading.Lock()
+
+
+def _ensure_nltk_resources_sync() -> None:
+    global _NLTK_READY
+    if _NLTK_READY:
+        return
+    with _NLTK_READY_LOCK:
+        if _NLTK_READY:
+            return
+        missing: list[str] = []
+        try:
+            resource_find("corpora/stopwords")
+        except LookupError:
+            missing.append("stopwords")
+        try:
+            resource_find("tokenizers/punkt")
+        except LookupError:
+            missing.append("punkt")
+        for package in missing:
+            logger.warning("NLTK {} not found. Downloading...", package)
+            nltk_download(package, quiet=True)
+        _NLTK_READY = True
+
+
+@lru_cache(maxsize=1)
+def _token_encoder():
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def _tokenize_sync(text: str) -> int:
+    encoder = _token_encoder()
+    return len(encoder.encode(text))
+
+
+def _progressive_summarize_text_sync(
+    text: str,
+    max_length: int,
+    initial_reduction_ratio: float = 0.8,
+    step: float = 0.1,
+) -> str:
+    _ensure_nltk_resources_sync()
+    current_tokens = _tokenize_sync(text)
     if current_tokens < max_length:
         return text
-    
+
     stop_words = set(stopwords.words("english"))
     ps = PorterStemmer()
     sentences = sent_tokenize(text)
 
-    # Remove stopwords and apply stemming
     words = [ps.stem(word) for word in word_tokenize(text.lower()) if word not in stop_words]
-    
-    # Calculate word frequencies
     word_freqs = FreqDist(words)
+    sentence_scores = {
+        idx: sum(word_freqs.get(word, 0) for word in word_tokenize(sentence.lower()))
+        for idx, sentence in enumerate(sentences)
+    }
 
-    # Score sentences based on word frequency
-    sentence_scores = {idx: sum(word_freqs.get(word, 0) for word in word_tokenize(sentence.lower())) for idx, sentence in enumerate(sentences)}
-    
     reduction_ratio = initial_reduction_ratio
-
-    # Extract top N sentences based on their scores
     while True:
         num_sentences = max(1, round(len(sentences) * reduction_ratio))
         selected_indexes = nlargest(num_sentences, sentence_scores, key=sentence_scores.get)
-        summary = '\n'.join(sentences[idx] for idx in sorted(selected_indexes))
-
+        summary = "\n".join(sentences[idx] for idx in sorted(selected_indexes))
         if 0 < len(summary.strip()) <= max_length or reduction_ratio - step < 0:
             break
-        else:
-            reduction_ratio -= step
+        reduction_ratio -= step
 
     return summary
+
+async def __progressive_summarize_text(text, max_length, initial_reduction_ratio=0.8, step=0.1):
+    return _progressive_summarize_text_sync(
+        text,
+        max_length,
+        initial_reduction_ratio,
+        step,
+    )
 
 async def __validate_messages_format(messages):
     if not messages:
@@ -98,8 +132,7 @@ async def __generate_timestamp():
     return int(time.time())
 
 async def __tokenize(text):
-    enconder = tiktoken.get_encoding("cl100k_base")
-    return len(enconder.encode(text))
+    return _tokenize_sync(text)
 
 async def __stringify_messages(messages):
     return '\n'.join(f"<{message['role'].capitalize()}>{message['content']}</{message['role'].capitalize()}>" for message in messages)

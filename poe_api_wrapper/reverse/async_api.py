@@ -132,8 +132,23 @@ class AsyncPoeApi:
         return self
         
     def __del__(self):
-        if self.client:
-            asyncio.get_event_loop().run_until_complete(self.client.aclose())
+        client = getattr(self, "client", None)
+        if not client:
+            return
+        self.client = None
+        try:
+            loop = getattr(self, "loop", None)
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(asyncio.create_task, client.aclose())
+                return
+        except Exception:
+            pass
+        try:
+            running_loop = asyncio.get_running_loop()
+            if running_loop.is_running():
+                running_loop.create_task(client.aclose())
+        except Exception:
+            pass
 
     def _log_load_bundle_failure(
         self,
@@ -1075,7 +1090,7 @@ class AsyncPoeApi:
             file_form = []
         else:
             apiPath = 'gql_POST'
-            file_form, file_size = generate_file(file_path, self.proxies)
+            file_form, file_size = await asyncio.to_thread(generate_file, file_path, self.proxies)
             if file_size > 350000000:
                 raise RuntimeError("File size too large. Please try again with a smaller file.")
             for i in range(len(file_form)):
@@ -1535,7 +1550,7 @@ class AsyncPoeApi:
                     await asyncio.sleep(2)        
         if file_path != []:
             for path in file_path:
-                file_form, file_size = generate_file([path], self.proxies)
+                file_form, file_size = await asyncio.to_thread(generate_file, [path], self.proxies)
                 if file_size > 350000000:
                     raise RuntimeError("File size too large. Please try again with a smaller file.")
                 response = await self.send_request('gql_upload_POST', 'Knowledge_CreateKnowledgeSourceMutation', {"sourceInput":{"file_upload":{"attachment":"file"}}}, file_form, knowledge=True)
