@@ -79,6 +79,9 @@ class AsyncPoeApi:
         self.retry_attempts: int = 3
         self.ws_refresh: int = 3
         self.ws_heartbeat_interval: int = 25
+        self.max_ws_reconnects: int = 5
+        self._ws_reconnect_count: int = 0
+        self._on_reconnect_exhausted: Optional[callable] = None
         self.groups: dict = {}
         self.proxies: str = ""
         self.bundle: Optional[AsyncPoeBundle] = None
@@ -566,6 +569,7 @@ class AsyncPoeApi:
     def on_ws_connect(self, ws):
         self.ws_connecting = False
         self.ws_connected = True
+        self._ws_reconnect_count = 0
         self._schedule_start_ws_heartbeat()
 
     def on_ws_close(self, ws, close_status_code, close_message):
@@ -573,7 +577,27 @@ class AsyncPoeApi:
         self.ws_connected = False
         self._schedule_stop_ws_heartbeat()
         if self.ws_error:
-            logger.warning("Connection to remote host was lost. Reconnecting...")
+            self._ws_reconnect_count += 1
+            if self._ws_reconnect_count > self.max_ws_reconnects:
+                logger.error(
+                    "WebSocket reconnect limit reached ({}/{}). Giving up.",
+                    self._ws_reconnect_count - 1,
+                    self.max_ws_reconnects,
+                )
+                self.ws_error = False
+                self.disconnect_ws()
+                cb = self._on_reconnect_exhausted
+                if cb:
+                    try:
+                        cb(self)
+                    except Exception:
+                        logger.exception("on_reconnect_exhausted callback failed")
+                return
+            logger.warning(
+                "Connection to remote host was lost. Reconnecting... ({}/{})",
+                self._ws_reconnect_count,
+                self.max_ws_reconnects,
+            )
             self.ws_error = False
             self.refresh_ws()
 

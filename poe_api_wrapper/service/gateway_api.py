@@ -342,7 +342,44 @@ class PrewarmQueueCoordinator:
             client.migrate_to_loop(self._main_loop)
             self.runtime.pool.store_prewarmed_client(account_id, client)
             self._clear_failure_backoff(account_id)
-            logger.info("Prewarmed account {} (background loop)", mask_secret(account_id))
+
+            # -- Refresh account points right after successful connection ------
+            try:
+                settings = await client.get_settings()
+                message_info = settings.get("messagePointInfo", {})
+                subscription = settings.get("subscription", {})
+                balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+                    message_info.get("addonPointBalance", 0) or 0
+                )
+                subscription_active = bool(subscription.get("isActive", False))
+                await self.runtime.repo.update_account_health(
+                    account_id,
+                    balance=balance,
+                    subscription_active=subscription_active,
+                    depleted_threshold=self.runtime.config.depleted_threshold,
+                )
+                await self.runtime.repo.mark_account_success(account_id)
+                logger.info(
+                    "Prewarmed account {} (background loop) | balance={}",
+                    mask_secret(account_id),
+                    balance,
+                )
+                # If account is depleted after refresh, evict immediately
+                if balance <= self.runtime.config.depleted_threshold:
+                    logger.warning(
+                        "Prewarmed account {} has insufficient balance ({}), evicting",
+                        mask_secret(account_id),
+                        balance,
+                    )
+                    await self.runtime.pool.invalidate_client(account_id)
+            except Exception as points_exc:
+                logger.warning(
+                    "Prewarmed account {} connected but failed to refresh points: {}",
+                    mask_secret(account_id),
+                    points_exc,
+                )
+                # Still keep the client in the pool; points refresh is best-effort
+
         except asyncio.TimeoutError:
             logger.warning(
                 "Prewarm timed out for account {} after {}s",
@@ -682,10 +719,22 @@ async def startup_event() -> None:
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
     refresher.start()
     app.state.prewarm_coordinator = None
+    # Let the pool know about the main loop so reconnect-exhaustion callbacks
+    # can schedule cleanup coroutines on it.
+    pool._main_loop = asyncio.get_running_loop()
     if config.prewarm_on_startup:
         prewarm_coordinator = PrewarmQueueCoordinator(runtime)
         prewarm_coordinator.start()
         app.state.prewarm_coordinator = prewarm_coordinator
+
+        # When a client is evicted after reconnect exhaustion,
+        # re-enqueue it for prewarm automatically.
+        async def _on_pool_evict(account_id: str) -> None:
+            coord = getattr(app.state, "prewarm_coordinator", None)
+            if coord:
+                await coord.enqueue_account(account_id)
+
+        pool._on_evict_callback = _on_pool_evict
     else:
         logger.info("Startup prewarm disabled (PREWARM_ON_STARTUP=false)")
     logger.info("Gateway startup complete")

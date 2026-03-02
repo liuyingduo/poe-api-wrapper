@@ -1007,6 +1007,10 @@ class PoeClientPool:
         self._clients: dict[str, "AsyncPoeApi"] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        # External callback: called when a client is evicted after reconnect
+        # exhaustion.  Signature: async (account_id: str) -> None
+        self._on_evict_callback: Optional[Any] = None
 
     async def _get_lock(self, account_id: str) -> asyncio.Lock:
         async with self._global_lock:
@@ -1077,6 +1081,7 @@ class PoeClientPool:
         The caller is responsible for having already called
         ``client.migrate_to_loop(main_loop)`` before invoking this.
         """
+        self._register_reconnect_callback(account_id, client)
         self._clients[account_id] = client
 
     async def get_client_for_account(
@@ -1101,8 +1106,54 @@ class PoeClientPool:
                 raise RuntimeError(f"Client is not prewarmed for account {account_id}")
             creds = await self.repo.get_account_credentials(account_doc)
             client = await self._create_client_with_fallback(account_id, creds)
+            self._register_reconnect_callback(account_id, client)
             self._clients[account_id] = client
             return client
+
+    def _register_reconnect_callback(self, account_id: str, client: "AsyncPoeApi") -> None:
+        """Attach a reconnect-exhaustion callback to a client.
+
+        When the WS reconnects fail ``max_ws_reconnects`` times in a row,
+        the callback fires (from the WS thread) and schedules async cleanup
+        on the main event loop.
+        """
+        pool = self
+
+        def _on_exhausted(cli: "AsyncPoeApi") -> None:
+            loop = pool._main_loop or getattr(cli, "loop", None)
+            if not loop or not loop.is_running():
+                logger.warning(
+                    "Reconnect exhausted for account {} but no running loop to schedule cleanup",
+                    mask_secret(account_id),
+                )
+                return
+            asyncio.run_coroutine_threadsafe(
+                pool._handle_reconnect_exhausted(account_id),
+                loop,
+            )
+
+        client._on_reconnect_exhausted = _on_exhausted
+
+    async def _handle_reconnect_exhausted(self, account_id: str) -> None:
+        """Evict client, record error, optionally re-enqueue for prewarm."""
+        logger.warning(
+            "Account {} evicted from pool after reconnect exhaustion",
+            mask_secret(account_id),
+        )
+        await self.invalidate_client(account_id)
+        await self.repo.record_account_error(
+            account_id,
+            "ws_reconnect_exhausted: WebSocket connection lost after max retries",
+            cooldown_seconds=120,
+            error_threshold=2,
+        )
+        # Notify external listener (e.g. prewarm coordinator) to re-queue.
+        cb = self._on_evict_callback
+        if cb:
+            try:
+                await cb(account_id)
+            except Exception:
+                logger.exception("on_evict_callback failed for {}", mask_secret(account_id))
 
     async def invalidate_client(self, account_id: str) -> None:
         client = self._clients.pop(account_id, None)
