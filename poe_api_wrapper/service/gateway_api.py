@@ -213,7 +213,7 @@ class GatewayConfig:
             recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
             prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
-            prewarm_max_accounts=_env_int("PREWARM_MAX_ACCOUNTS", 300),
+            prewarm_max_accounts=_env_int("PREWARM_MAX_ACCOUNTS", 3000),
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
             prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
@@ -242,16 +242,43 @@ class PrewarmQueueCoordinator:
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued_ids: set[str] = set()
         self._queued_ids_lock = asyncio.Lock()
+        self._failed_backoff_until: dict[str, float] = {}
         self._stop_event = asyncio.Event()
         self._producer_task: Optional[asyncio.Task] = None
         self._consumer_tasks: list[asyncio.Task] = []
+
+    def _target_count(self) -> int:
+        return max(1, int(self.runtime.config.prewarm_max_accounts))
+
+    def _failure_backoff_seconds(self) -> int:
+        scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
+        cooldown = max(1, int(self.runtime.config.cooldown_seconds))
+        return max(scan_interval, min(cooldown, 300))
+
+    def _cleanup_failure_backoff(self, now: float) -> None:
+        expired = [account_id for account_id, until in self._failed_backoff_until.items() if until <= now]
+        for account_id in expired:
+            self._failed_backoff_until.pop(account_id, None)
+
+    def _mark_failure_backoff(self, account_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        self._failed_backoff_until[account_id] = loop.time() + self._failure_backoff_seconds()
+
+    def _clear_failure_backoff(self, account_id: str) -> None:
+        self._failed_backoff_until.pop(account_id, None)
+
+    def _in_failure_backoff(self, account_id: str, now: float) -> bool:
+        until = self._failed_backoff_until.get(account_id)
+        return bool(until and until > now)
 
     async def enqueue_account(self, account_id: str) -> bool:
         account_id = str(account_id or "").strip()
         if not account_id:
             return False
         async with self._queued_ids_lock:
-            if account_id in self._queued_ids:
+            if account_id in self._queued_ids or self.runtime.pool.has_client(account_id):
+                return False
+            if (len(self.runtime.pool.cached_account_ids()) + len(self._queued_ids)) >= self._target_count():
                 return False
             self._queued_ids.add(account_id)
         await self.queue.put(account_id)
@@ -263,6 +290,7 @@ class PrewarmQueueCoordinator:
 
     async def _prewarm_account(self, account_id: str) -> None:
         if self.runtime.pool.has_client(account_id):
+            self._clear_failure_backoff(account_id)
             return
         account_doc = await self.runtime.repo.get_account_by_id(account_id)
         if not account_doc:
@@ -274,6 +302,7 @@ class PrewarmQueueCoordinator:
                 self.runtime.pool.get_client(account_doc),
                 timeout=max(1, self.runtime.config.prewarm_account_timeout_seconds),
             )
+            self._clear_failure_backoff(account_id)
             logger.info("Prewarmed account {}", mask_secret(account_id))
         except asyncio.TimeoutError:
             logger.warning(
@@ -281,8 +310,10 @@ class PrewarmQueueCoordinator:
                 mask_secret(account_id),
                 self.runtime.config.prewarm_account_timeout_seconds,
             )
+            self._mark_failure_backoff(account_id)
         except Exception as exc:
             logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
+            self._mark_failure_backoff(account_id)
             await self.runtime.repo.record_account_error(
                 account_id,
                 f"prewarm_error: {exc}",
@@ -291,22 +322,43 @@ class PrewarmQueueCoordinator:
 
     async def _producer_loop(self) -> None:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
+        target_count = self._target_count()
         while not self._stop_event.is_set():
             try:
+                cached_count = len(self.runtime.pool.cached_account_ids())
+                async with self._queued_ids_lock:
+                    queued_count = len(self._queued_ids)
+                deficit = target_count - cached_count - queued_count
+                if deficit <= 0:
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=scan_interval)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
                 candidates = await self.runtime.repo.list_candidate_accounts(limit=0)
+                now = asyncio.get_running_loop().time()
+                self._cleanup_failure_backoff(now)
                 enqueue_count = 0
                 for account_doc in candidates:
+                    if enqueue_count >= deficit:
+                        break
                     account_id = str(account_doc["_id"])
                     if self.runtime.pool.has_client(account_id):
+                        continue
+                    if self._in_failure_backoff(account_id, now):
                         continue
                     queued = await self.enqueue_account(account_id)
                     if queued:
                         enqueue_count += 1
                 if enqueue_count > 0:
                     logger.info(
-                        "Prewarm producer queued {} account(s); queue_size={}",
+                        "Prewarm producer queued {} account(s); queue_size={} target={} cached={} queued={}",
                         enqueue_count,
                         self.queue.qsize(),
+                        target_count,
+                        cached_count,
+                        queued_count + enqueue_count,
                     )
             except Exception as exc:
                 logger.warning("Prewarm producer loop failed: {}", exc)
@@ -323,6 +375,11 @@ class PrewarmQueueCoordinator:
             except asyncio.CancelledError:
                 break
             try:
+                if (
+                    not self.runtime.pool.has_client(account_id)
+                    and len(self.runtime.pool.cached_account_ids()) >= self._target_count()
+                ):
+                    continue
                 await self._prewarm_account(account_id)
             except Exception as exc:
                 logger.warning("Prewarm consumer {} unexpected error: {}", worker_idx, exc)
@@ -340,7 +397,11 @@ class PrewarmQueueCoordinator:
             asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
             for i in range(worker_count)
         ]
-        logger.info("Started prewarm coordinator with {} consumers", worker_count)
+        logger.info(
+            "Started prewarm coordinator with {} consumers; target_prewarmed_accounts={}",
+            worker_count,
+            self._target_count(),
+        )
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -735,6 +796,8 @@ async def admin_refresh_account_points(request: Request) -> JSONResponse:
             depleted_threshold=runtime.config.depleted_threshold,
         )
         await runtime.repo.mark_account_success(account_id)
+        if balance <= runtime.config.depleted_threshold:
+            await runtime.pool.invalidate_client(account_id)
         return JSONResponse(
             {
                 "email": email,
