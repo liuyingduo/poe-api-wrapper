@@ -187,8 +187,10 @@ class GatewayConfig:
     recent_active_minutes: int
     cooldown_seconds: int
     prewarm_concurrency: int
+    prewarm_max_accounts: int
     prewarm_on_startup: bool
     prewarm_account_timeout_seconds: int
+    acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
     daily_reset_hour: int
@@ -210,8 +212,10 @@ class GatewayConfig:
             recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
             prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
+            prewarm_max_accounts=_env_int("PREWARM_MAX_ACCOUNTS", 300),
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
+            acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
@@ -307,7 +311,7 @@ async def _account_error_payload(
 
 async def _prewarm_pool(runtime: GatewayRuntime) -> None:
     try:
-        primary_pool = await runtime.selector.get_primary_pool()
+        primary_pool = await runtime.selector.get_primary_pool(max_accounts=runtime.config.prewarm_max_accounts)
     except NoAccountAvailableError:
         logger.info("Prewarm skipped: no active accounts yet. Service will wait for admin account upsert.")
         return
@@ -343,6 +347,17 @@ async def _prewarm_pool(runtime: GatewayRuntime) -> None:
     await asyncio.gather(*(_prewarm_one(account) for account in primary_pool), return_exceptions=True)
 
 
+async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
+    wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
+    while True:
+        try:
+            return await runtime.selector.select_account(prewarmed_only=True)
+        except NoAccountAvailableError:
+            raise
+        except CapacityLimitError:
+            await asyncio.sleep(wait_sec)
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     config = GatewayConfig.from_env()
@@ -364,10 +379,15 @@ async def startup_event() -> None:
         max_inflight_per_account=config.max_inflight_per_account,
         global_inflight_limit=config.global_inflight_limit,
     )
-    selector = AccountSelector(repo=repo, limiter=limiter, top_n=100)
     pool = PoeClientPool(
         repo=repo,
         default_poe_revision=config.default_poe_revision,
+    )
+    selector = AccountSelector(
+        repo=repo,
+        limiter=limiter,
+        pool=pool,
+        top_n=max(1, int(config.prewarm_max_accounts)),
     )
     refresher = AccountHealthRefresher(
         repo=repo,
@@ -1224,18 +1244,19 @@ async def _acquire_account_for_chat(
                     "Bound account is unavailable. Create a new session_id and retry.",
                     {"session_id": session_id},
                 )
-            if not await runtime.limiter.try_acquire(account_id):
-                _openai_http_error(429, "rate_limit_error", "Session account is busy, retry later")
+            wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
+            while not runtime.pool.has_client(account_id):
+                await asyncio.sleep(wait_sec)
+            while not await runtime.limiter.try_acquire(account_id):
+                await asyncio.sleep(wait_sec)
             lease = AccountLease(account_id=account_id, limiter=runtime.limiter)
             await runtime.repo.touch_session(session_id)
             return account_doc, lease, session.get("chat_code"), session.get("chat_id")
 
     try:
-        account_doc, lease = await runtime.selector.select_account()
+        account_doc, lease = await _acquire_prewarmed_account(runtime)
     except NoAccountAvailableError:
         _openai_http_error(402, "insufficient_credits", "No active accounts available")
-    except CapacityLimitError:
-        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
 
     account_id = str(account_doc["_id"])
     if persistent_session:
@@ -1315,7 +1336,7 @@ async def _chat_completions_impl(
         account_doc = refreshed
 
     try:
-        client = await runtime.pool.get_client(account_doc)
+        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
     except Exception as exc:
         payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
         await lease.release()
@@ -1435,11 +1456,9 @@ async def create_images(
     premium_model = bool(model_data.get("premium_model", False))
 
     try:
-        account_doc, lease = await runtime.selector.select_account()
+        account_doc, lease = await _acquire_prewarmed_account(runtime)
     except NoAccountAvailableError:
         _openai_http_error(402, "insufficient_credits", "No active accounts available")
-    except CapacityLimitError:
-        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
@@ -1448,7 +1467,7 @@ async def create_images(
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
     try:
-        client = await runtime.pool.get_client(account_doc)
+        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
         response = await image_handler(base_model, prompt, tokens_limit)
 
         urls: list[str] = []
@@ -1546,11 +1565,9 @@ async def edit_images(
     premium_model = bool(model_data.get("premium_model", False))
 
     try:
-        account_doc, lease = await runtime.selector.select_account()
+        account_doc, lease = await _acquire_prewarmed_account(runtime)
     except NoAccountAvailableError:
         _openai_http_error(402, "insufficient_credits", "No active accounts available")
-    except CapacityLimitError:
-        _openai_http_error(429, "rate_limit_error", "All accounts are busy. Retry later")
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
@@ -1586,7 +1603,7 @@ async def edit_images(
                 _openai_http_error(400, "invalid_request_error", "Invalid image input")
             edit_attachment = image
 
-        client = await runtime.pool.get_client(account_doc)
+        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
         response = await image_handler(base_model, prompt, tokens_limit)
 
         urls: list[str] = []

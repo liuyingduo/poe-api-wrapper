@@ -918,21 +918,35 @@ class AccountSelector:
         self,
         repo: AccountRepository,
         limiter: RuntimeLimiter,
+        pool: Optional["PoeClientPool"] = None,
         *,
-        top_n: int = 100,
+        top_n: int = 300,
         inflight_penalty: float = 50.0,
         recent_error_penalty: float = 20.0,
     ):
         self.repo = repo
         self.limiter = limiter
+        self.pool = pool
         self.top_n = top_n
         self.inflight_penalty = inflight_penalty
         self.recent_error_penalty = recent_error_penalty
 
-    async def _top_and_primary_pool(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    def _filter_prewarmed_accounts(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self.pool:
+            return candidates
+        cached_ids = self.pool.cached_account_ids()
+        if not cached_ids:
+            return []
+        return [account for account in candidates if str(account["_id"]) in cached_ids]
+
+    async def _top_and_primary_pool(self, *, prewarmed_only: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
         candidates = await self.repo.list_candidate_accounts(limit=5000)
         if not candidates:
             raise NoAccountAvailableError("No active accounts are available")
+        if prewarmed_only:
+            candidates = self._filter_prewarmed_accounts(candidates)
+            if not candidates:
+                raise CapacityLimitError("No prewarmed accounts are currently available")
         top_limit = min(self.top_n, len(candidates))
         top_accounts = candidates[:top_limit]
         balances = [int(a.get("message_point_balance", 0) or 0) for a in top_accounts]
@@ -942,8 +956,10 @@ class AccountSelector:
             primary = top_accounts
         return top_accounts, primary, median_balance
 
-    async def get_primary_pool(self) -> list[dict[str, Any]]:
-        _, primary, _ = await self._top_and_primary_pool()
+    async def get_primary_pool(self, *, max_accounts: Optional[int] = None) -> list[dict[str, Any]]:
+        _, primary, _ = await self._top_and_primary_pool(prewarmed_only=False)
+        if max_accounts is not None:
+            return primary[: max(0, int(max_accounts))]
         return primary
 
     async def _score_account(self, account: dict[str, Any]) -> float:
@@ -967,8 +983,8 @@ class AccountSelector:
                 return account, AccountLease(account_id=account_id, limiter=self.limiter)
         return None
 
-    async def select_account(self) -> tuple[dict[str, Any], AccountLease]:
-        top_accounts, primary, _ = await self._top_and_primary_pool()
+    async def select_account(self, *, prewarmed_only: bool = False) -> tuple[dict[str, Any], AccountLease]:
+        top_accounts, primary, _ = await self._top_and_primary_pool(prewarmed_only=prewarmed_only)
 
         selected = await self._select_from_pool(primary)
         if selected:
@@ -1047,16 +1063,34 @@ class PoeClientPool:
             return client
 
     async def get_client(self, account_doc: dict[str, Any]) -> "AsyncPoeApi":
+        return await self.get_client_for_account(account_doc, create_if_missing=True)
+
+    def cached_account_ids(self) -> set[str]:
+        return set(self._clients.keys())
+
+    def has_client(self, account_id: str) -> bool:
+        return account_id in self._clients
+
+    async def get_client_for_account(
+        self,
+        account_doc: dict[str, Any],
+        *,
+        create_if_missing: bool,
+    ) -> "AsyncPoeApi":
         account_id = str(account_doc["_id"])
         existing = self._clients.get(account_id)
         if existing:
             return existing
+        if not create_if_missing:
+            raise RuntimeError(f"Client is not prewarmed for account {account_id}")
 
         lock = await self._get_lock(account_id)
         async with lock:
             existing = self._clients.get(account_id)
             if existing:
                 return existing
+            if not create_if_missing:
+                raise RuntimeError(f"Client is not prewarmed for account {account_id}")
             creds = await self.repo.get_account_credentials(account_doc)
             client = await self._create_client_with_fallback(account_id, creds)
             self._clients[account_id] = client
