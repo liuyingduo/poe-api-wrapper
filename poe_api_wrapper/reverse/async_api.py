@@ -551,6 +551,18 @@ class AsyncPoeApi:
             return
         # Cancel heartbeat task that lives on the old (prewarm) loop.
         self._stop_ws_heartbeat()
+        # Rebuild httpx.AsyncClient so its internal connection-pool asyncio
+        # primitives (Semaphore/Event) are NOT bound to the prewarm loop.
+        # The old client is closed on the old loop best-effort.
+        old_client = self.client
+        self.client = self._build_http_client()
+        # Restore the Poe-Tchannel header that was set after the initial build.
+        if self.tchannel_data:
+            self.client.headers["Poe-Tchannel"] = self.tchannel_data["channel"]
+        # Schedule close of old client on the old loop (non-blocking best-effort).
+        old_loop = self.loop
+        if old_client is not None and old_loop and old_loop.is_running():
+            asyncio.run_coroutine_threadsafe(old_client.aclose(), old_loop)
         # Switch loop reference – all future run_coroutine_threadsafe calls
         # (e.g. from on_message / refresh_ws) will target the new loop.
         self.loop = target_loop
