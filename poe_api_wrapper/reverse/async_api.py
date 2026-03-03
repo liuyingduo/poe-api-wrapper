@@ -1037,10 +1037,19 @@ class AsyncPoeApi:
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
+        _queue_timeout = 120
+        _queue_idle = 0
         
         while True:
             try:
-                ws_data = await self.message_queues[chatId].get()
+                try:
+                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_queue_timeout)
+                    _queue_idle = 0
+                except asyncio.TimeoutError:
+                    _queue_idle += _queue_timeout
+                    if _queue_idle >= 300:
+                        raise RuntimeError(f"Timed out waiting for response from bot (chatId={chatId}). WebSocket may have disconnected.")
+                    continue
             except KeyError:
                 await asyncio.sleep(1)
                 continue
@@ -1278,10 +1287,19 @@ class AsyncPoeApi:
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
+        _queue_timeout = 120
+        _queue_idle = 0
         
         while True:
             try:
-                ws_data = await self.message_queues[chatId].get()
+                try:
+                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_queue_timeout)
+                    _queue_idle = 0
+                except asyncio.TimeoutError:
+                    _queue_idle += _queue_timeout
+                    if _queue_idle >= 300:
+                        raise RuntimeError(f"Timed out waiting for response from bot (chatId={chatId}). WebSocket may have disconnected.")
+                    continue
             except KeyError:
                 await asyncio.sleep(1)
                 continue
