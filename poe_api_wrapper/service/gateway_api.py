@@ -331,19 +331,17 @@ class PrewarmQueueCoordinator:
             return
         if str(account_doc.get("status", "active")) != "active":
             return
+        client = None
+        stored_in_pool = False
         try:
             creds = await self.runtime.repo.get_account_credentials(account_doc)
             client = await asyncio.wait_for(
                 self.runtime.pool._create_client_with_fallback(account_id, creds),
                 timeout=max(1, self.runtime.config.prewarm_account_timeout_seconds),
             )
-            # Migrate the client's event-loop binding to the main (uvicorn) loop
-            # so that subsequent send_message / on_message traffic runs there.
-            client.migrate_to_loop(self._main_loop)
-            self.runtime.pool.store_prewarmed_client(account_id, client)
-            self._clear_failure_backoff(account_id)
 
             # -- Refresh account points right after successful connection ------
+            balance = None
             try:
                 settings = await client.get_settings()
                 message_info = settings.get("messagePointInfo", {})
@@ -380,6 +378,24 @@ class PrewarmQueueCoordinator:
                 )
                 # Still keep the client in the pool; points refresh is best-effort
 
+            if balance is not None and balance <= self.runtime.config.depleted_threshold:
+                logger.warning(
+                    "Prewarmed account {} has insufficient balance ({}), skipping cache",
+                    mask_secret(account_id),
+                    balance,
+                )
+                await self.runtime.pool._close_client(client)
+                client = None
+                self._clear_failure_backoff(account_id)
+                return
+
+            # Important: migrate only after all prewarm-loop async operations are done.
+            # This prevents rebinding the rebuilt httpx client back to the prewarm loop.
+            client.migrate_to_loop(self._main_loop)
+            self.runtime.pool.store_prewarmed_client(account_id, client)
+            stored_in_pool = True
+            self._clear_failure_backoff(account_id)
+
         except asyncio.TimeoutError:
             logger.warning(
                 "Prewarm timed out for account {} after {}s",
@@ -395,6 +411,12 @@ class PrewarmQueueCoordinator:
                 f"prewarm_error: {exc}",
                 cooldown_seconds=self.runtime.config.cooldown_seconds,
             )
+        finally:
+            if client is not None and not stored_in_pool:
+                try:
+                    await self.runtime.pool._close_client(client)
+                except Exception:
+                    pass
 
     async def _producer_loop(self) -> None:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
