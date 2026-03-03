@@ -694,7 +694,7 @@ class AsyncPoeApi:
                 
                 subscriptionName = payload.get("subscription_name")
                 
-                if subscriptionName not in ("messageAdded", "messageCancelled", "chatTitleUpdated"):
+                if subscriptionName not in ("messageAdded", "messageCancelled", "chatTitleUpdated", "jobUpdated"):
                     continue
 
                 data = (payload.get("data", {}))
@@ -1098,7 +1098,40 @@ class AsyncPoeApi:
             
             if ws_data["subscription"] == "messageCancelled":
                 break
-            
+
+            if ws_data["subscription"] == "jobUpdated":
+                job_state = str(
+                    (ws_data.get("data") or {}).get("jobUpdated", {}).get("state", "")
+                ).lower()
+                if job_state in ("completed", "complete", "done"):
+                    recovered = await self._fetch_latest_bot_message(chatCode, chatId)
+                    if recovered and recovered.get("state") == "complete":
+                        logger.warning(
+                            "Recovered completed message via jobUpdated signal "
+                            "(regenerate, chatId={})",
+                            chatId,
+                        )
+                        response = recovered
+                        response["chatCode"] = chatCode
+                        response["chatId"] = chatId
+                        response["title"] = recovered.get("title", title)
+                        response["response"] = ""
+                        response["suggestedReplies"] = suggestedReplies
+
+                        if (response.get("author") == "pacarana" and response.get("text", "").strip() == last_text.strip()):
+                            response["response"] = ""
+                        elif response.get("author") == "pacarana" and (last_text == "" or bot != "web-search"):
+                            response["response"] = f"{response.get('text', '')}\n"
+                        else:
+                            if stateChange == False:
+                                response["response"] = response.get("text", "")
+                                stateChange = True
+                            else:
+                                response["response"] = response.get("text", "")[len(last_text):]
+                        yield response
+                        break
+                continue
+             
             if ws_data["subscription"] == "chatTitleUpdated":
                 title = ws_data["data"]["chatTitleUpdated"]["title"]
 
@@ -1378,7 +1411,41 @@ class AsyncPoeApi:
             
             if ws_data["subscription"] == "messageCancelled":
                 break
-            
+
+            if ws_data["subscription"] == "jobUpdated":
+                job_state = str(
+                    (ws_data.get("data") or {}).get("jobUpdated", {}).get("state", "")
+                ).lower()
+                if job_state in ("completed", "complete", "done"):
+                    recovered = await self._fetch_latest_bot_message(chatCode, chatId)
+                    if recovered and recovered.get("state") == "complete":
+                        logger.warning(
+                            "Recovered completed message via jobUpdated signal "
+                            "(send_message, chatId={})",
+                            chatId,
+                        )
+                        response = recovered
+                        response["chatCode"] = chatCode
+                        response["chatId"] = chatId
+                        response["title"] = recovered.get("title", title)
+                        response["msgPrice"] = msgPrice
+                        response["response"] = ""
+                        response["suggestedReplies"] = suggestedReplies
+
+                        if (response.get("author") == "pacarana" and response.get("text", "").strip() == last_text.strip()):
+                            response["response"] = ""
+                        elif response.get("author") == "pacarana" and (last_text == "" or bot != "web-search"):
+                            response["response"] = f"{response.get('text', '')}\n"
+                        else:
+                            if stateChange == False:
+                                response["response"] = response.get("text", "")
+                                stateChange = True
+                            else:
+                                response["response"] = response.get("text", "")[len(last_text):]
+                        yield response
+                        break
+                continue
+             
             if ws_data["subscription"] == "chatTitleUpdated":
                 title = ws_data["data"]["chatTitleUpdated"]["title"]
 
