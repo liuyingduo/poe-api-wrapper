@@ -1234,6 +1234,19 @@ async def generate_image(client, response: dict, aspect_ratio: str, image: list 
             file_path=image,
         ):
             pass
+        # 优先从 attachments 中提取图片 URL（如 Qwen-Image 等把图片作为附件返回的模型）
+        attachments = chunk.get("attachments") or []
+        attachment_urls = []
+        for att in attachments:
+            # 优先取 file.url（不带 pmaid 参数的干净 URL），其次取顶层 url
+            file_info = att.get("file") or {}
+            url = file_info.get("url") or att.get("url") or ""
+            mime = file_info.get("mimeType") or ""
+            if url and (mime.startswith("image/") or not mime):
+                attachment_urls.append(url)
+        if attachment_urls:
+            return " ".join(attachment_urls)
+        # fallback：从文本中解析 URL（适用于把 URL 直接写在文本里的模型）
         return chunk["text"]
     except Exception as exc:
         _openai_http_error(500, "provider_error", f"Failed to generate image: {exc}")
