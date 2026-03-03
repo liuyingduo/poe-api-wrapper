@@ -1815,7 +1815,7 @@ async def create_images(
 
         async with AsyncClient(http2=True, timeout=None) as fetcher:
             for url in urls:
-                resp = await fetcher.get(url)
+                resp = await fetcher.head(url)
                 content_type = resp.headers.get("Content-Type", "")
                 if not content_type.startswith("image/"):
                     _openai_http_error(500, "provider_error", "The content returned was not an image")
@@ -1951,7 +1951,7 @@ async def edit_images(
 
         async with AsyncClient(http2=True, timeout=None) as fetcher:
             for url in urls:
-                resp = await fetcher.get(url)
+                resp = await fetcher.head(url)
                 content_type = resp.headers.get("Content-Type", "")
                 if not content_type.startswith("image/"):
                     _openai_http_error(500, "provider_error", "The content returned was not an image")
