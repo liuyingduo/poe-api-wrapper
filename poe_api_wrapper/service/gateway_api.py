@@ -1185,26 +1185,19 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
                         ),
-                        "Accept": "image/*,*/*;q=0.8",
+                        "Accept": "*/*",
                     },
                 )
                 if resp.status_code >= 400:
                     _openai_http_error(
                         400,
                         "invalid_request_error",
-                        f"Failed to download image_url: {remote_url} (HTTP {resp.status_code})",
+                        f"Failed to download attachment: {remote_url} (HTTP {resp.status_code})",
                     )
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
-                if not content_type.startswith("image/"):
-                    _openai_http_error(
-                        400,
-                        "invalid_request_error",
-                        f"image_url must point to an image resource, got Content-Type={content_type or 'unknown'}",
-                    )
-
-                suffix = _guess_suffix_from_content_type(content_type) or _guess_suffix_from_url(remote_url) or ".jpg"
-                tmp_path = _create_temp_file_path(prefix="poe_img_", suffix=suffix)
+                suffix = _guess_suffix_from_content_type(content_type) or _guess_suffix_from_url(remote_url) or ".bin"
+                tmp_path = _create_temp_file_path(prefix="poe_att_", suffix=suffix)
                 temp_files.append(tmp_path)
                 async with aiofiles.open(tmp_path, "wb") as tmp:
                     await tmp.write(resp.content)
@@ -1732,7 +1725,7 @@ async def _chat_completions_impl(
             _openai_http_error(
                 400,
                 "invalid_request_error",
-                f"Failed to process image_url attachments: {exc}",
+                f"Failed to process attachments: {exc}",
             )
 
     if streaming:

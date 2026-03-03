@@ -23,17 +23,17 @@ client = openai.OpenAI(
 # print(response.choices[0].message.content)
 
 # # ── Streaming Example ──────────────────────────────────────────────────────────
-# stream = client.chat.completions.create(
-#     model="gpt-3.5-turbo",
-#     messages=[
-#         {"role": "user", "content": "this is a test request, write a short poem"},
-#     ],
-#     stream=True,
-# )
-# for chunk in stream:
-#     if chunk.choices[0].delta.content is not None:
-#         print(chunk.choices[0].delta.content, end="")
-# # print()
+stream = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "user", "content": "helloi"},
+    ],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content is not None:
+        print(chunk.choices[0].delta.content, end="")
+# print()
 
 # # # ── Vision / Image-Input Example ───────────────────────────────────────────────
 # IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
@@ -65,42 +65,70 @@ client = openai.OpenAI(
 # print(edit_resp.data[0].url)
 
 
-import concurrent.futures
-import time
+# ── File Analysis Example ──────────────────────────────────────────────────────
+# 支持图片、PDF 等文件 URL，模型会分析文件内容并回答问题。
+# 多个文件直接在 content 列表里追加多个 image_url 条目即可。
 
-TOTAL_REQUESTS = 5
-PROMPT = "A cute girl with a little flower"
-MODEL = "Qwen-Image"
+ANALYZE_FILES = [
+    "https://elinux.org/images/c/c5/IntroductionToReverseEngineering_Anderson.pdf",
+    # "https://example.com/another.pdf",
+]
+ANALYZE_PROMPT = "请分析这些文件的主要内容，用中文回答。"
+ANALYZE_MODEL = "GPT-4o"
 
-def generate_image(index: int):
-    try:
-        start = time.time()
-        result = client.images.generate(
-            model=MODEL,
-            prompt=PROMPT,
-            n=1,
-        )
-        elapsed = time.time() - start
-        url = result.data[0].url if result.data else None
-        print(f"[{index:03d}] 成功 ({elapsed:.2f}s): {url}")
-        return {"index": index, "success": True, "url": url, "elapsed": elapsed}
-    except Exception as e:
-        print(f"[{index:03d}] 失败: {e}")
-        return {"index": index, "success": False, "error": str(e)}
+content_parts = [{"type": "text", "text": ANALYZE_PROMPT}]
+for f in ANALYZE_FILES:
+    content_parts.append({"type": "file", "file": {"url": f}})
 
-print(f"开始发起 {TOTAL_REQUESTS} 个并发图片生成请求...")
-overall_start = time.time()
+file_analysis = client.chat.completions.create(
+    model=ANALYZE_MODEL,
+    messages=[{"role": "user", "content": content_parts}],
+    stream=True,
+)
+print(f"\n=== 文件分析结果 ({len(ANALYZE_FILES)} 个文件) ===")
+for chunk in file_analysis:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)
+print()
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_REQUESTS) as executor:
-    futures = {executor.submit(generate_image, i): i for i in range(1, TOTAL_REQUESTS + 1)}
-    results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
-overall_elapsed = time.time() - overall_start
-success_count = sum(1 for r in results if r["success"])
-fail_count = TOTAL_REQUESTS - success_count
+# import concurrent.futures
+# import time
 
-print(f"\n===== 测试完成 =====")
-print(f"总请求数: {TOTAL_REQUESTS}")
-print(f"成功: {success_count} | 失败: {fail_count}")
-print(f"总耗时: {overall_elapsed:.2f}s")
+# TOTAL_REQUESTS = 5
+# PROMPT = "A cute girl with a little flower"
+# MODEL = "Qwen-Image"
+
+# def generate_image(index: int):
+#     try:
+#         start = time.time()
+#         result = client.images.generate(
+#             model=MODEL,
+#             prompt=PROMPT,
+#             n=1,
+#         )
+#         elapsed = time.time() - start
+#         url = result.data[0].url if result.data else None
+#         print(f"[{index:03d}] 成功 ({elapsed:.2f}s): {url}")
+#         return {"index": index, "success": True, "url": url, "elapsed": elapsed}
+#     except Exception as e:
+#         print(f"[{index:03d}] 失败: {e}")
+#         return {"index": index, "success": False, "error": str(e)}
+
+# print(f"开始发起 {TOTAL_REQUESTS} 个并发图片生成请求...")
+# overall_start = time.time()
+
+# with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_REQUESTS) as executor:
+#     futures = {executor.submit(generate_image, i): i for i in range(1, TOTAL_REQUESTS + 1)}
+#     results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+# overall_elapsed = time.time() - overall_start
+# success_count = sum(1 for r in results if r["success"])
+# fail_count = TOTAL_REQUESTS - success_count
+
+# print(f"\n===== 测试完成 =====")
+# print(f"总请求数: {TOTAL_REQUESTS}")
+# print(f"成功: {success_count} | 失败: {fail_count}")
+# print(f"总耗时: {overall_elapsed:.2f}s")
 

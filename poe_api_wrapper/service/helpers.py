@@ -103,7 +103,7 @@ async def __validate_messages_format(messages):
 
 async def __split_content(messages):
     text_messages = []
-    image_urls = []
+    attachment_urls = []
     
     for message in messages:
         if "content" in message and isinstance(message["content"], list):
@@ -112,18 +112,26 @@ async def __split_content(messages):
                     if "text" in item:
                         text_messages.append({"role": message["role"], "content": item["text"]})
                 elif item["type"] == "image_url":
+                    # 图片附件：{"type": "image_url", "image_url": {"url": "..."}}
                     if "image_url" in item:
                         if isinstance(item["image_url"], str):
-                            image_urls.append(item["image_url"])  
+                            if item["image_url"] not in attachment_urls:
+                                attachment_urls.append(item["image_url"])
                         elif isinstance(item["image_url"], dict) and "url" in item["image_url"]:
-                            if item["image_url"]["url"] not in image_urls:
-                                image_urls.append(item["image_url"]["url"])
+                            if item["image_url"]["url"] not in attachment_urls:
+                                attachment_urls.append(item["image_url"]["url"])
                         else:
-                            logger.error(f"Invalid image URL format: {item['image_url']}")
+                            logger.error(f"Invalid image_url format: {item['image_url']}")
+                elif item["type"] == "file":
+                    # 文件附件（PDF/文档等）：{"type": "file", "file": {"url": "..."}}
+                    file_info = item.get("file") or {}
+                    url = file_info.get("url") or file_info.get("file_url") or ""
+                    if url and url not in attachment_urls:
+                        attachment_urls.append(url)
         elif "content" in message and isinstance(message["content"], str):
             text_messages.append({"role": message["role"], "content": message["content"]})  
                
-    return text_messages, image_urls
+    return text_messages, attachment_urls
 
 async def __generate_completion_id():
     return "".join(random.choices(string.ascii_letters + string.digits, k=28))
