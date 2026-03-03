@@ -671,9 +671,11 @@ async def startup_event() -> None:
             config.default_poe_revision = fetched
             logger.info("自动获取 poe-revision: {}", fetched)
         else:
-            logger.warning("未能自动获取 poe-revision，客户端将不携带该请求头")
+            logger.error("未能自动获取 poe-revision，服务启动中止。请检查网络或手动配置 POE_REVISION 环境变量。")
+            raise RuntimeError("Failed to fetch poe-revision from poe.com. Service startup aborted.")
     elif not config.default_poe_revision and not config.auto_fetch_poe_revision:
-        logger.info("POE_REVISION 未配置，且 AUTO_FETCH_POE_REVISION=false，跳过自动抓取")
+        logger.error("POE_REVISION 未配置，且 AUTO_FETCH_POE_REVISION=false，服务启动中止。")
+        raise RuntimeError("POE_REVISION is not set and auto-fetch is disabled. Service startup aborted.")
 
     crypto = CredentialCrypto(config.fernet_key)
     repo = AccountRepository(config.mongodb_uri, config.mongodb_db, crypto)
