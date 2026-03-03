@@ -1806,7 +1806,11 @@ async def create_images(
         urls: list[str] = []
         for _ in range(n):
             image_generation = await generate_image(client, response, aspect_ratio)
-            urls.extend([url for url in image_generation.split() if url.startswith("https://")])
+            logger.info("Raw image generation response for model={}: {!r}", model, image_generation)
+            extracted = [url for url in image_generation.split() if url.startswith("https://")]
+            if not extracted:
+                extracted = re.findall(r'https://\S+', image_generation)
+            urls.extend(extracted)
             if len(urls) >= n:
                 break
         urls = urls[-n:]
