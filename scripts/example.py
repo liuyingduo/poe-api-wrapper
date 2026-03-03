@@ -36,21 +36,21 @@ for chunk in stream:
 # print()
 
 # # # ── Vision / Image-Input Example ───────────────────────────────────────────────
-# IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
+IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
 
-# image_input = client.chat.completions.create(
-#     model="GPT-4o",
-#     messages=[
-#         {
-#             "role": "user",
-#             "content": [
-#                 {"type": "text", "text": "What's in this image?"},
-#                 {"type": "image_url", "image_url": {"url": IMAGE_URL}},
-#             ],
-#         }
-#     ],
-# )
-# print(image_input.choices[0].message.content)
+image_input = client.chat.completions.create(
+    model="GPT-4o",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What's in this image?"},
+                {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+            ],
+        }
+    ],
+)
+print(image_input.choices[0].message.content)
 
 # ── Image-Edit Example ─────────────────────────────────────────────────────────
 # Download the reference image and pass it as a file-like object.
@@ -70,8 +70,7 @@ for chunk in stream:
 # 多个文件直接在 content 列表里追加多个 image_url 条目即可。
 
 ANALYZE_FILES = [
-    "https://elinux.org/images/c/c5/IntroductionToReverseEngineering_Anderson.pdf",
-    # "https://example.com/another.pdf",
+    "https://lib.hueb.edu.cn/__local/C/03/BD/ABAB4CD4F1A81D63A6B2C978081_B112E78E_1198F9.pdf?e=.pdf",
 ]
 ANALYZE_PROMPT = "请分析这些文件的主要内容，用中文回答。"
 ANALYZE_MODEL = "GPT-4o"

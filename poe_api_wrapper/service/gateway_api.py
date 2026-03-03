@@ -573,6 +573,28 @@ def _openai_http_error(code: int, err_type: str, message: str, metadata: Optiona
     raise HTTPException(status_code=code, detail=build_openai_error(code, err_type, message, metadata))
 
 
+def _unwrap_root_exception(exc: BaseException) -> BaseException:
+    seen: set[int] = set()
+    current: BaseException = exc
+    while True:
+        next_exc = current.__cause__ or current.__context__
+        if next_exc is None:
+            return current
+        if id(next_exc) in seen:
+            return current
+        seen.add(id(current))
+        current = next_exc
+
+
+def _exception_summary(exc: BaseException) -> str:
+    root = _unwrap_root_exception(exc)
+    top = f"{type(exc).__name__}: {exc}"
+    root_text = f"{type(root).__name__}: {root}"
+    if root is exc:
+        return top
+    return f"{top} | root={root_text}"
+
+
 def _is_depleted_error(error_text: str) -> bool:
     lower = error_text.lower()
     return any(token in lower for token in ("insufficient", "balance", "reached_limit", "402", "daily limit"))
@@ -588,6 +610,17 @@ def _is_rate_limit_error(error_text: str) -> bool:
     return any(token in lower for token in ("rate_limit", "429", "concurrent_messages", "too many requests"))
 
 
+def _is_provider_timeout_error(error_text: str) -> bool:
+    lower = error_text.lower()
+    return any(
+        token in lower
+        for token in (
+            "timed out waiting for response from bot",
+            "websocket may have disconnected",
+        )
+    )
+
+
 async def _account_error_payload(
     runtime: GatewayRuntime,
     account_id: str,
@@ -595,7 +628,7 @@ async def _account_error_payload(
     persistent_session: bool,
     exc: Exception,
 ) -> tuple[dict[str, Any], int]:
-    error_text = str(exc)
+    error_text = _exception_summary(exc)
     metadata = {"session_id": session_id, "account_id": account_id}
     if _is_depleted_error(error_text):
         await runtime.repo.mark_account_depleted(account_id, error_text)
@@ -605,6 +638,12 @@ async def _account_error_payload(
             message = "Bound account has no remaining points. Create a new session_id and retry."
         else:
             message = "Insufficient credits on selected account."
+        logger.warning(
+            "provider_error_classified status=402 type=insufficient_credits account_id={} session_id={} detail={}",
+            mask_secret(account_id),
+            session_id,
+            error_text,
+        )
         return build_openai_error(402, "insufficient_credits", message, metadata), 402
 
     if _is_invalid_error(error_text):
@@ -615,7 +654,35 @@ async def _account_error_payload(
             message = "Bound account became invalid. Create a new session_id and retry."
         else:
             message = "Selected account failed authorization."
+        logger.warning(
+            "provider_error_classified status=403 type=authentication_error account_id={} session_id={} detail={}",
+            mask_secret(account_id),
+            session_id,
+            error_text,
+        )
         return build_openai_error(403, "authentication_error", message, metadata), 403
+
+    if _is_provider_timeout_error(error_text):
+        await runtime.repo.record_account_error(
+            account_id,
+            error_text,
+            cooldown_seconds=runtime.config.cooldown_seconds,
+        )
+        logger.warning(
+            "provider_error_classified status=504 type=provider_timeout_error account_id={} session_id={} detail={}",
+            mask_secret(account_id),
+            session_id,
+            error_text,
+        )
+        return (
+            build_openai_error(
+                504,
+                "provider_timeout_error",
+                "Provider timeout while waiting for Poe response. Retry with backoff.",
+                metadata,
+            ),
+            504,
+        )
 
     if _is_rate_limit_error(error_text):
         await runtime.repo.record_account_error(
@@ -623,12 +690,24 @@ async def _account_error_payload(
             error_text,
             cooldown_seconds=runtime.config.cooldown_seconds,
         )
+        logger.warning(
+            "provider_error_classified status=429 type=rate_limit_error account_id={} session_id={} detail={}",
+            mask_secret(account_id),
+            session_id,
+            error_text,
+        )
         return build_openai_error(429, "rate_limit_error", "Rate limit reached. Retry with backoff.", metadata), 429
 
     await runtime.repo.record_account_error(
         account_id,
         error_text,
         cooldown_seconds=runtime.config.cooldown_seconds,
+    )
+    logger.error(
+        "provider_error_classified status=500 type=provider_error account_id={} session_id={} detail={}",
+        mask_secret(account_id),
+        session_id,
+        error_text,
     )
     return build_openai_error(500, "provider_error", f"Provider error: {error_text}", metadata), 500
 
@@ -805,11 +884,22 @@ async def audit_middleware(request: Request, call_next):
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(_: Request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(exc.detail, dict) and "error" in exc.detail:
         payload = exc.detail
     else:
         payload = build_openai_error(exc.status_code, "invalid_request_error", str(exc.detail))
+    err = payload.get("error", {})
+    logger.warning(
+        "http_error request_id={} method={} path={} status={} type={} message={} metadata={}",
+        getattr(request.state, "request_id", None),
+        request.method,
+        request.url.path,
+        exc.status_code,
+        err.get("type"),
+        err.get("message"),
+        err.get("metadata", {}),
+    )
     return JSONResponse(payload, status_code=exc.status_code)
 
 
@@ -1266,6 +1356,12 @@ async def generate_image(client, response: dict, aspect_ratio: str, image: list 
         # fallback：从文本中解析 URL（适用于把 URL 直接写在文本里的模型）
         return chunk["text"]
     except Exception as exc:
+        logger.error(
+            "generate_image_failed bot={} aspect_ratio={} detail={}",
+            response.get("bot"),
+            normalized_aspect,
+            _exception_summary(exc),
+        )
         _openai_http_error(500, "provider_error", f"Failed to generate image: {exc}")
 
 
