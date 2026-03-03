@@ -663,13 +663,16 @@ async def _account_error_payload(
         return build_openai_error(403, "authentication_error", message, metadata), 403
 
     if _is_provider_timeout_error(error_text):
+        await runtime.pool.invalidate_client(account_id)
         await runtime.repo.record_account_error(
             account_id,
             error_text,
             cooldown_seconds=runtime.config.cooldown_seconds,
+            error_threshold=2,
         )
         logger.warning(
-            "provider_error_classified status=504 type=provider_timeout_error account_id={} session_id={} detail={}",
+            "provider_error_classified status=504 type=provider_timeout_error account_id={} session_id={} "
+            "evicted_client=true detail={}",
             mask_secret(account_id),
             session_id,
             error_text,
@@ -1356,13 +1359,14 @@ async def generate_image(client, response: dict, aspect_ratio: str, image: list 
         # fallback：从文本中解析 URL（适用于把 URL 直接写在文本里的模型）
         return chunk["text"]
     except Exception as exc:
+        detail = _exception_summary(exc)
         logger.error(
             "generate_image_failed bot={} aspect_ratio={} detail={}",
             response.get("bot"),
             normalized_aspect,
-            _exception_summary(exc),
+            detail,
         )
-        _openai_http_error(500, "provider_error", f"Failed to generate image: {exc}")
+        raise RuntimeError(f"Failed to generate image: {detail}") from exc
 
 
 async def create_completion_data(

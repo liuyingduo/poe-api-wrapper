@@ -1051,6 +1051,8 @@ class AsyncPoeApi:
         suggestedReplies = []
         _queue_timeout = 120
         _queue_idle = 0
+        _ws_recovery_attempts = 0
+        _max_ws_recovery_attempts = 1
         
         while True:
             try:
@@ -1060,6 +1062,34 @@ class AsyncPoeApi:
                 except asyncio.TimeoutError:
                     _queue_idle += _queue_timeout
                     if _queue_idle >= 300:
+                        if _ws_recovery_attempts < _max_ws_recovery_attempts:
+                            _ws_recovery_attempts += 1
+                            logger.warning(
+                                "No websocket events for chatId={} during regenerate flow. "
+                                "Forcing reconnect before failing ({}/{})",
+                                chatId,
+                                _ws_recovery_attempts,
+                                _max_ws_recovery_attempts,
+                            )
+                            try:
+                                self.disconnect_ws()
+                            except Exception as reconnect_exc:
+                                logger.debug(
+                                    "disconnect_ws failed during regenerate timeout recovery: {}",
+                                    reconnect_exc,
+                                )
+                            try:
+                                await self.connect_ws()
+                                # Only grant one short extra window after reconnect.
+                                _queue_idle = 180
+                                continue
+                            except Exception as reconnect_exc:
+                                logger.warning(
+                                    "WebSocket reconnect failed during regenerate timeout recovery "
+                                    "(chatId={}): {}",
+                                    chatId,
+                                    reconnect_exc,
+                                )
                         raise RuntimeError(f"Timed out waiting for response from bot (chatId={chatId}). WebSocket may have disconnected.")
                     continue
             except KeyError:
@@ -1301,6 +1331,8 @@ class AsyncPoeApi:
         suggestedReplies = []
         _queue_timeout = 120
         _queue_idle = 0
+        _ws_recovery_attempts = 0
+        _max_ws_recovery_attempts = 1
         
         while True:
             try:
@@ -1310,6 +1342,34 @@ class AsyncPoeApi:
                 except asyncio.TimeoutError:
                     _queue_idle += _queue_timeout
                     if _queue_idle >= 300:
+                        if _ws_recovery_attempts < _max_ws_recovery_attempts:
+                            _ws_recovery_attempts += 1
+                            logger.warning(
+                                "No websocket events for chatId={} during send_message flow. "
+                                "Forcing reconnect before failing ({}/{})",
+                                chatId,
+                                _ws_recovery_attempts,
+                                _max_ws_recovery_attempts,
+                            )
+                            try:
+                                self.disconnect_ws()
+                            except Exception as reconnect_exc:
+                                logger.debug(
+                                    "disconnect_ws failed during send_message timeout recovery: {}",
+                                    reconnect_exc,
+                                )
+                            try:
+                                await self.connect_ws()
+                                # Only grant one short extra window after reconnect.
+                                _queue_idle = 180
+                                continue
+                            except Exception as reconnect_exc:
+                                logger.warning(
+                                    "WebSocket reconnect failed during send_message timeout recovery "
+                                    "(chatId={}): {}",
+                                    chatId,
+                                    reconnect_exc,
+                                )
                         raise RuntimeError(f"Timed out waiting for response from bot (chatId={chatId}). WebSocket may have disconnected.")
                     continue
             except KeyError:
