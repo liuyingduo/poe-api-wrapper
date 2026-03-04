@@ -1768,8 +1768,14 @@ async def _chat_completions_impl(
     user = data.user
     request.state.model = model
 
-    if not await helpers.__validate_messages_format(messages):
-        _openai_http_error(400, "invalid_request_error", "Invalid messages format")
+    messages_valid, messages_error = await helpers.__validate_messages_format_detail(messages)
+    if not messages_valid:
+        _openai_http_error(
+            400,
+            "invalid_request_error",
+            f"Invalid messages format: {messages_error}",
+            {"reason": messages_error},
+        )
     if model not in app.state.models:
         _openai_http_error(404, "not_found_error", "Invalid model")
     if data.n not in (None, 1):

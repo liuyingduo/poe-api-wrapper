@@ -90,16 +90,40 @@ async def __progressive_summarize_text(text, max_length, initial_reduction_ratio
         step,
     )
 
+async def __validate_messages_format_detail(messages):
+    if messages is None:
+        return False, "messages is required"
+    if not isinstance(messages, list):
+        return False, "messages must be a list"
+    if len(messages) == 0:
+        return False, "messages cannot be empty"
+
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return False, f"messages[{idx}] must be an object"
+        if "role" not in message:
+            return False, f"messages[{idx}] missing role"
+        if not isinstance(message["role"], str):
+            return False, f"messages[{idx}].role must be a string"
+        role = message["role"].strip()
+        if role == "":
+            return False, f"messages[{idx}].role cannot be empty"
+
+    if messages[0]["role"] == "assistant":
+        return False, "messages[0].role cannot be assistant"
+    if messages[-1]["role"] == "assistant":
+        return False, f"messages[{len(messages) - 1}].role cannot be assistant"
+
+    for idx, message in enumerate(messages[1:], start=1):
+        if message["role"] == "system":
+            return False, f"messages[{idx}].role cannot be system (system is only allowed at index 0)"
+
+    return True, ""
+
+
 async def __validate_messages_format(messages):
-    if not messages:
-        return False
-    if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
-        return False
-    if messages[0]["role"] == "assistant" or messages[-1]["role"] == "assistant":
-        return False
-    if any(message["role"] == "system" for message in messages[1:]):
-        return False
-    return True
+    valid, _ = await __validate_messages_format_detail(messages)
+    return valid
 
 async def __split_content(messages):
     text_messages = []
