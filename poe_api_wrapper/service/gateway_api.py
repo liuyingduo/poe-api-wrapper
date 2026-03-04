@@ -1,8 +1,6 @@
 ﻿from __future__ import annotations
 
 import asyncio
-from collections import deque
-import math
 import mimetypes
 import os
 import queue as thread_queue
@@ -195,14 +193,10 @@ class GatewayConfig:
     prewarm_on_startup: bool
     prewarm_account_timeout_seconds: int
     prewarm_scan_interval_seconds: int
-    auto_prewarm_target_enabled: bool
-    prewarm_min_accounts: int
-    prewarm_target_recalc_seconds: int
-    prewarm_target_headroom_ratio_percent: int
-    prewarm_target_buffer: int
-    prewarm_target_step_up: int
-    prewarm_target_step_down: int
-    prewarm_target_wait_ms_threshold: int
+    prewarm_rolling_refresh_enabled: bool
+    prewarm_rolling_refresh_interval_seconds: int
+    prewarm_rolling_refresh_batch_size: int
+    prewarm_rolling_refresh_reuse_cooldown_seconds: int
     acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
@@ -232,14 +226,13 @@ class GatewayConfig:
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
             prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
-            auto_prewarm_target_enabled=_env_bool("AUTO_PREWARM_TARGET_ENABLED", True),
-            prewarm_min_accounts=_env_int("PREWARM_MIN_ACCOUNTS", 50),
-            prewarm_target_recalc_seconds=_env_int("PREWARM_TARGET_RECALC_SECONDS", 30),
-            prewarm_target_headroom_ratio_percent=_env_int("PREWARM_TARGET_HEADROOM_RATIO_PERCENT", 130),
-            prewarm_target_buffer=_env_int("PREWARM_TARGET_BUFFER", 10),
-            prewarm_target_step_up=_env_int("PREWARM_TARGET_STEP_UP", 20),
-            prewarm_target_step_down=_env_int("PREWARM_TARGET_STEP_DOWN", 5),
-            prewarm_target_wait_ms_threshold=_env_int("PREWARM_TARGET_WAIT_MS_THRESHOLD", 80),
+            prewarm_rolling_refresh_enabled=_env_bool("PREWARM_ROLLING_REFRESH_ENABLED", True),
+            prewarm_rolling_refresh_interval_seconds=_env_int("PREWARM_ROLLING_REFRESH_INTERVAL_SECONDS", 120),
+            prewarm_rolling_refresh_batch_size=_env_int("PREWARM_ROLLING_REFRESH_BATCH_SIZE", 10),
+            prewarm_rolling_refresh_reuse_cooldown_seconds=_env_int(
+                "PREWARM_ROLLING_REFRESH_REUSE_COOLDOWN_SECONDS",
+                600,
+            ),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
@@ -298,87 +291,88 @@ class PrewarmQueueCoordinator:
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
         cfg = self.runtime.config
-        self._target_auto_enabled = bool(cfg.auto_prewarm_target_enabled)
-        self._target_min = max(1, int(cfg.prewarm_min_accounts))
-        self._target_max = max(self._target_min, int(cfg.prewarm_max_accounts))
-        self._dynamic_target_count = self._target_min if self._target_auto_enabled else self._target_max
-        self._target_recalc_seconds = max(5, int(cfg.prewarm_target_recalc_seconds))
-        self._target_headroom_ratio = max(1.0, float(cfg.prewarm_target_headroom_ratio_percent) / 100.0)
-        self._target_buffer = max(0, int(cfg.prewarm_target_buffer))
-        self._target_step_up = max(1, int(cfg.prewarm_target_step_up))
-        self._target_step_down = max(1, int(cfg.prewarm_target_step_down))
-        self._target_wait_ms_threshold = max(0, int(cfg.prewarm_target_wait_ms_threshold))
-        self._target_last_recalc_mono = 0.0
-        self._wait_ms_samples: deque[float] = deque(maxlen=512)
-        self._inflight_samples: deque[int] = deque(maxlen=512)
-        self._target_samples_lock = threading.Lock()
+        self._target_max = max(1, int(cfg.prewarm_max_accounts))
+        self._rolling_refresh_enabled = bool(cfg.prewarm_rolling_refresh_enabled)
+        self._rolling_refresh_interval_seconds = max(30, int(cfg.prewarm_rolling_refresh_interval_seconds))
+        self._rolling_refresh_batch_size = max(1, int(cfg.prewarm_rolling_refresh_batch_size))
+        self._rolling_refresh_reuse_cooldown_seconds = max(
+            self._rolling_refresh_interval_seconds,
+            int(cfg.prewarm_rolling_refresh_reuse_cooldown_seconds),
+        )
+        self._rolling_refresh_last_mono = 0.0
+        self._recently_rotated_until: dict[str, float] = {}
 
     # -- helpers ---------------------------------------------------------------
 
     def _target_count(self) -> int:
-        if not self._target_auto_enabled:
-            return self._target_max
-        return max(self._target_min, min(self._dynamic_target_count, self._target_max))
-
-    @staticmethod
-    def _p95(values: list[float]) -> float:
-        if not values:
-            return 0.0
-        ordered = sorted(values)
-        idx = max(0, min(len(ordered) - 1, int(math.ceil(len(ordered) * 0.95) - 1)))
-        return float(ordered[idx])
-
-    def observe_runtime_sample(self, *, wait_ms: float, inflight: int) -> None:
-        if not self._target_auto_enabled:
-            return
-        wait_ms = max(0.0, float(wait_ms))
-        inflight = max(0, int(inflight))
-        with self._target_samples_lock:
-            self._wait_ms_samples.append(wait_ms)
-            self._inflight_samples.append(inflight)
-
-    def _maybe_recalculate_target(self) -> None:
-        if not self._target_auto_enabled:
-            return
-        now = time.monotonic()
-        if (now - self._target_last_recalc_mono) < self._target_recalc_seconds:
-            return
-        self._target_last_recalc_mono = now
-
-        with self._target_samples_lock:
-            wait_samples = list(self._wait_ms_samples)
-            inflight_samples = list(self._inflight_samples)
-
-        p95_wait_ms = self._p95(wait_samples)
-        p95_inflight = self._p95([float(v) for v in inflight_samples])
-        raw_target = int(math.ceil(p95_inflight * self._target_headroom_ratio + self._target_buffer))
-        raw_target = max(self._target_min, min(raw_target, self._target_max))
-
-        current = self._dynamic_target_count
-        new_target = current
-        if p95_wait_ms > self._target_wait_ms_threshold:
-            new_target = min(self._target_max, max(raw_target, current + self._target_step_up))
-        elif raw_target > current:
-            new_target = min(self._target_max, min(raw_target, current + self._target_step_up))
-        elif raw_target < current:
-            new_target = max(self._target_min, max(raw_target, current - self._target_step_down))
-
-        if new_target != current:
-            self._dynamic_target_count = new_target
-            logger.info(
-                "Adaptive prewarm target adjusted {} -> {} (p95_inflight={:.1f}, p95_wait_ms={:.1f}, min={}, max={})",
-                current,
-                new_target,
-                p95_inflight,
-                p95_wait_ms,
-                self._target_min,
-                self._target_max,
-            )
+        return self._target_max
 
     def _failure_backoff_seconds(self) -> int:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
         cooldown = max(1, int(self.runtime.config.cooldown_seconds))
         return max(scan_interval, min(cooldown, 300))
+
+    def _cleanup_recently_rotated(self, now: float) -> None:
+        expired = [aid for aid, until in self._recently_rotated_until.items() if until <= now]
+        for aid in expired:
+            self._recently_rotated_until.pop(aid, None)
+
+    def _in_recently_rotated(self, account_id: str, now: float) -> bool:
+        until = self._recently_rotated_until.get(account_id)
+        return bool(until and until > now)
+
+    async def _maybe_rotate_cached_clients(self) -> None:
+        if not self._rolling_refresh_enabled:
+            return
+        now = time.monotonic()
+        if (now - self._rolling_refresh_last_mono) < self._rolling_refresh_interval_seconds:
+            return
+        self._rolling_refresh_last_mono = now
+        self._cleanup_recently_rotated(now)
+
+        target_count = self._target_count()
+        cached_ids = self.runtime.pool.cached_account_ids_in_order()
+        if not cached_ids:
+            return
+
+        # Keep most of the warm pool alive while rotating a small batch.
+        keep_floor = max(1, target_count - self._rolling_refresh_batch_size)
+        max_evict = min(
+            self._rolling_refresh_batch_size,
+            max(0, len(cached_ids) - keep_floor),
+        )
+        if max_evict <= 0:
+            return
+
+        evicted_ids: list[str] = []
+        for account_id in cached_ids:
+            if len(evicted_ids) >= max_evict:
+                break
+            if self._in_recently_rotated(account_id, now):
+                continue
+
+            await self.runtime.limiter.block_account(account_id)
+            try:
+                # Only evict idle clients so ongoing streams are not interrupted.
+                inflight = await self.runtime.limiter.inflight_for(account_id)
+                if inflight > 0:
+                    continue
+                await self.runtime.pool.invalidate_client(account_id)
+                self._recently_rotated_until[account_id] = now + self._rolling_refresh_reuse_cooldown_seconds
+                evicted_ids.append(account_id)
+            except Exception as exc:
+                logger.debug("Rolling refresh evict failed for {}: {}", mask_secret(account_id), exc)
+            finally:
+                await self.runtime.limiter.unblock_account(account_id)
+
+        if evicted_ids:
+            logger.info(
+                "Rolling refresh evicted {} idle prewarmed client(s) (interval={}s batch={} cooldown={}s)",
+                len(evicted_ids),
+                self._rolling_refresh_interval_seconds,
+                self._rolling_refresh_batch_size,
+                self._rolling_refresh_reuse_cooldown_seconds,
+            )
 
     def _cleanup_failure_backoff(self, now: float) -> None:
         expired = [aid for aid, until in self._failed_backoff_until.items() if until <= now]
@@ -517,7 +511,7 @@ class PrewarmQueueCoordinator:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
         while not self._stop_event.is_set():
             try:
-                self._maybe_recalculate_target()
+                await self._maybe_rotate_cached_clients()
                 target_count = self._target_count()
                 cached_count = len(self.runtime.pool.cached_account_ids())
                 with self._queued_ids_lock:
@@ -530,23 +524,29 @@ class PrewarmQueueCoordinator:
                 candidates = await self.runtime.repo.list_candidate_accounts(limit=0)
                 now = time.monotonic()
                 self._cleanup_failure_backoff(now)
+                self._cleanup_recently_rotated(now)
                 enqueue_count = 0
-                for account_doc in candidates:
+                for allow_recently_rotated in (False, True):
+                    for account_doc in candidates:
+                        if enqueue_count >= deficit:
+                            break
+                        account_id = str(account_doc["_id"])
+                        if self.runtime.pool.has_client(account_id):
+                            continue
+                        if self._in_failure_backoff(account_id, now):
+                            continue
+                        if (not allow_recently_rotated) and self._in_recently_rotated(account_id, now):
+                            continue
+                        with self._queued_ids_lock:
+                            if account_id in self._queued_ids:
+                                continue
+                            if (cached_count + len(self._queued_ids)) >= target_count:
+                                break
+                            self._queued_ids.add(account_id)
+                        self._enqueue_q.put(account_id)
+                        enqueue_count += 1
                     if enqueue_count >= deficit:
                         break
-                    account_id = str(account_doc["_id"])
-                    if self.runtime.pool.has_client(account_id):
-                        continue
-                    if self._in_failure_backoff(account_id, now):
-                        continue
-                    with self._queued_ids_lock:
-                        if account_id in self._queued_ids:
-                            continue
-                        if (cached_count + len(self._queued_ids)) >= target_count:
-                            break
-                        self._queued_ids.add(account_id)
-                    self._enqueue_q.put(account_id)
-                    enqueue_count += 1
                 if enqueue_count > 0:
                     logger.info(
                         "Prewarm producer queued {} account(s); target={} cached={} queued={}",
@@ -611,21 +611,14 @@ class PrewarmQueueCoordinator:
             asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
             for i in range(worker_count)
         ]
-        if self._target_auto_enabled:
-            logger.info(
-                "Started prewarm coordinator with {} consumers; adaptive_target=true current={} min={} max={} recalc={}s",
-                worker_count,
-                self._target_count(),
-                self._target_min,
-                self._target_max,
-                self._target_recalc_seconds,
-            )
-        else:
-            logger.info(
-                "Started prewarm coordinator with {} consumers; adaptive_target=false fixed_target={}",
-                worker_count,
-                self._target_count(),
-            )
+        logger.info(
+            "Started prewarm coordinator with {} consumers; fixed_target={} rolling_refresh={} interval={}s batch={}",
+            worker_count,
+            self._target_count(),
+            self._rolling_refresh_enabled,
+            self._rolling_refresh_interval_seconds,
+            self._rolling_refresh_batch_size,
+        )
         # Block until the coordinator is asked to stop.
         while not self._stop_event.is_set():
             await asyncio.sleep(0.5)
@@ -861,20 +854,9 @@ async def _prewarm_pool(runtime: GatewayRuntime) -> None:
 
 async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
     wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
-    loop = asyncio.get_running_loop()
-    started = loop.time()
     while True:
         try:
-            selected = await runtime.selector.select_account(prewarmed_only=True)
-            waited_ms = max(0.0, (loop.time() - started) * 1000.0)
-            coordinator = getattr(app.state, "prewarm_coordinator", None)
-            if coordinator and hasattr(coordinator, "observe_runtime_sample"):
-                try:
-                    inflight = await runtime.limiter.global_inflight()
-                    coordinator.observe_runtime_sample(wait_ms=waited_ms, inflight=inflight)
-                except Exception:
-                    pass
-            return selected
+            return await runtime.selector.select_account(prewarmed_only=True)
         except NoAccountAvailableError:
             raise
         except CapacityLimitError:

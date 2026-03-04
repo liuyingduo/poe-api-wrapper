@@ -725,27 +725,28 @@ class AsyncPoeApi:
             return None
         return int(raw_id)
 
-    def _append_pending_event(self, chat_id: int, event: dict) -> None:
+    def _append_pending_event(self, chat_id: int, event: dict) -> int:
         with self._queue_state_lock:
             pending = self.pending_events.setdefault(chat_id, [])
             pending.append(event)
             if len(pending) > self.max_pending_events_per_chat:
                 pending.pop(0)
+            return len(pending)
 
-    def _dispatch_ws_event(self, chat_id: int, event: dict) -> bool:
+    def _dispatch_ws_event(self, chat_id: int, event: dict) -> tuple[bool, int]:
         with self._queue_state_lock:
             queue = self.message_queues.get(chat_id)
         if not queue:
-            self._append_pending_event(chat_id, event)
-            return False
+            pending_len = self._append_pending_event(chat_id, event)
+            return False, pending_len
 
         target_loop = self.loop
         if not target_loop or not target_loop.is_running():
-            self._append_pending_event(chat_id, event)
-            return False
+            pending_len = self._append_pending_event(chat_id, event)
+            return False, pending_len
 
         asyncio.run_coroutine_threadsafe(queue.put(event), target_loop)
-        return True
+        return True, 0
 
     async def _reset_message_queue(self, chat_id: int) -> asyncio.Queue:
         queue = asyncio.Queue()
@@ -841,8 +842,8 @@ class AsyncPoeApi:
                     "data": data,
                     "subscription": subscriptionName,
                 }
-                queued = self._dispatch_ws_event(chat_id, event)
-                if not queued:
+                queued, pending_len = self._dispatch_ws_event(chat_id, event)
+                if not queued and pending_len == 1:
                     logger.debug(
                         "Buffered websocket event for chatId={} subscription={} (queue not ready)",
                         chat_id,

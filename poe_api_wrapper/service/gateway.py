@@ -873,18 +873,25 @@ class RuntimeLimiter:
         self.global_inflight_limit = global_inflight_limit
         self._global_inflight = 0
         self._account_inflight: dict[str, int] = defaultdict(int)
+        self._blocked_accounts: set[str] = set()
         self._lock = asyncio.Lock()
 
     async def inflight_for(self, account_id: str) -> int:
         async with self._lock:
             return self._account_inflight.get(account_id, 0)
 
-    async def global_inflight(self) -> int:
+    async def block_account(self, account_id: str) -> None:
         async with self._lock:
-            return self._global_inflight
+            self._blocked_accounts.add(account_id)
+
+    async def unblock_account(self, account_id: str) -> None:
+        async with self._lock:
+            self._blocked_accounts.discard(account_id)
 
     async def try_acquire(self, account_id: str) -> bool:
         async with self._lock:
+            if account_id in self._blocked_accounts:
+                return False
             if self._global_inflight >= self.global_inflight_limit:
                 return False
             if self._account_inflight.get(account_id, 0) >= self.max_inflight_per_account:
@@ -1074,6 +1081,10 @@ class PoeClientPool:
 
     def cached_account_ids(self) -> set[str]:
         return set(self._clients.keys())
+
+    def cached_account_ids_in_order(self) -> list[str]:
+        # Dict insertion order tracks warm-client generation order.
+        return list(self._clients.keys())
 
     def has_client(self, account_id: str) -> bool:
         return account_id in self._clients
