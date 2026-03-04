@@ -86,9 +86,8 @@ file_analysis = client.chat.completions.create(
 )
 print(f"\n=== 文件分析结果 ({len(ANALYZE_FILES)} 个文件) ===")
 for chunk in file_analysis:
-    delta = chunk.choices[0].delta.content
-    if delta:
-        print(delta, end="", flush=True)
+    if chunk.choices[0].delta.content is not None:
+        print(chunk.choices[0].delta.content, end="")
 print()
 
 
