@@ -879,6 +879,10 @@ class RuntimeLimiter:
         async with self._lock:
             return self._account_inflight.get(account_id, 0)
 
+    async def global_inflight(self) -> int:
+        async with self._lock:
+            return self._global_inflight
+
     async def try_acquire(self, account_id: str) -> bool:
         async with self._lock:
             if self._global_inflight >= self.global_inflight_limit:

@@ -1,5 +1,5 @@
 from httpx import AsyncClient
-import asyncio, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid
+import asyncio, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid, time
 from typing import AsyncIterator, Optional
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
@@ -82,6 +82,15 @@ class AsyncPoeApi:
         self.max_ws_reconnects: int = 5
         self._ws_reconnect_count: int = 0
         self._on_reconnect_exhausted: Optional[callable] = None
+        self.ws_max_lifetime_min_seconds: int = 20 * 60
+        self.ws_max_lifetime_max_seconds: int = 30 * 60
+        self.ws_max_lifetime_seconds: int = self._pick_ws_max_lifetime_seconds()
+        self._ws_connected_since_mono: float = 0.0
+        self._ws_rotation_in_progress: bool = False
+        self._ws_rotation_lock = threading.Lock()
+        self.pending_events: dict[int, list[dict]] = {}
+        self.max_pending_events_per_chat: int = 128
+        self._queue_state_lock = threading.Lock()
         self.groups: dict = {}
         self.proxies: str = ""
         self.bundle: Optional[AsyncPoeBundle] = None
@@ -573,6 +582,7 @@ class AsyncPoeApi:
     def disconnect_ws(self):
         self.ws_connecting = False
         self.ws_connected = False
+        self._ws_connected_since_mono = 0.0
         self._schedule_stop_ws_heartbeat()
         if self.ws:
             self.ws.close()
@@ -582,11 +592,13 @@ class AsyncPoeApi:
         self.ws_connecting = False
         self.ws_connected = True
         self._ws_reconnect_count = 0
+        self._mark_ws_connected()
         self._schedule_start_ws_heartbeat()
 
     def on_ws_close(self, ws, close_status_code, close_message):
         self.ws_connecting = False
         self.ws_connected = False
+        self._ws_connected_since_mono = 0.0
         self._schedule_stop_ws_heartbeat()
         if self.ws_error:
             self._ws_reconnect_count += 1
@@ -644,11 +656,127 @@ class AsyncPoeApi:
         else:
             self._stop_ws_heartbeat()
 
+    def _pick_ws_max_lifetime_seconds(self) -> int:
+        low = max(60, int(self.ws_max_lifetime_min_seconds))
+        high = max(low, int(self.ws_max_lifetime_max_seconds))
+        return random.randint(low, high)
+
+    def _mark_ws_connected(self) -> None:
+        self._ws_connected_since_mono = time.monotonic()
+        self.ws_max_lifetime_seconds = self._pick_ws_max_lifetime_seconds()
+
+    def _ws_age_seconds(self) -> float:
+        if self._ws_connected_since_mono <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self._ws_connected_since_mono)
+
+    def _ws_is_stale(self) -> bool:
+        return self.ws_connected and self._ws_age_seconds() >= float(self.ws_max_lifetime_seconds)
+
+    def _has_active_streams(self) -> bool:
+        with self._queue_state_lock:
+            return bool(self.message_queues)
+
+    async def _rotate_ws_if_stale(
+        self,
+        *,
+        reason: str,
+        force: bool = False,
+        require_idle: bool = False,
+    ) -> bool:
+        if not self.ws_connected:
+            return False
+        if not force and not self._ws_is_stale():
+            return False
+        if require_idle and self._has_active_streams():
+            return False
+
+        with self._ws_rotation_lock:
+            if self._ws_rotation_in_progress:
+                return False
+            self._ws_rotation_in_progress = True
+
+        age = self._ws_age_seconds()
+        max_age = self.ws_max_lifetime_seconds
+        try:
+            logger.info(
+                "WebSocket proactive rotate triggered reason={} age_s={:.1f} max_lifetime_s={}",
+                reason,
+                age,
+                max_age,
+            )
+            try:
+                self.disconnect_ws()
+            except Exception as exc:
+                logger.debug("disconnect_ws failed during proactive rotation: {}", exc)
+            await self.connect_ws()
+            return True
+        finally:
+            with self._ws_rotation_lock:
+                self._ws_rotation_in_progress = False
+
+    def _extract_chat_id(self, payload: dict, subscription_name: str) -> Optional[int]:
+        unique_id = str(payload.get("unique_id") or "")
+        prefix = f"{subscription_name}:"
+        if not unique_id.startswith(prefix):
+            return None
+        raw_id = unique_id[len(prefix):]
+        if not raw_id.isdigit():
+            return None
+        return int(raw_id)
+
+    def _append_pending_event(self, chat_id: int, event: dict) -> None:
+        with self._queue_state_lock:
+            pending = self.pending_events.setdefault(chat_id, [])
+            pending.append(event)
+            if len(pending) > self.max_pending_events_per_chat:
+                pending.pop(0)
+
+    def _dispatch_ws_event(self, chat_id: int, event: dict) -> bool:
+        with self._queue_state_lock:
+            queue = self.message_queues.get(chat_id)
+        if not queue:
+            self._append_pending_event(chat_id, event)
+            return False
+
+        target_loop = self.loop
+        if not target_loop or not target_loop.is_running():
+            self._append_pending_event(chat_id, event)
+            return False
+
+        asyncio.run_coroutine_threadsafe(queue.put(event), target_loop)
+        return True
+
+    async def _reset_message_queue(self, chat_id: int) -> asyncio.Queue:
+        queue = asyncio.Queue()
+        with self._queue_state_lock:
+            self.message_queues[chat_id] = queue
+            pending_events = self.pending_events.pop(chat_id, [])
+
+        if pending_events:
+            for event in pending_events:
+                await queue.put(event)
+            logger.debug(
+                "Replayed {} buffered websocket events for chatId={}",
+                len(pending_events),
+                chat_id,
+            )
+        return queue
+
     async def _ws_heartbeat_loop(self):
         try:
             while self.ws_connected and not self.ws_error:
                 await asyncio.sleep(self.ws_heartbeat_interval)
                 if not self.ws_connected or self.ws_error:
+                    break
+                try:
+                    rotated = await self._rotate_ws_if_stale(reason="heartbeat", require_idle=True)
+                    if rotated:
+                        continue
+                except Exception as exc:
+                    logger.warning("WebSocket proactive rotate failed during heartbeat: {}", exc)
+                    self.ws_error = True
+                    self.refresh_ws()
                     break
                 ws = getattr(self, "ws", None)
                 if not ws or not ws.sock:
@@ -704,23 +832,25 @@ class AsyncPoeApi:
                 
                 if subscriptionName == "messageAdded" and data["messageAdded"]["author"] == "human":
                     continue
-                             
-                chat_id: int = int(payload.get("unique_id")[(len(subscriptionName) + 1):])
-                
-                if chat_id not in self.message_queues:
+
+                chat_id = self._extract_chat_id(payload, subscriptionName)
+                if chat_id is None:
                     continue
-                
-                if chat_id in self.message_queues:
-                    asyncio.run_coroutine_threadsafe(
-                                        self.message_queues[chat_id].put({
-                                            "data": data,
-                                            "subscription": subscriptionName,
-                                        }),
-                                        self.loop
+
+                event = {
+                    "data": data,
+                    "subscription": subscriptionName,
+                }
+                queued = self._dispatch_ws_event(chat_id, event)
+                if not queued:
+                    logger.debug(
+                        "Buffered websocket event for chatId={} subscription={} (queue not ready)",
+                        chat_id,
+                        subscriptionName,
                     )
-                    if subscriptionName == "messageAdded":
-                        self.active_messages[chat_id] = data["messageAdded"]["messageId"]          
-                    continue
+                if subscriptionName == "messageAdded":
+                    self.active_messages[chat_id] = data["messageAdded"]["messageId"]
+                continue
                 
         except Exception:
             logger.exception(f"Failed to parse message: {msg}")
@@ -748,13 +878,15 @@ class AsyncPoeApi:
         logger.warning("Skipping websocket refresh: no running event loop available.")
             
     async def delete_queues(self, chatId: int):
-        if chatId in self.message_queues:
-            while not self.message_queues[chatId].empty():
+        with self._queue_state_lock:
+            queue = self.message_queues.pop(chatId, None)
+            self.pending_events.pop(chatId, None)
+        if queue:
+            while not queue.empty():
                 try:
-                    self.message_queues[chatId].get_nowait()
+                    queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
-            del self.message_queues[chatId]
         if chatId in self.active_messages:
             del self.active_messages[chatId]
             
@@ -998,6 +1130,7 @@ class AsyncPoeApi:
         while self.ws_error:
             await asyncio.sleep(0.01)
         await self.connect_ws()
+        await self._rotate_ws_if_stale(reason="before_retry_message")
         
         variables = {"chatCode": chatCode}
         response_json = await self.send_request('gql_POST', 'ChatPageQuery', variables)
@@ -1042,7 +1175,7 @@ class AsyncPoeApi:
             logger.info(f"Message {bot_message_id} of Thread {chatCode} has been retried.")
             
         self.active_messages[chatId] = None
-        self.message_queues[chatId] = asyncio.Queue()
+        await self._reset_message_queue(chatId)
 
         last_text = ""        
         stateChange = False
@@ -1178,6 +1311,7 @@ class AsyncPoeApi:
         while self.ws_error:
             await asyncio.sleep(0.01)
         await self.connect_ws()
+        await self._rotate_ws_if_stale(reason="before_send_message")
         
         bot_input = bot
         bot = bot_map(bot_input)
@@ -1330,7 +1464,7 @@ class AsyncPoeApi:
                 raise e
                     
         self.active_messages[chatId] = None
-        self.message_queues[chatId] = asyncio.Queue()
+        await self._reset_message_queue(chatId)
 
         last_text = ""     
         stateChange = False

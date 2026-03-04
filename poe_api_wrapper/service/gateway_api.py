@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+from collections import deque
 import math
 import mimetypes
 import os
@@ -194,6 +195,14 @@ class GatewayConfig:
     prewarm_on_startup: bool
     prewarm_account_timeout_seconds: int
     prewarm_scan_interval_seconds: int
+    auto_prewarm_target_enabled: bool
+    prewarm_min_accounts: int
+    prewarm_target_recalc_seconds: int
+    prewarm_target_headroom_ratio_percent: int
+    prewarm_target_buffer: int
+    prewarm_target_step_up: int
+    prewarm_target_step_down: int
+    prewarm_target_wait_ms_threshold: int
     acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
@@ -223,6 +232,14 @@ class GatewayConfig:
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
             prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
+            auto_prewarm_target_enabled=_env_bool("AUTO_PREWARM_TARGET_ENABLED", True),
+            prewarm_min_accounts=_env_int("PREWARM_MIN_ACCOUNTS", 50),
+            prewarm_target_recalc_seconds=_env_int("PREWARM_TARGET_RECALC_SECONDS", 30),
+            prewarm_target_headroom_ratio_percent=_env_int("PREWARM_TARGET_HEADROOM_RATIO_PERCENT", 130),
+            prewarm_target_buffer=_env_int("PREWARM_TARGET_BUFFER", 10),
+            prewarm_target_step_up=_env_int("PREWARM_TARGET_STEP_UP", 20),
+            prewarm_target_step_down=_env_int("PREWARM_TARGET_STEP_DOWN", 5),
+            prewarm_target_wait_ms_threshold=_env_int("PREWARM_TARGET_WAIT_MS_THRESHOLD", 80),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
@@ -280,11 +297,83 @@ class PrewarmQueueCoordinator:
         self._prewarm_loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
+        cfg = self.runtime.config
+        self._target_auto_enabled = bool(cfg.auto_prewarm_target_enabled)
+        self._target_min = max(1, int(cfg.prewarm_min_accounts))
+        self._target_max = max(self._target_min, int(cfg.prewarm_max_accounts))
+        self._dynamic_target_count = self._target_min if self._target_auto_enabled else self._target_max
+        self._target_recalc_seconds = max(5, int(cfg.prewarm_target_recalc_seconds))
+        self._target_headroom_ratio = max(1.0, float(cfg.prewarm_target_headroom_ratio_percent) / 100.0)
+        self._target_buffer = max(0, int(cfg.prewarm_target_buffer))
+        self._target_step_up = max(1, int(cfg.prewarm_target_step_up))
+        self._target_step_down = max(1, int(cfg.prewarm_target_step_down))
+        self._target_wait_ms_threshold = max(0, int(cfg.prewarm_target_wait_ms_threshold))
+        self._target_last_recalc_mono = 0.0
+        self._wait_ms_samples: deque[float] = deque(maxlen=512)
+        self._inflight_samples: deque[int] = deque(maxlen=512)
+        self._target_samples_lock = threading.Lock()
 
     # -- helpers ---------------------------------------------------------------
 
     def _target_count(self) -> int:
-        return max(1, int(self.runtime.config.prewarm_max_accounts))
+        if not self._target_auto_enabled:
+            return self._target_max
+        return max(self._target_min, min(self._dynamic_target_count, self._target_max))
+
+    @staticmethod
+    def _p95(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = max(0, min(len(ordered) - 1, int(math.ceil(len(ordered) * 0.95) - 1)))
+        return float(ordered[idx])
+
+    def observe_runtime_sample(self, *, wait_ms: float, inflight: int) -> None:
+        if not self._target_auto_enabled:
+            return
+        wait_ms = max(0.0, float(wait_ms))
+        inflight = max(0, int(inflight))
+        with self._target_samples_lock:
+            self._wait_ms_samples.append(wait_ms)
+            self._inflight_samples.append(inflight)
+
+    def _maybe_recalculate_target(self) -> None:
+        if not self._target_auto_enabled:
+            return
+        now = time.monotonic()
+        if (now - self._target_last_recalc_mono) < self._target_recalc_seconds:
+            return
+        self._target_last_recalc_mono = now
+
+        with self._target_samples_lock:
+            wait_samples = list(self._wait_ms_samples)
+            inflight_samples = list(self._inflight_samples)
+
+        p95_wait_ms = self._p95(wait_samples)
+        p95_inflight = self._p95([float(v) for v in inflight_samples])
+        raw_target = int(math.ceil(p95_inflight * self._target_headroom_ratio + self._target_buffer))
+        raw_target = max(self._target_min, min(raw_target, self._target_max))
+
+        current = self._dynamic_target_count
+        new_target = current
+        if p95_wait_ms > self._target_wait_ms_threshold:
+            new_target = min(self._target_max, max(raw_target, current + self._target_step_up))
+        elif raw_target > current:
+            new_target = min(self._target_max, min(raw_target, current + self._target_step_up))
+        elif raw_target < current:
+            new_target = max(self._target_min, max(raw_target, current - self._target_step_down))
+
+        if new_target != current:
+            self._dynamic_target_count = new_target
+            logger.info(
+                "Adaptive prewarm target adjusted {} -> {} (p95_inflight={:.1f}, p95_wait_ms={:.1f}, min={}, max={})",
+                current,
+                new_target,
+                p95_inflight,
+                p95_wait_ms,
+                self._target_min,
+                self._target_max,
+            )
 
     def _failure_backoff_seconds(self) -> int:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
@@ -426,9 +515,10 @@ class PrewarmQueueCoordinator:
 
     async def _producer_loop(self) -> None:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
-        target_count = self._target_count()
         while not self._stop_event.is_set():
             try:
+                self._maybe_recalculate_target()
+                target_count = self._target_count()
                 cached_count = len(self.runtime.pool.cached_account_ids())
                 with self._queued_ids_lock:
                     queued_count = len(self._queued_ids)
@@ -521,11 +611,21 @@ class PrewarmQueueCoordinator:
             asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
             for i in range(worker_count)
         ]
-        logger.info(
-            "Started prewarm coordinator on dedicated loop with {} consumers; target_prewarmed_accounts={}",
-            worker_count,
-            self._target_count(),
-        )
+        if self._target_auto_enabled:
+            logger.info(
+                "Started prewarm coordinator with {} consumers; adaptive_target=true current={} min={} max={} recalc={}s",
+                worker_count,
+                self._target_count(),
+                self._target_min,
+                self._target_max,
+                self._target_recalc_seconds,
+            )
+        else:
+            logger.info(
+                "Started prewarm coordinator with {} consumers; adaptive_target=false fixed_target={}",
+                worker_count,
+                self._target_count(),
+            )
         # Block until the coordinator is asked to stop.
         while not self._stop_event.is_set():
             await asyncio.sleep(0.5)
@@ -761,9 +861,20 @@ async def _prewarm_pool(runtime: GatewayRuntime) -> None:
 
 async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
     wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     while True:
         try:
-            return await runtime.selector.select_account(prewarmed_only=True)
+            selected = await runtime.selector.select_account(prewarmed_only=True)
+            waited_ms = max(0.0, (loop.time() - started) * 1000.0)
+            coordinator = getattr(app.state, "prewarm_coordinator", None)
+            if coordinator and hasattr(coordinator, "observe_runtime_sample"):
+                try:
+                    inflight = await runtime.limiter.global_inflight()
+                    coordinator.observe_runtime_sample(wait_ms=waited_ms, inflight=inflight)
+                except Exception:
+                    pass
+            return selected
         except NoAccountAvailableError:
             raise
         except CapacityLimitError:
