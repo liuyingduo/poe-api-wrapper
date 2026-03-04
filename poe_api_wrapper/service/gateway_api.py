@@ -199,6 +199,9 @@ class GatewayConfig:
     daily_reset_timezone: str
     daily_reset_hour: int
     daily_reset_point_balance: int
+    invalid_auto_refresh_enabled: bool
+    invalid_auto_refresh_interval_seconds: int
+    invalid_auto_refresh_batch_limit: int
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -225,6 +228,9 @@ class GatewayConfig:
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
             daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 3000),
+            invalid_auto_refresh_enabled=_env_bool("INVALID_AUTO_REFRESH_ENABLED", True),
+            invalid_auto_refresh_interval_seconds=_env_int("INVALID_AUTO_REFRESH_INTERVAL_SECONDS", 900),
+            invalid_auto_refresh_batch_limit=_env_int("INVALID_AUTO_REFRESH_BATCH_LIMIT", 200),
         )
 
 
@@ -807,6 +813,9 @@ async def startup_event() -> None:
         daily_reset_timezone=config.daily_reset_timezone,
         daily_reset_hour=config.daily_reset_hour,
         daily_reset_point_balance=config.daily_reset_point_balance,
+        invalid_auto_refresh_enabled=config.invalid_auto_refresh_enabled,
+        invalid_auto_refresh_interval_seconds=config.invalid_auto_refresh_interval_seconds,
+        invalid_auto_refresh_batch_limit=config.invalid_auto_refresh_batch_limit,
     )
     sessions = SessionManager(repo=repo)
 

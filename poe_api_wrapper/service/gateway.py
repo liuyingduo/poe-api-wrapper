@@ -1190,6 +1190,9 @@ class AccountHealthRefresher:
         daily_reset_timezone: str = "America/Los_Angeles",
         daily_reset_hour: int = 0,
         daily_reset_point_balance: int = 3000,
+        invalid_auto_refresh_enabled: bool = True,
+        invalid_auto_refresh_interval_seconds: int = 900,
+        invalid_auto_refresh_batch_limit: int = 200,
         error_threshold: int = 3,
     ):
         self.repo = repo
@@ -1201,6 +1204,9 @@ class AccountHealthRefresher:
         self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"
         self.daily_reset_hour = max(0, min(int(daily_reset_hour), 23))
         self.daily_reset_point_balance = max(0, int(daily_reset_point_balance))
+        self.invalid_auto_refresh_enabled = bool(invalid_auto_refresh_enabled)
+        self.invalid_auto_refresh_interval_seconds = max(30, int(invalid_auto_refresh_interval_seconds))
+        self.invalid_auto_refresh_batch_limit = max(1, int(invalid_auto_refresh_batch_limit))
         self.error_threshold = error_threshold
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
@@ -1215,6 +1221,9 @@ class AccountHealthRefresher:
             self.daily_reset_timezone = "America/Los_Angeles"
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         self._next_daily_reset_utc = self._compute_next_daily_reset_utc()
+        self._next_invalid_auto_refresh_utc = utc_now() + timedelta(
+            seconds=self.invalid_auto_refresh_interval_seconds
+        )
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -1263,6 +1272,31 @@ class AccountHealthRefresher:
             self.daily_reset_point_balance,
         )
         self._next_daily_reset_utc = self._compute_next_daily_reset_utc(now_utc + timedelta(seconds=1))
+
+    async def _run_invalid_auto_refresh_if_due(self, now_utc: datetime) -> None:
+        if not self.invalid_auto_refresh_enabled:
+            return
+        if now_utc < self._next_invalid_auto_refresh_utc:
+            return
+
+        try:
+            invalid_accounts = await self.repo.list_all_accounts_for_refresh(
+                statuses=["invalid"],
+                limit=self.invalid_auto_refresh_batch_limit,
+            )
+            if invalid_accounts:
+                logger.info(
+                    "invalid_auto_refresh: attempting {} invalid account(s)",
+                    len(invalid_accounts),
+                )
+                await asyncio.gather(
+                    *(self.refresh_account(str(account["_id"])) for account in invalid_accounts),
+                    return_exceptions=True,
+                )
+        finally:
+            self._next_invalid_auto_refresh_utc = now_utc + timedelta(
+                seconds=self.invalid_auto_refresh_interval_seconds
+            )
 
     def _looks_like_depleted(self, error: str) -> bool:
         lower = error.lower()
@@ -1388,12 +1422,17 @@ class AccountHealthRefresher:
                 minutes=self.recent_active_minutes,
                 limit=200,
             )
-            if not recent_accounts:
-                continue
-            await asyncio.gather(
-                *(self.refresh_account(str(account["_id"])) for account in recent_accounts),
-                return_exceptions=True,
-            )
+            if recent_accounts:
+                await asyncio.gather(
+                    *(self.refresh_account(str(account["_id"])) for account in recent_accounts),
+                    return_exceptions=True,
+                )
+
+            try:
+                await self._run_invalid_auto_refresh_if_due(now_utc)
+            except Exception as exc:
+                logger.warning("Invalid auto refresh failed: {}", exc)
+                self._next_invalid_auto_refresh_utc = utc_now() + timedelta(minutes=1)
 
 
 class SessionManager:
