@@ -178,6 +178,72 @@ def _model_endpoints(meta: dict[str, Any]) -> list[str]:
     return DEFAULT_MODEL_ENDPOINTS
 
 
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                        continue
+                if item_type == "image_url":
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url")
+                        if isinstance(url, str):
+                            parts.append(url)
+                            continue
+                    if isinstance(image_url, str):
+                        parts.append(image_url)
+                        continue
+            parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _merge_system_messages_to_index_zero(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    if any(not isinstance(message, dict) for message in messages):
+        return messages
+
+    system_messages: list[dict[str, Any]] = []
+    non_system_messages: list[dict[str, Any]] = []
+    has_system_after_zero = False
+
+    for idx, message in enumerate(messages):
+        copied = dict(message)
+        if copied.get("role") == "system":
+            if idx > 0:
+                has_system_after_zero = True
+            system_messages.append(copied)
+        else:
+            non_system_messages.append(copied)
+
+    if not has_system_after_zero:
+        return [dict(message) for message in messages]
+
+    first_system = system_messages[0]
+    all_system_contents = [item.get("content") for item in system_messages]
+    if all(isinstance(content, list) for content in all_system_contents):
+        merged_content: Any = [entry for content in all_system_contents for entry in content]
+    else:
+        merged_parts = [
+            _message_content_to_text(content).strip()
+            for content in all_system_contents
+        ]
+        merged_content = "\n\n".join(part for part in merged_parts if part)
+    first_system["content"] = merged_content
+    return [first_system, *non_system_messages]
+
+
 @dataclass
 class GatewayConfig:
     default_poe_revision: str
@@ -1888,7 +1954,7 @@ async def _chat_completions_impl(
     data: ChatData,
 ) -> Union[StreamingResponse, JSONResponse]:
     runtime = _runtime()
-    messages = data.messages
+    messages = _merge_system_messages_to_index_zero(data.messages)
     model = data.model
     streaming = bool(data.stream)
     max_tokens = data.max_completion_tokens or data.max_tokens
