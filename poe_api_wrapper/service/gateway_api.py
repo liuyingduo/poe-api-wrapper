@@ -202,6 +202,7 @@ class GatewayConfig:
     invalid_auto_refresh_enabled: bool
     invalid_auto_refresh_interval_seconds: int
     invalid_auto_refresh_batch_limit: int
+    client_max_age_seconds: int
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -231,6 +232,7 @@ class GatewayConfig:
             invalid_auto_refresh_enabled=_env_bool("INVALID_AUTO_REFRESH_ENABLED", True),
             invalid_auto_refresh_interval_seconds=_env_int("INVALID_AUTO_REFRESH_INTERVAL_SECONDS", 900),
             invalid_auto_refresh_batch_limit=_env_int("INVALID_AUTO_REFRESH_BATCH_LIMIT", 200),
+            client_max_age_seconds=_env_int("CLIENT_MAX_AGE_SECONDS", 600),
         )
 
 
@@ -494,6 +496,23 @@ class PrewarmQueueCoordinator:
             finally:
                 self._dequeue_mark_done(account_id)
 
+    async def _ttl_cleanup_loop(self) -> None:
+        check_interval = max(30, int(self.runtime.config.prewarm_scan_interval_seconds))
+        while not self._stop_event.is_set():
+            try:
+                expired_ids = [
+                    account_id
+                    for account_id in self.runtime.pool.cached_account_ids()
+                    if self.runtime.pool.is_client_expired(account_id)
+                ]
+                for account_id in expired_ids:
+                    logger.info("TTL expired for account {}, evicting and re-queuing", mask_secret(account_id))
+                    await self.runtime.pool.invalidate_client(account_id)
+                    await self.enqueue_account(account_id)
+            except Exception as exc:
+                logger.warning("TTL cleanup loop failed: {}", exc)
+            await asyncio.sleep(check_interval)
+
     # -- background thread entry point -----------------------------------------
 
     def _run_prewarm_loop(self) -> None:
@@ -521,6 +540,7 @@ class PrewarmQueueCoordinator:
             asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
             for i in range(worker_count)
         ]
+        ttl_cleanup = asyncio.create_task(self._ttl_cleanup_loop(), name="ttl-cleanup")
         logger.info(
             "Started prewarm coordinator on dedicated loop with {} consumers; target_prewarmed_accounts={}",
             worker_count,
@@ -531,9 +551,10 @@ class PrewarmQueueCoordinator:
             await asyncio.sleep(0.5)
         # Graceful shutdown of all tasks on this loop.
         producer.cancel()
+        ttl_cleanup.cancel()
         for c in consumers:
             c.cancel()
-        await asyncio.gather(producer, *consumers, return_exceptions=True)
+        await asyncio.gather(producer, ttl_cleanup, *consumers, return_exceptions=True)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -796,6 +817,7 @@ async def startup_event() -> None:
     pool = PoeClientPool(
         repo=repo,
         default_poe_revision=config.default_poe_revision,
+        client_max_age_seconds=config.client_max_age_seconds,
     )
     selector = AccountSelector(
         repo=repo,
@@ -1540,6 +1562,7 @@ async def generate_chunks(
     finally:
         _cleanup_temp_files(temp_files)
         runtime.refresher.schedule_refresh(account_id)
+        await runtime.pool.invalidate_client(account_id)
         await lease.release()
 
 
@@ -1684,6 +1707,7 @@ async def non_streaming_response(
     finally:
         _cleanup_temp_files(temp_files)
         runtime.refresher.schedule_refresh(account_id)
+        await runtime.pool.invalidate_client(account_id)
         await lease.release()
 
 
