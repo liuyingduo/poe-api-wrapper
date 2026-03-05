@@ -583,24 +583,55 @@ class AccountRepository:
 
         return await self._run(_op)
 
-    async def list_accounts_round_robin_snapshot(self, *, limit: int = 0) -> list[dict[str, Any]]:
-        """Return all accounts (or first N) in storage order for prewarm round-robin."""
+    async def fetch_accounts_sequential(
+        self,
+        *,
+        after_id: Optional[Any] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """按 _id 顺序取 active 账号，after_id 用于翻页（从头取时传 None）。"""
+        query: dict[str, Any] = {"status": "active"}
+        if after_id is not None:
+            query["_id"] = {"$gt": after_id}
 
         def _op():
-            cursor = self.accounts.find(
-                {},
-                {
-                    "_id": 1,
-                    "status": 1,
-                    "cooldown_until": 1,
-                    "message_point_balance": 1,
-                },
-            ).sort("_id", ASCENDING)
-            if limit > 0:
-                cursor = cursor.limit(limit)
-            return list(cursor)
+            return list(
+                self.accounts.find(
+                    query,
+                    {
+                        "_id": 1,
+                        "status": 1,
+                        "message_point_balance": 1,
+                        "ever_connected": 1,
+                        "cooldown_until": 1,
+                    },
+                )
+                .sort("_id", ASCENDING)
+                .limit(limit)
+            )
 
         return await self._run(_op)
+
+    async def get_used_account_balances(self) -> list[int]:
+        """返回所有 ever_connected=True 的 active 账号余额，用于计算中位数。"""
+        def _op():
+            docs = list(
+                self.accounts.find(
+                    {"ever_connected": True, "status": "active"},
+                    {"message_point_balance": 1},
+                )
+            )
+            return [int(doc.get("message_point_balance", 0) or 0) for doc in docs]
+
+        return await self._run(_op)
+
+    async def mark_account_ever_connected(self, account_id: str) -> None:
+        """标记账号已成功建立过连接。"""
+        await self._run(
+            self.accounts.update_one,
+            {"_id": self._object_id(account_id)},
+            {"$set": {"ever_connected": True, "updated_at": utc_now()}},
+        )
 
     async def list_candidate_accounts(self, limit: int = 1000) -> list[dict[str, Any]]:
         now = utc_now()
@@ -876,8 +907,22 @@ class AccountRepository:
                         "health_score": health_score,
                         "last_refresh_at": now,
                         "updated_at": now,
+                        "ever_connected": False,  # 每日重置时重置"已使用"标记
                     }
                 },
+            )
+            return int(result.modified_count)
+
+        return await self._run(_op)
+
+    async def reset_all_ever_connected(self) -> int:
+        """重置所有账号的 ever_connected 标记为 False，用于服务启动时清理状态。"""
+        now = utc_now()
+
+        def _op() -> int:
+            result = self.accounts.update_many(
+                {},  # 所有账号
+                {"$set": {"ever_connected": False, "updated_at": now}},
             )
             return int(result.modified_count)
 
@@ -1016,10 +1061,12 @@ class PoeClientPool:
         repo: AccountRepository,
         default_poe_revision: Optional[str] = None,
         client_max_age_seconds: int = 600,
+        depleted_threshold: int = 20,
     ):
         self.repo = repo
         self.default_poe_revision = (default_poe_revision or "").strip()
         self.client_max_age_seconds = client_max_age_seconds
+        self._depleted_threshold = depleted_threshold
         self._clients: dict[str, "AsyncPoeApi"] = {}
         self._client_created_at: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -1191,9 +1238,36 @@ class PoeClientPool:
         client = self._clients.pop(account_id, None)
         self._client_created_at.pop(account_id, None)
         if client:
-            await self._close_client(client)
+            await self._close_client(client, account_id=account_id)
 
-    async def _close_client(self, client: "AsyncPoeApi") -> None:
+    async def _close_client(self, client: "AsyncPoeApi", *, account_id: Optional[str] = None) -> None:
+        # 销毁前查询余额并存库
+        if account_id:
+            try:
+                settings = await client.get_settings()
+                message_info = settings.get("messagePointInfo", {})
+                subscription = settings.get("subscription", {})
+                balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+                    message_info.get("addonPointBalance", 0) or 0
+                )
+                subscription_active = bool(subscription.get("isActive", False))
+                await self.repo.update_account_health(
+                    account_id,
+                    balance=balance,
+                    subscription_active=subscription_active,
+                    depleted_threshold=self._depleted_threshold,
+                )
+                logger.info(
+                    "Client destroyed, updated balance for account {}: {}",
+                    mask_secret(account_id),
+                    balance,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch balance before closing client for account {}: {}",
+                    mask_secret(account_id),
+                    exc,
+                )
         try:
             client.disconnect_ws()
         except Exception:
@@ -1204,47 +1278,28 @@ class PoeClientPool:
             pass
 
     async def close_all(self) -> None:
-        clients = list(self._clients.values())
+        items = list(self._clients.items())
         self._clients.clear()
-        for client in clients:
-            await self._close_client(client)
+        self._client_created_at.clear()
+        for account_id, client in items:
+            await self._close_client(client, account_id=account_id)
 
 
 class AccountHealthRefresher:
     def __init__(
         self,
         repo: AccountRepository,
-        pool: PoeClientPool,
         *,
-        depleted_threshold: int,
-        refresh_interval_seconds: int,
-        recent_active_minutes: int,
-        cooldown_seconds: int,
         daily_reset_timezone: str = "America/Los_Angeles",
         daily_reset_hour: int = 0,
         daily_reset_point_balance: int = 3000,
-        invalid_auto_refresh_enabled: bool = True,
-        invalid_auto_refresh_interval_seconds: int = 900,
-        invalid_auto_refresh_batch_limit: int = 200,
-        error_threshold: int = 3,
     ):
         self.repo = repo
-        self.pool = pool
-        self.depleted_threshold = depleted_threshold
-        self.refresh_interval_seconds = refresh_interval_seconds
-        self.recent_active_minutes = recent_active_minutes
-        self.cooldown_seconds = cooldown_seconds
         self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"
         self.daily_reset_hour = max(0, min(int(daily_reset_hour), 23))
         self.daily_reset_point_balance = max(0, int(daily_reset_point_balance))
-        self.invalid_auto_refresh_enabled = bool(invalid_auto_refresh_enabled)
-        self.invalid_auto_refresh_interval_seconds = max(30, int(invalid_auto_refresh_interval_seconds))
-        self.invalid_auto_refresh_batch_limit = max(1, int(invalid_auto_refresh_batch_limit))
-        self.error_threshold = error_threshold
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
-        self._refresh_semaphore = asyncio.Semaphore(10)
-        self._scheduled_refresh_tasks: dict[str, asyncio.Task] = {}
         try:
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         except Exception:
@@ -1255,9 +1310,6 @@ class AccountHealthRefresher:
             self.daily_reset_timezone = "America/Los_Angeles"
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         self._next_daily_reset_utc = self._compute_next_daily_reset_utc()
-        self._next_invalid_auto_refresh_utc = utc_now() + timedelta(
-            seconds=self.invalid_auto_refresh_interval_seconds
-        )
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -1273,36 +1325,6 @@ class AccountHealthRefresher:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        pending_tasks = list(self._scheduled_refresh_tasks.values())
-        self._scheduled_refresh_tasks.clear()
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
-
-    def schedule_refresh(self, account_id: str) -> None:
-        account_id = str(account_id or "").strip()
-        if not account_id:
-            return
-        existing = self._scheduled_refresh_tasks.get(account_id)
-        if existing and not existing.done():
-            return
-
-        task = asyncio.create_task(self.refresh_account(account_id), name=f"refresh-account-{account_id}")
-        self._scheduled_refresh_tasks[account_id] = task
-
-        def _on_done(done_task: asyncio.Task, aid: str = account_id) -> None:
-            current = self._scheduled_refresh_tasks.get(aid)
-            if current is done_task:
-                self._scheduled_refresh_tasks.pop(aid, None)
-            try:
-                done_task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.warning("Scheduled refresh task failed for {}: {}", mask_secret(aid), exc)
-
-        task.add_done_callback(_on_done)
 
     def _compute_next_daily_reset_utc(self, now_utc: Optional[datetime] = None) -> datetime:
         now_utc = now_utc or utc_now()
@@ -1334,86 +1356,15 @@ class AccountHealthRefresher:
         )
         self._next_daily_reset_utc = self._compute_next_daily_reset_utc(now_utc + timedelta(seconds=1))
 
-    async def _run_invalid_auto_refresh_if_due(self, now_utc: datetime) -> None:
-        if not self.invalid_auto_refresh_enabled:
-            return
-        if now_utc < self._next_invalid_auto_refresh_utc:
-            return
-
-        try:
-            invalid_accounts = await self.repo.list_all_accounts_for_refresh(
-                statuses=["invalid"],
-                limit=self.invalid_auto_refresh_batch_limit,
-            )
-            if invalid_accounts:
-                logger.info(
-                    "invalid_auto_refresh: attempting {} invalid account(s)",
-                    len(invalid_accounts),
-                )
-                await asyncio.gather(
-                    *(self.refresh_account(str(account["_id"])) for account in invalid_accounts),
-                    return_exceptions=True,
-                )
-        finally:
-            self._next_invalid_auto_refresh_utc = now_utc + timedelta(
-                seconds=self.invalid_auto_refresh_interval_seconds
-            )
-
-    def _looks_like_depleted(self, error: str) -> bool:
-        lower = error.lower()
-        return any(token in lower for token in ("insufficient", "balance", "reached_limit", "402", "daily limit"))
-
-    def _looks_like_invalid(self, error: str) -> bool:
-        lower = error.lower()
-        return any(token in lower for token in ("403", "unauthorized", "invalid", "forbidden", "challenge"))
-
-    async def refresh_account(self, account_id: str) -> None:
-        async with self._refresh_semaphore:
-            account_doc = await self.repo.get_account_by_id(account_id)
-            if not account_doc:
-                return
-            try:
-                client = await self.pool.get_client(account_doc)
-                settings = await client.get_settings()
-                message_info = settings.get("messagePointInfo", {})
-                subscription = settings.get("subscription", {})
-                balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
-                    message_info.get("addonPointBalance", 0) or 0
-                )
-                subscription_active = bool(subscription.get("isActive", False))
-                await self.repo.update_account_health(
-                    account_id,
-                    balance=balance,
-                    subscription_active=subscription_active,
-                    depleted_threshold=self.depleted_threshold,
-                )
-                await self.repo.mark_account_success(account_id)
-                if balance <= self.depleted_threshold:
-                    await self.pool.invalidate_client(account_id)
-            except Exception as exc:
-                error_text = str(exc)
-                if self._looks_like_depleted(error_text):
-                    await self.repo.mark_account_depleted(account_id, error_text)
-                    await self.pool.invalidate_client(account_id)
-                    return
-                if self._looks_like_invalid(error_text):
-                    await self.repo.mark_account_invalid(account_id, error_text)
-                    await self.pool.invalidate_client(account_id)
-                    return
-                await self.repo.record_account_error(
-                    account_id,
-                    error_text,
-                    cooldown_seconds=self.cooldown_seconds,
-                    error_threshold=self.error_threshold,
-                )
-
     async def refresh_all_accounts(
         self,
         *,
         statuses: Optional[list[str]] = None,
         concurrency: int = 10,
     ) -> dict[str, Any]:
-        """Immediately refresh points for all accounts (or selected statuses)."""
+        """手动触发：通过 admin API 立即刷新所有账号积分（创建临时 client 查询后关闭）。"""
+        from poe_api_wrapper.reverse import AsyncPoeApi
+
         target_statuses = statuses or ["active", "depleted", "cooldown", "invalid"]
         all_docs = await self.repo.list_all_accounts_for_refresh(
             statuses=target_statuses,
@@ -1434,18 +1385,54 @@ class AccountHealthRefresher:
         errors: list[dict[str, str]] = []
         sem = asyncio.Semaphore(concurrency)
 
-        async def _do_refresh(account_doc: dict[str, Any]) -> None:
+        async def _do_one(account_doc: dict[str, Any]) -> None:
             nonlocal succeeded, failed
             account_id = str(account_doc["_id"])
             async with sem:
                 try:
-                    await self.refresh_account(account_id)
-                    succeeded += 1
+                    full_doc = await self.repo.get_account_by_id(account_id)
+                    if not full_doc:
+                        return
+                    creds = await self.repo.get_account_credentials(full_doc)
+                    tokens: dict[str, str] = {"p-b": creds["poe_p_b"], "cf_clearance": creds["poe_cf_clearance"]}
+                    if creds.get("poe_cf_bm"):
+                        tokens["__cf_bm"] = creds["poe_cf_bm"]
+                    if creds.get("p_lat"):
+                        tokens["p-lat"] = creds["p_lat"]
+                    if creds.get("formkey"):
+                        tokens["formkey"] = creds["formkey"]
+                    if creds.get("poe_revision"):
+                        tokens["poe-revision"] = creds["poe_revision"]
+                    client = await AsyncPoeApi(tokens=tokens).create()
+                    try:
+                        settings = await client.get_settings()
+                        message_info = settings.get("messagePointInfo", {})
+                        subscription = settings.get("subscription", {})
+                        balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+                            message_info.get("addonPointBalance", 0) or 0
+                        )
+                        subscription_active = bool(subscription.get("isActive", False))
+                        await self.repo.update_account_health(
+                            account_id,
+                            balance=balance,
+                            subscription_active=subscription_active,
+                            depleted_threshold=20,
+                        )
+                        succeeded += 1
+                    finally:
+                        try:
+                            client.disconnect_ws()
+                        except Exception:
+                            pass
+                        try:
+                            await client.client.aclose()
+                        except Exception:
+                            pass
                 except Exception as exc:
                     failed += 1
                     errors.append({"account_id": account_id, "error": str(exc)})
 
-        await asyncio.gather(*(_do_refresh(doc) for doc in all_docs), return_exceptions=True)
+        await asyncio.gather(*(_do_one(doc) for doc in all_docs), return_exceptions=True)
 
         logger.info(
             "refresh_all_accounts: done. total={} succeeded={} failed={}",
@@ -1457,14 +1444,14 @@ class AccountHealthRefresher:
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
-            "errors": errors[:50],  # Return only first 50 errors.
+            "errors": errors[:50],
         }
 
     async def _loop(self) -> None:
         while not self._stopped.is_set():
             now_utc = utc_now()
-            seconds_until_reset = max(1.0, (self._next_daily_reset_utc - now_utc).total_seconds())
-            sleep_timeout = max(1.0, min(float(self.refresh_interval_seconds), seconds_until_reset))
+            seconds_until_reset = max(60.0, (self._next_daily_reset_utc - now_utc).total_seconds())
+            sleep_timeout = min(3600.0, seconds_until_reset)
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=sleep_timeout)
                 if self._stopped.is_set():
@@ -1478,22 +1465,6 @@ class AccountHealthRefresher:
             except Exception as exc:
                 logger.warning("Daily point reset failed: {}", exc)
                 self._next_daily_reset_utc = utc_now() + timedelta(minutes=1)
-
-            recent_accounts = await self.repo.list_recent_active_accounts(
-                minutes=self.recent_active_minutes,
-                limit=200,
-            )
-            if recent_accounts:
-                await asyncio.gather(
-                    *(self.refresh_account(str(account["_id"])) for account in recent_accounts),
-                    return_exceptions=True,
-                )
-
-            try:
-                await self._run_invalid_auto_refresh_if_due(now_utc)
-            except Exception as exc:
-                logger.warning("Invalid auto refresh failed: {}", exc)
-                self._next_invalid_auto_refresh_utc = utc_now() + timedelta(minutes=1)
 
 
 class SessionManager:
@@ -1553,3 +1524,270 @@ class SessionManager:
         await self.repo.mark_session_broken(session_id, reason)
 
 
+class PoolMonitor:
+    """单一后台任务：监控 pool 中 client 数量，低于阈值时从 DB 顺序补充。
+
+    补充规则：
+    - 从 DB 按 _id 顺序扫描 active 账号
+    - 计算 ever_connected=True 账号的余额中位数
+    - 账号满足以下条件之一才建连：
+        1. ever_connected=False（从未连过）
+        2. ever_connected=True 且 balance >= 中位数
+    - 否则跳过，取下一个账号
+    - 扫完一轮后从头再来（循环）
+
+    TTL：
+    - 单独的 TTL 检查循环，每 ttl_check_interval_seconds 检查一次
+    - 超过 client_max_age_seconds 的 client 会被销毁（销毁前查余额存DB）
+    """
+
+    def __init__(
+        self,
+        repo: AccountRepository,
+        pool: PoeClientPool,
+        *,
+        target_pool_size: int = 30,
+        fill_concurrency: int = 10,
+        monitor_interval_seconds: int = 5,
+        connect_timeout_seconds: int = 20,
+        ttl_check_interval_seconds: int = 30,
+    ):
+        self.repo = repo
+        self.pool = pool
+        self.target_pool_size = max(1, target_pool_size)
+        self.fill_concurrency = max(1, fill_concurrency)
+        self.monitor_interval_seconds = max(1, monitor_interval_seconds)
+        self.connect_timeout_seconds = max(5, connect_timeout_seconds)
+        self.ttl_check_interval_seconds = max(10, ttl_check_interval_seconds)
+
+        self._stopped = asyncio.Event()
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._ttl_task: Optional[asyncio.Task] = None
+        # 记录扫描游标（上次扫到的最后一个 _id）
+        self._last_scanned_id: Optional[Any] = None
+        # 正在建连的账号 id 集合，避免重复
+        self._connecting: set[str] = set()
+        self._connecting_lock = asyncio.Lock()
+
+    def start(self) -> None:
+        if self._monitor_task and not self._monitor_task.done():
+            return
+        self._stopped.clear()
+        self._monitor_task = asyncio.create_task(self._monitor_loop(), name="pool-monitor")
+        self._ttl_task = asyncio.create_task(self._ttl_loop(), name="pool-ttl-cleanup")
+        logger.info(
+            "PoolMonitor started: target={} concurrency={} interval={}s ttl_check={}s",
+            self.target_pool_size,
+            self.fill_concurrency,
+            self.monitor_interval_seconds,
+            self.ttl_check_interval_seconds,
+        )
+
+    async def stop(self) -> None:
+        self._stopped.set()
+        for task in (self._monitor_task, self._ttl_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._monitor_task = None
+        self._ttl_task = None
+
+    async def _monitor_loop(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                await self._fill_pool()
+            except Exception as exc:
+                logger.warning("PoolMonitor fill_pool error: {}", exc)
+            try:
+                await asyncio.wait_for(
+                    self._stopped.wait(),
+                    timeout=self.monitor_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _ttl_loop(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stopped.wait(),
+                    timeout=self.ttl_check_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            if self._stopped.is_set():
+                break
+            try:
+                await self._evict_expired()
+            except Exception as exc:
+                logger.warning("PoolMonitor TTL evict error: {}", exc)
+
+    async def _evict_expired(self) -> None:
+        expired_ids = [
+            aid
+            for aid in list(self.pool.cached_account_ids())
+            if self.pool.is_client_expired(aid)
+        ]
+        if not expired_ids:
+            return
+        logger.info("PoolMonitor TTL: evicting {} expired client(s)", len(expired_ids))
+        for account_id in expired_ids:
+            try:
+                await self.pool.invalidate_client(account_id)
+            except Exception as exc:
+                logger.debug("TTL evict failed for {}: {}", mask_secret(account_id), exc)
+
+    async def _fill_pool(self) -> None:
+        current_count = len(self.pool.cached_account_ids())
+        async with self._connecting_lock:
+            in_flight = len(self._connecting)
+        deficit = self.target_pool_size - current_count - in_flight
+
+        # 每次都计算中位数（用于监控和日志）
+        import statistics
+        used_balances = await self.repo.get_used_account_balances()
+        median_balance = float(statistics.median(used_balances)) if used_balances else 0.0
+
+        logger.info(
+            "PoolMonitor: check | pool={} connecting={} deficit={} used_accounts={} median_balance={}",
+            current_count,
+            in_flight,
+            deficit,
+            len(used_balances),
+            int(median_balance),
+        )
+
+        if deficit <= 0:
+            return
+
+        enqueued = 0
+        # 最多扫 target_pool_size * 3 个账号，避免无限扫
+        max_scan = max(deficit, self.target_pool_size) * 3
+        scanned = 0
+        batch_size = max(deficit * 2, 50)
+
+        while enqueued < deficit and scanned < max_scan:
+            docs = await self.repo.fetch_accounts_sequential(
+                after_id=self._last_scanned_id,
+                limit=batch_size,
+            )
+
+            if not docs:
+                # 扫完一轮，重置游标从头再来
+                if self._last_scanned_id is not None:
+                    self._last_scanned_id = None
+                    logger.debug("PoolMonitor: full scan done, restarting from head")
+                    continue
+                else:
+                    # DB 里根本没有 active 账号
+                    break
+
+            for doc in docs:
+                scanned += 1
+                self._last_scanned_id = doc["_id"]
+
+                if enqueued >= deficit:
+                    break
+
+                account_id = str(doc["_id"])
+
+                # 跳过已在 pool 或正在建连的
+                if self.pool.has_client(account_id):
+                    continue
+                async with self._connecting_lock:
+                    if account_id in self._connecting:
+                        continue
+
+                # 检查 cooldown
+                cooldown_until = doc.get("cooldown_until")
+                now_utc = utc_now()
+                if (
+                    cooldown_until
+                    and isinstance(cooldown_until, datetime)
+                    and cooldown_until > now_utc
+                ):
+                    continue
+
+                # 中位数过滤
+                ever_connected = bool(doc.get("ever_connected", False))
+                balance = int(doc.get("message_point_balance", 0) or 0)
+                if ever_connected and balance < median_balance:
+                    continue
+
+                # 满足条件，启动建连任务
+                async with self._connecting_lock:
+                    self._connecting.add(account_id)
+                asyncio.create_task(
+                    self._connect_one(account_id),
+                    name=f"pool-connect-{account_id}",
+                )
+                enqueued += 1
+
+            if not docs or len(docs) < batch_size:
+                # 这批没取满，说明已到末尾，重置游标
+                self._last_scanned_id = None
+                break
+
+        if enqueued > 0:
+            logger.info(
+                "PoolMonitor: queued {} connect task(s); pool={}/{} median_balance={}",
+                enqueued,
+                current_count,
+                self.target_pool_size,
+                int(median_balance),
+            )
+
+    async def _connect_one(self, account_id: str) -> None:
+        try:
+            account_doc = await self.repo.get_account_by_id(account_id)
+            if not account_doc or str(account_doc.get("status", "")) != "active":
+                return
+            if self.pool.has_client(account_id):
+                return
+
+            creds = await self.repo.get_account_credentials(account_doc)
+            try:
+                client = await asyncio.wait_for(
+                    self.pool._create_client_with_fallback(account_id, creds),
+                    timeout=self.connect_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "PoolMonitor: connect timeout for account {} after {}s",
+                    mask_secret(account_id),
+                    self.connect_timeout_seconds,
+                )
+                await self.repo.record_account_error(
+                    account_id,
+                    "pool_monitor_connect_timeout",
+                    cooldown_seconds=120,
+                )
+                return
+
+            import time
+            self.pool._register_reconnect_callback(account_id, client)
+            self.pool._clients[account_id] = client
+            self.pool._client_created_at[account_id] = time.time()
+            await self.repo.mark_account_ever_connected(account_id)
+            logger.info(
+                "PoolMonitor: connected account {} | pool_size={}",
+                mask_secret(account_id),
+                len(self.pool.cached_account_ids()),
+            )
+        except Exception as exc:
+            logger.warning(
+                "PoolMonitor: connect failed for account {}: {}",
+                mask_secret(account_id),
+                exc,
+            )
+            await self.repo.record_account_error(
+                account_id,
+                f"pool_monitor_connect_error: {exc}",
+                cooldown_seconds=120,
+            )
+        finally:
+            async with self._connecting_lock:
+                self._connecting.discard(account_id)

@@ -1,21 +1,17 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import math
 import mimetypes
 import os
-import queue as thread_queue
 import re
-import statistics
 import tempfile
-import threading
-import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+from starlette.background import BackgroundTask
 
 try:
     import orjson
@@ -55,6 +51,7 @@ from .gateway import (
     CredentialCrypto,
     NoAccountAvailableError,
     PoeClientPool,
+    PoolMonitor,
     RuntimeLimiter,
     SessionManager,
     build_openai_error,
@@ -255,23 +252,18 @@ class GatewayConfig:
     max_inflight_per_account: int
     global_inflight_limit: int
     depleted_threshold: int
-    refresh_interval_seconds: int
-    recent_active_minutes: int
     cooldown_seconds: int
-    prewarm_concurrency: int
-    prewarm_max_accounts: int
-    prewarm_on_startup: bool
-    prewarm_account_timeout_seconds: int
-    prewarm_scan_interval_seconds: int
+    target_pool_size: int
+    pool_fill_concurrency: int
+    pool_monitor_interval_seconds: int
+    pool_connect_timeout_seconds: int
+    pool_ttl_check_interval_seconds: int
+    client_max_age_seconds: int
     acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
     daily_reset_hour: int
     daily_reset_point_balance: int
-    invalid_auto_refresh_enabled: bool
-    invalid_auto_refresh_interval_seconds: int
-    invalid_auto_refresh_batch_limit: int
-    client_max_age_seconds: int
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -285,23 +277,18 @@ class GatewayConfig:
             max_inflight_per_account=_env_int("MAX_INFLIGHT_PER_ACCOUNT", 2),
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
-            refresh_interval_seconds=_env_int("REFRESH_INTERVAL_SECONDS", 600),
-            recent_active_minutes=_env_int("RECENT_ACTIVE_MINUTES", 120),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
-            prewarm_concurrency=_env_int("PREWARM_CONCURRENCY", 5),
-            prewarm_max_accounts=_env_int("PREWARM_MAX_ACCOUNTS", 3000),
-            prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
-            prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
-            prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
+            target_pool_size=_env_int("TARGET_POOL_SIZE", 30),
+            pool_fill_concurrency=_env_int("POOL_FILL_CONCURRENCY", 10),
+            pool_monitor_interval_seconds=_env_int("POOL_MONITOR_INTERVAL_SECONDS", 5),
+            pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 20),
+            pool_ttl_check_interval_seconds=_env_int("POOL_TTL_CHECK_INTERVAL_SECONDS", 30),
+            client_max_age_seconds=_env_int("CLIENT_MAX_AGE_SECONDS", 600),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
             daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 3000),
-            invalid_auto_refresh_enabled=_env_bool("INVALID_AUTO_REFRESH_ENABLED", True),
-            invalid_auto_refresh_interval_seconds=_env_int("INVALID_AUTO_REFRESH_INTERVAL_SECONDS", 900),
-            invalid_auto_refresh_batch_limit=_env_int("INVALID_AUTO_REFRESH_BATCH_LIMIT", 200),
-            client_max_age_seconds=_env_int("CLIENT_MAX_AGE_SECONDS", 600),
         )
 
 
@@ -313,487 +300,8 @@ class GatewayRuntime:
     selector: AccountSelector
     pool: PoeClientPool
     refresher: AccountHealthRefresher
+    pool_monitor: PoolMonitor
     sessions: SessionManager
-
-
-class PrewarmQueueCoordinator:
-    """Dedicated prewarm loop with a DB-order round-robin queue.
-
-    Rules:
-    - Build a total queue from Mongo storage order (`_id` ASC).
-    - Only accounts with `balance >= current_median_balance` are prewarmed.
-    - Warm pool upper bound is always `PREWARM_MAX_ACCOUNTS`.
-    - Evicted/expired accounts are moved to the tail of total queue.
-    """
-
-    def __init__(self, runtime: GatewayRuntime):
-        self.runtime = runtime
-        # Cross-thread signal queue: move these accounts to total-queue tail.
-        self._tail_request_q: thread_queue.Queue[str] = thread_queue.Queue()
-        self._tail_requested_ids: set[str] = set()
-        self._tail_requested_lock = threading.Lock()
-
-        # Prewarm work queue consumed by background workers.
-        self._prewarm_q: thread_queue.Queue[str] = thread_queue.Queue()
-        self._queued_prewarm_ids: set[str] = set()
-        self._queued_prewarm_lock = threading.Lock()
-
-        self._failed_backoff_until: dict[str, float] = {}
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._prewarm_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._loop_ready = threading.Event()
-        self._target_max = max(1, int(self.runtime.config.prewarm_max_accounts))
-
-        # Round-robin snapshot (owned by prewarm loop).
-        self._round_robin_ids: deque[str] = deque()
-        self._round_robin_known: set[str] = set()
-        self._round_robin_meta: dict[str, dict[str, Any]] = {}
-        self._median_balance: float = 0.0
-
-    # -- helpers ---------------------------------------------------------------
-
-    def _target_count(self) -> int:
-        return self._target_max
-
-    def _failure_backoff_seconds(self) -> int:
-        scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
-        cooldown = max(1, int(self.runtime.config.cooldown_seconds))
-        return max(scan_interval, min(cooldown, 300))
-
-    def _cleanup_failure_backoff(self, now: float) -> None:
-        expired = [aid for aid, until in self._failed_backoff_until.items() if until <= now]
-        for aid in expired:
-            self._failed_backoff_until.pop(aid, None)
-
-    def _mark_failure_backoff(self, account_id: str) -> None:
-        self._failed_backoff_until[account_id] = time.monotonic() + self._failure_backoff_seconds()
-
-    def _clear_failure_backoff(self, account_id: str) -> None:
-        self._failed_backoff_until.pop(account_id, None)
-
-    def _in_failure_backoff(self, account_id: str, now: float) -> bool:
-        until = self._failed_backoff_until.get(account_id)
-        return bool(until and until > now)
-
-    # -- public API (called from main loop) ------------------------------------
-
-    async def enqueue_account(self, account_id: str) -> bool:
-        """Request this account to be moved to the total-queue tail."""
-        account_id = str(account_id or "").strip()
-        if not account_id:
-            return False
-        with self._tail_requested_lock:
-            if account_id in self._tail_requested_ids:
-                return False
-            self._tail_requested_ids.add(account_id)
-        self._tail_request_q.put(account_id)
-        return True
-
-    # -- queue state maintenance -----------------------------------------------
-
-    async def _sync_round_robin_snapshot(self) -> None:
-        docs = await self.runtime.repo.list_accounts_round_robin_snapshot(limit=0)
-        db_ids: list[str] = []
-        db_meta: dict[str, dict[str, Any]] = {}
-        balances: list[int] = []
-
-        for doc in docs:
-            account_id = str(doc["_id"])
-            balance = int(doc.get("message_point_balance", 0) or 0)
-            db_ids.append(account_id)
-            balances.append(balance)
-            db_meta[account_id] = {
-                "status": str(doc.get("status", "unknown")),
-                "cooldown_until": doc.get("cooldown_until"),
-                "message_point_balance": balance,
-            }
-
-        self._median_balance = float(statistics.median(balances)) if balances else 0.0
-        self._round_robin_meta = db_meta
-
-        db_set = set(db_ids)
-        if self._round_robin_ids:
-            self._round_robin_ids = deque(aid for aid in self._round_robin_ids if aid in db_set)
-        self._round_robin_known = set(self._round_robin_ids)
-
-        for account_id in db_ids:
-            if account_id not in self._round_robin_known:
-                self._round_robin_ids.append(account_id)
-                self._round_robin_known.add(account_id)
-
-    def _move_to_tail(self, account_id: str) -> bool:
-        if account_id not in self._round_robin_known:
-            if account_id not in self._round_robin_meta:
-                return False
-            self._round_robin_ids.append(account_id)
-            self._round_robin_known.add(account_id)
-            return True
-
-        try:
-            self._round_robin_ids.remove(account_id)
-        except ValueError:
-            pass
-        self._round_robin_ids.append(account_id)
-        return True
-
-    async def _drain_tail_requests(self) -> int:
-        moved = 0
-        while True:
-            try:
-                account_id = self._tail_request_q.get_nowait()
-            except thread_queue.Empty:
-                break
-
-            with self._tail_requested_lock:
-                self._tail_requested_ids.discard(account_id)
-            if self._move_to_tail(account_id):
-                moved += 1
-        return moved
-
-    async def _evict_cached_below_median(self) -> int:
-        """Evict idle prewarmed clients whose balance is below current median."""
-        cached_ids = self.runtime.pool.cached_account_ids_in_order()
-        if not cached_ids:
-            return 0
-
-        evicted = 0
-        for account_id in cached_ids:
-            meta = self._round_robin_meta.get(account_id)
-            if not meta:
-                continue
-            balance = int(meta.get("message_point_balance", 0) or 0)
-            if balance >= self._median_balance:
-                continue
-
-            await self.runtime.limiter.block_account(account_id)
-            try:
-                # Do not interrupt in-flight requests; retry in next scan.
-                inflight = await self.runtime.limiter.inflight_for(account_id)
-                if inflight > 0:
-                    continue
-                await self.runtime.pool.invalidate_client(account_id)
-                self._move_to_tail(account_id)
-                evicted += 1
-            except Exception as exc:
-                logger.debug(
-                    "Evict-below-median failed for {}: {}",
-                    mask_secret(account_id),
-                    exc,
-                )
-            finally:
-                await self.runtime.limiter.unblock_account(account_id)
-
-        if evicted > 0:
-            logger.info(
-                "Evicted {} prewarmed account(s) below median balance (median_balance={})",
-                evicted,
-                int(self._median_balance),
-            )
-        return evicted
-
-    def _enqueue_prewarm_job(self, account_id: str) -> bool:
-        cached_count = len(self.runtime.pool.cached_account_ids())
-        with self._queued_prewarm_lock:
-            if account_id in self._queued_prewarm_ids:
-                return False
-            if (cached_count + len(self._queued_prewarm_ids)) >= self._target_count():
-                return False
-            self._queued_prewarm_ids.add(account_id)
-        self._prewarm_q.put(account_id)
-        return True
-
-    def _mark_prewarm_done(self, account_id: str) -> None:
-        with self._queued_prewarm_lock:
-            self._queued_prewarm_ids.discard(account_id)
-
-    # -- prewarm logic (runs on background loop) -------------------------------
-
-    async def _prewarm_account(self, account_id: str) -> None:
-        if self.runtime.pool.has_client(account_id):
-            self._clear_failure_backoff(account_id)
-            return
-        account_doc = await self.runtime.repo.get_account_by_id(account_id)
-        if not account_doc:
-            return
-        if str(account_doc.get("status", "active")) != "active":
-            return
-        client = None
-        stored_in_pool = False
-        try:
-            creds = await self.runtime.repo.get_account_credentials(account_doc)
-            client = await asyncio.wait_for(
-                self.runtime.pool._create_client_with_fallback(account_id, creds),
-                timeout=max(1, self.runtime.config.prewarm_account_timeout_seconds),
-            )
-
-            # -- Refresh account points right after successful connection ------
-            balance = None
-            try:
-                settings = await client.get_settings()
-                message_info = settings.get("messagePointInfo", {})
-                subscription = settings.get("subscription", {})
-                balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
-                    message_info.get("addonPointBalance", 0) or 0
-                )
-                subscription_active = bool(subscription.get("isActive", False))
-                await self.runtime.repo.update_account_health(
-                    account_id,
-                    balance=balance,
-                    subscription_active=subscription_active,
-                    depleted_threshold=self.runtime.config.depleted_threshold,
-                )
-                await self.runtime.repo.mark_account_success(account_id)
-                logger.info(
-                    "Prewarmed account {} (background loop) | balance={}",
-                    mask_secret(account_id),
-                    balance,
-                )
-                # If account is depleted after refresh, evict immediately
-                if balance <= self.runtime.config.depleted_threshold:
-                    logger.warning(
-                        "Prewarmed account {} has insufficient balance ({}), evicting",
-                        mask_secret(account_id),
-                        balance,
-                    )
-                    await self.runtime.pool.invalidate_client(account_id)
-            except Exception as points_exc:
-                logger.warning(
-                    "Prewarmed account {} connected but failed to refresh points: {}",
-                    mask_secret(account_id),
-                    points_exc,
-                )
-                # Still keep the client in the pool; points refresh is best-effort
-
-            if balance is not None and balance <= self.runtime.config.depleted_threshold:
-                logger.warning(
-                    "Prewarmed account {} has insufficient balance ({}), skipping cache",
-                    mask_secret(account_id),
-                    balance,
-                )
-                await self.runtime.pool._close_client(client)
-                client = None
-                self._clear_failure_backoff(account_id)
-                return
-
-            # Important: migrate only after all prewarm-loop async operations are done.
-            # This prevents rebinding the rebuilt httpx client back to the prewarm loop.
-            client.migrate_to_loop(self._main_loop)
-            self.runtime.pool.store_prewarmed_client(account_id, client)
-            stored_in_pool = True
-            self._clear_failure_backoff(account_id)
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Prewarm timed out for account {} after {}s",
-                mask_secret(account_id),
-                self.runtime.config.prewarm_account_timeout_seconds,
-            )
-            self._mark_failure_backoff(account_id)
-        except Exception as exc:
-            logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
-            self._mark_failure_backoff(account_id)
-            await self.runtime.repo.record_account_error(
-                account_id,
-                f"prewarm_error: {exc}",
-                cooldown_seconds=self.runtime.config.cooldown_seconds,
-            )
-        finally:
-            if client is not None and not stored_in_pool:
-                try:
-                    await self.runtime.pool._close_client(client)
-                except Exception:
-                    pass
-
-    async def _producer_loop(self) -> None:
-        scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
-        while not self._stop_event.is_set():
-            try:
-                await self._sync_round_robin_snapshot()
-                moved = await self._drain_tail_requests()
-                if moved > 0:
-                    logger.info("Prewarm total-queue moved {} account(s) to tail", moved)
-                await self._evict_cached_below_median()
-
-                target_count = self._target_count()
-                cached_count = len(self.runtime.pool.cached_account_ids())
-                with self._queued_prewarm_lock:
-                    queued_count = len(self._queued_prewarm_ids)
-                deficit = target_count - cached_count - queued_count
-                if deficit <= 0:
-                    await asyncio.sleep(scan_interval)
-                    continue
-
-                if not self._round_robin_ids:
-                    await asyncio.sleep(scan_interval)
-                    continue
-
-                now_utc = utc_now()
-                now = time.monotonic()
-                self._cleanup_failure_backoff(now)
-
-                enqueue_count = 0
-                scan_budget = len(self._round_robin_ids)
-                for _ in range(scan_budget):
-                    if enqueue_count >= deficit:
-                        break
-                    account_id = self._round_robin_ids[0]
-                    self._round_robin_ids.rotate(-1)
-
-                    if self.runtime.pool.has_client(account_id):
-                        continue
-                    if self._in_failure_backoff(account_id, now):
-                        continue
-
-                    meta = self._round_robin_meta.get(account_id)
-                    if not meta:
-                        continue
-                    if meta.get("status") != "active":
-                        continue
-
-                    cooldown_until = meta.get("cooldown_until")
-                    in_cooldown = bool(
-                        cooldown_until
-                        and isinstance(cooldown_until, datetime)
-                        and cooldown_until > now_utc
-                    )
-                    if in_cooldown:
-                        continue
-
-                    balance = int(meta.get("message_point_balance", 0) or 0)
-                    if balance < self._median_balance:
-                        continue
-
-                    if self._enqueue_prewarm_job(account_id):
-                        enqueue_count += 1
-
-                if enqueue_count > 0:
-                    logger.info(
-                        "Prewarm producer queued {} account(s); target={} cached={} queued={} median_balance={}",
-                        enqueue_count,
-                        target_count,
-                        cached_count,
-                        queued_count + enqueue_count,
-                        int(self._median_balance),
-                    )
-            except Exception as exc:
-                logger.warning("Prewarm producer loop failed: {}", exc)
-
-            await asyncio.sleep(scan_interval)
-
-    async def _consumer_loop(self, worker_idx: int) -> None:
-        loop = asyncio.get_running_loop()
-        while not self._stop_event.is_set():
-            # Poll the thread-safe queue with a timeout so we can check the
-            # stop event periodically.
-            try:
-                account_id = await loop.run_in_executor(
-                    None, lambda: self._prewarm_q.get(timeout=1.0),
-                )
-            except thread_queue.Empty:
-                continue
-            except asyncio.CancelledError:
-                break
-            try:
-                if (
-                    not self.runtime.pool.has_client(account_id)
-                    and len(self.runtime.pool.cached_account_ids()) < self._target_count()
-                ):
-                    await self._prewarm_account(account_id)
-            except Exception as exc:
-                logger.warning("Prewarm consumer {} unexpected error: {}", worker_idx, exc)
-            finally:
-                self._mark_prewarm_done(account_id)
-
-    async def _ttl_cleanup_loop(self) -> None:
-        check_interval = max(30, int(self.runtime.config.prewarm_scan_interval_seconds))
-        while not self._stop_event.is_set():
-            try:
-                expired_ids = [
-                    account_id
-                    for account_id in self.runtime.pool.cached_account_ids()
-                    if self.runtime.pool.is_client_expired(account_id)
-                ]
-                for account_id in expired_ids:
-                    logger.info("TTL expired for account {}, evicting and re-queuing", mask_secret(account_id))
-                    await self.runtime.pool.invalidate_client(account_id)
-                    await self.enqueue_account(account_id)
-            except Exception as exc:
-                logger.warning("TTL cleanup loop failed: {}", exc)
-            await asyncio.sleep(check_interval)
-
-    # -- background thread entry point -----------------------------------------
-
-    def _run_prewarm_loop(self) -> None:
-        """Thread target: create and run a dedicated asyncio event loop."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._prewarm_loop = loop
-        self._loop_ready.set()
-        try:
-            loop.run_until_complete(self._prewarm_main())
-        except Exception:
-            logger.exception("Prewarm background loop crashed")
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            loop.close()
-            self._prewarm_loop = None
-
-    async def _prewarm_main(self) -> None:
-        worker_count = max(1, int(self.runtime.config.prewarm_concurrency))
-        producer = asyncio.create_task(self._producer_loop(), name="prewarm-producer")
-        consumers = [
-            asyncio.create_task(self._consumer_loop(i + 1), name=f"prewarm-consumer-{i + 1}")
-            for i in range(worker_count)
-        ]
-        ttl_cleanup = asyncio.create_task(self._ttl_cleanup_loop(), name="ttl-cleanup")
-        logger.info(
-            "Started prewarm coordinator with {} consumers; fixed_target={} scan_interval={}s",
-            worker_count,
-            self._target_count(),
-            max(1, int(self.runtime.config.prewarm_scan_interval_seconds)),
-        )
-        # Block until the coordinator is asked to stop.
-        while not self._stop_event.is_set():
-            await asyncio.sleep(0.5)
-        # Graceful shutdown of all tasks on this loop.
-        producer.cancel()
-        ttl_cleanup.cancel()
-        for c in consumers:
-            c.cancel()
-        await asyncio.gather(producer, ttl_cleanup, *consumers, return_exceptions=True)
-
-    # -- lifecycle -------------------------------------------------------------
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._main_loop = asyncio.get_running_loop()
-        self._stop_event.clear()
-        self._loop_ready.clear()
-        self._thread = threading.Thread(
-            target=self._run_prewarm_loop,
-            daemon=True,
-            name="prewarm-loop-thread",
-        )
-        self._thread.start()
-        # Wait for the background loop to be ready (up to 5 s).
-        self._loop_ready.wait(timeout=5.0)
-        logger.info("Prewarm background thread started")
-
-    async def stop(self) -> None:
-        self._stop_event.set()
-        thread = self._thread
-        if thread and thread.is_alive():
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: thread.join(timeout=15),
-            )
-        self._thread = None
-        self._prewarm_loop = None
 
 
 with (DIR / "models.json").open("rb") as f:
@@ -969,7 +477,6 @@ async def _finalize_account_use(
     persistent_session: bool = False,
     success: bool = False,
     error_decision: Optional[AccountErrorDecision] = None,
-    schedule_refresh: bool = True,
     evict_client: bool = True,
     release_lease: bool = True,
 ) -> None:
@@ -998,8 +505,6 @@ async def _finalize_account_use(
                 cooldown_seconds=runtime.config.cooldown_seconds,
             )
 
-    if schedule_refresh:
-        runtime.refresher.schedule_refresh(account_id)
     if evict_client:
         await runtime.pool.invalidate_client(account_id)
     if lease and release_lease:
@@ -1044,26 +549,28 @@ async def startup_event() -> None:
         repo=repo,
         default_poe_revision=config.default_poe_revision,
         client_max_age_seconds=config.client_max_age_seconds,
+        depleted_threshold=config.depleted_threshold,
     )
     selector = AccountSelector(
         repo=repo,
         limiter=limiter,
         pool=pool,
-        top_n=max(1, int(config.prewarm_max_accounts)),
+        top_n=max(1, int(config.target_pool_size)),
     )
     refresher = AccountHealthRefresher(
         repo=repo,
-        pool=pool,
-        depleted_threshold=config.depleted_threshold,
-        refresh_interval_seconds=config.refresh_interval_seconds,
-        recent_active_minutes=config.recent_active_minutes,
-        cooldown_seconds=config.cooldown_seconds,
         daily_reset_timezone=config.daily_reset_timezone,
         daily_reset_hour=config.daily_reset_hour,
         daily_reset_point_balance=config.daily_reset_point_balance,
-        invalid_auto_refresh_enabled=config.invalid_auto_refresh_enabled,
-        invalid_auto_refresh_interval_seconds=config.invalid_auto_refresh_interval_seconds,
-        invalid_auto_refresh_batch_limit=config.invalid_auto_refresh_batch_limit,
+    )
+    pool_monitor = PoolMonitor(
+        repo=repo,
+        pool=pool,
+        target_pool_size=config.target_pool_size,
+        fill_concurrency=config.pool_fill_concurrency,
+        monitor_interval_seconds=config.pool_monitor_interval_seconds,
+        connect_timeout_seconds=config.pool_connect_timeout_seconds,
+        ttl_check_interval_seconds=config.pool_ttl_check_interval_seconds,
     )
     sessions = SessionManager(repo=repo)
 
@@ -1074,32 +581,26 @@ async def startup_event() -> None:
         selector=selector,
         pool=pool,
         refresher=refresher,
+        pool_monitor=pool_monitor,
         sessions=sessions,
     )
     app.state.runtime = runtime
 
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
+
+    # 服务启动时重置所有账号的"已使用"标记，让所有账号从未使用状态开始
+    reset_count = await repo.reset_all_ever_connected()
+    logger.info(
+        "Gateway startup: reset {} accounts to 'unused' state (ever_connected=False)",
+        reset_count,
+    )
+
     refresher.start()
-    app.state.prewarm_coordinator = None
+    pool_monitor.start()
     # Let the pool know about the main loop so reconnect-exhaustion callbacks
     # can schedule cleanup coroutines on it.
     pool._main_loop = asyncio.get_running_loop()
-    if config.prewarm_on_startup:
-        prewarm_coordinator = PrewarmQueueCoordinator(runtime)
-        prewarm_coordinator.start()
-        app.state.prewarm_coordinator = prewarm_coordinator
-
-        # When a client is evicted after reconnect exhaustion,
-        # re-enqueue it for prewarm automatically.
-        async def _on_pool_evict(account_id: str) -> None:
-            coord = getattr(app.state, "prewarm_coordinator", None)
-            if coord:
-                await coord.enqueue_account(account_id)
-
-        pool._on_evict_callback = _on_pool_evict
-    else:
-        logger.info("Startup prewarm disabled (PREWARM_ON_STARTUP=false)")
     logger.info("Gateway startup complete")
 
 
@@ -1108,9 +609,7 @@ async def shutdown_event() -> None:
     runtime = getattr(app.state, "runtime", None)
     if not runtime:
         return
-    prewarm_coordinator = getattr(app.state, "prewarm_coordinator", None)
-    if prewarm_coordinator:
-        await prewarm_coordinator.stop()
+    await runtime.pool_monitor.stop()
     await runtime.refresher.stop()
     await runtime.pool.close_all()
     await runtime.repo.close()
@@ -1229,14 +728,10 @@ async def admin_upsert_account(data: AccountUpsertData) -> JSONResponse:
     account_id = str(account.get("id", "")).strip()
     if account_id:
         await runtime.pool.invalidate_client(account_id)
-        prewarm_coordinator = getattr(app.state, "prewarm_coordinator", None)
-        if prewarm_coordinator:
-            queued = await prewarm_coordinator.enqueue_account(account_id)
-            if queued:
-                logger.info(
-                    "Queued account {} for async prewarm after upsert",
-                    mask_secret(account_id),
-                )
+        logger.info(
+            "Account {} upserted, PoolMonitor will warm it on next cycle if needed",
+            mask_secret(account_id),
+        )
     logger.info(
         "Upserted account email={} p_b={} cf_clearance={}",
         data.email,
@@ -1520,8 +1015,8 @@ def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
             width = int(parts[0])
             height = int(parts[1])
             if width > 0 and height > 0:
-                gcd = math.gcd(width, height)
-                return f"--aspect {width // gcd}:{height // gcd}"
+                gcd_value = math.gcd(width, height)
+                return f"--aspect {width // gcd_value}:{height // gcd_value}"
 
     supported_sizes = ["auto", "1024x1024"]
     if isinstance(model_sizes, dict):
@@ -1699,13 +1194,12 @@ async def generate_chunks(
     persistent_session: bool,
     account_id: str,
     lease: AccountLease,
+    shared_state: dict[str, Any],  # 用于与 BackgroundTask 共享执行结果
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
     emitted_done = False
     completion_tokens = 0
     finish_reason = "stop"
-    succeeded = False
-    error_decision: Optional[AccountErrorDecision] = None
     try:
         if not raw_tool_calls:
             async for chunk in client.send_message(
@@ -1774,7 +1268,7 @@ async def generate_chunks(
 
         yield b"data: [DONE]\n\n"
         emitted_done = True
-        succeeded = True
+        shared_state["succeeded"] = True  # 标记成功，供 BackgroundTask 使用
     except asyncio.CancelledError:
         # Client closed the streaming connection; avoid noisy ASGI stack traces.
         pass
@@ -1785,22 +1279,11 @@ async def generate_chunks(
             persistent_session=persistent_session,
             exc=exc,
         )
+        shared_state["error_decision"] = error_decision  # 保存错误决策，供 BackgroundTask 使用
         yield b"data: " + orjson.dumps(error_decision.payload) + b"\n\n"
         if not emitted_done:
             yield b"data: [DONE]\n\n"
-    finally:
-        _cleanup_temp_files(temp_files)
-        await _finalize_account_use(
-            runtime,
-            account_id=account_id,
-            lease=lease,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            success=succeeded,
-            error_decision=error_decision,
-            schedule_refresh=True,
-            evict_client=True,
-        )
+    # 注意：清理逻辑（_finalize_account_use + _cleanup_temp_files）已移到 BackgroundTask 中
 
 
 async def streaming_response(
@@ -1823,6 +1306,25 @@ async def streaming_response(
     account_id: str,
     lease: AccountLease,
 ) -> StreamingResponse:
+
+    # 用于在生成器和后台任务间共享执行结果
+    shared_state = {"succeeded": False, "error_decision": None}
+
+    # 定义后台清理任务，在流式响应彻底结束后必定执行
+    async def cleanup_task():
+        _cleanup_temp_files(temp_files)
+        # 销毁 client 并释放 lease
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=shared_state["succeeded"],
+            error_decision=shared_state["error_decision"],
+            evict_client=True,  # 强制销毁
+        )
+
     return StreamingResponse(
         content=generate_chunks(
             runtime=runtime,
@@ -1842,9 +1344,11 @@ async def streaming_response(
             persistent_session=persistent_session,
             account_id=account_id,
             lease=lease,
+            shared_state=shared_state,  # 传入共享状态
         ),
         status_code=200,
         headers={"Content-Type": "text/event-stream", "X-Request-ID": str(uuid.uuid4())},
+        background=BackgroundTask(cleanup_task)  # 绑定后台清理任务
     )
 
 
@@ -1958,7 +1462,6 @@ async def non_streaming_response(
             persistent_session=persistent_session,
             success=succeeded,
             error_decision=error_decision,
-            schedule_refresh=True,
             evict_client=True,
         )
 
@@ -2077,17 +1580,22 @@ async def _chat_completions_impl(
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
+    # Premium model 检查：如果需要 subscription 但账号没有，直接拒绝
     if premium_model and not bool(account_doc.get("subscription_active", False)):
-        await runtime.refresher.refresh_account(account_id)
-        refreshed = await runtime.repo.get_account_by_id(account_id)
-        if not refreshed or not refreshed.get("subscription_active", False):
-            await lease.release()
-            _openai_http_error(
-                402,
-                "insufficient_credits",
-                "Premium model requires an active subscription on selected account",
-            )
-        account_doc = refreshed
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=False,
+            evict_client=True,
+        )
+        _openai_http_error(
+            402,
+            "insufficient_credits",
+            "Premium model requires an active subscription on selected account",
+        )
 
     try:
         client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
@@ -2106,7 +1614,6 @@ async def _chat_completions_impl(
             persistent_session=persistent_session,
             success=False,
             error_decision=error_decision,
-            schedule_refresh=False,
             evict_client=True,
         )
         raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
@@ -2116,14 +1623,30 @@ async def _chat_completions_impl(
     prompt_tokens = await helpers.__tokenize("".join([str(message) for message in response["message"]]))
 
     if prompt_tokens > tokens_limit:
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=False,
+            evict_client=True,
+        )
         _openai_http_error(
             413,
             "request_too_large",
             f"Your prompt exceeds the maximum context length of {tokens_limit} tokens",
         )
     if max_tokens and (max_tokens + prompt_tokens) > tokens_limit:
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=False,
+            evict_client=True,
+        )
         _openai_http_error(
             413,
             "request_too_large",
@@ -2148,10 +1671,26 @@ async def _chat_completions_impl(
         try:
             attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
         except HTTPException:
-            await lease.release()
+            await _finalize_account_use(
+                runtime,
+                account_id=account_id,
+                lease=lease,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                success=False,
+                evict_client=True,
+            )
             raise
         except Exception as exc:
-            await lease.release()
+            await _finalize_account_use(
+                runtime,
+                account_id=account_id,
+                lease=lease,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                success=False,
+                evict_client=True,
+            )
             _openai_http_error(
                 400,
                 "invalid_request_error",
@@ -2232,7 +1771,15 @@ async def create_images(
     request.state.account_id = account_id
 
     if premium_model and not bool(account_doc.get("subscription_active", False)):
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id="ephemeral",
+            persistent_session=False,
+            success=False,
+            evict_client=True,
+        )
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
     succeeded = False
@@ -2285,7 +1832,6 @@ async def create_images(
             persistent_session=False,
             success=succeeded,
             error_decision=error_decision,
-            schedule_refresh=True,
             evict_client=True,
         )
 
@@ -2361,7 +1907,15 @@ async def edit_images(
     request.state.account_id = account_id
 
     if premium_model and not bool(account_doc.get("subscription_active", False)):
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id="ephemeral",
+            persistent_session=False,
+            success=False,
+            evict_client=True,
+        )
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
     edit_attachment = image
@@ -2442,7 +1996,6 @@ async def edit_images(
             persistent_session=False,
             success=succeeded,
             error_decision=error_decision,
-            schedule_refresh=True,
             evict_client=True,
         )
 
