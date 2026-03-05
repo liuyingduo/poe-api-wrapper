@@ -859,20 +859,25 @@ def _is_provider_timeout_error(error_text: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class AccountErrorDecision:
+    payload: dict[str, Any]
+    status_code: int
+    kind: str
+    error_text: str
+
+
 async def _account_error_payload(
-    runtime: GatewayRuntime,
+    *,
     account_id: str,
     session_id: str,
     persistent_session: bool,
     exc: Exception,
-) -> tuple[dict[str, Any], int]:
+) -> AccountErrorDecision:
     error_text = _exception_summary(exc)
     metadata = {"session_id": session_id, "account_id": account_id}
     if _is_depleted_error(error_text):
-        await runtime.repo.mark_account_depleted(account_id, error_text)
-        await runtime.pool.invalidate_client(account_id)
         if persistent_session:
-            await runtime.sessions.break_session(session_id, "bound account is depleted")
             message = "Bound account has no remaining points. Create a new session_id and retry."
         else:
             message = "Insufficient credits on selected account."
@@ -882,13 +887,15 @@ async def _account_error_payload(
             session_id,
             error_text,
         )
-        return build_openai_error(402, "insufficient_credits", message, metadata), 402
+        return AccountErrorDecision(
+            payload=build_openai_error(402, "insufficient_credits", message, metadata),
+            status_code=402,
+            kind="depleted",
+            error_text=error_text,
+        )
 
     if _is_invalid_error(error_text):
-        await runtime.repo.mark_account_invalid(account_id, error_text)
-        await runtime.pool.invalidate_client(account_id)
         if persistent_session:
-            await runtime.sessions.break_session(session_id, "bound account is invalid")
             message = "Bound account became invalid. Create a new session_id and retry."
         else:
             message = "Selected account failed authorization."
@@ -898,16 +905,14 @@ async def _account_error_payload(
             session_id,
             error_text,
         )
-        return build_openai_error(403, "authentication_error", message, metadata), 403
+        return AccountErrorDecision(
+            payload=build_openai_error(403, "authentication_error", message, metadata),
+            status_code=403,
+            kind="invalid",
+            error_text=error_text,
+        )
 
     if _is_provider_timeout_error(error_text):
-        await runtime.pool.invalidate_client(account_id)
-        await runtime.repo.record_account_error(
-            account_id,
-            error_text,
-            cooldown_seconds=runtime.config.cooldown_seconds,
-            error_threshold=2,
-        )
         logger.warning(
             "provider_error_classified status=504 type=provider_timeout_error account_id={} session_id={} "
             "evicted_client=true detail={}",
@@ -915,42 +920,90 @@ async def _account_error_payload(
             session_id,
             error_text,
         )
-        return (
-            build_openai_error(
+        return AccountErrorDecision(
+            payload=build_openai_error(
                 504,
                 "provider_timeout_error",
                 "Provider timeout while waiting for Poe response. Retry with backoff.",
                 metadata,
             ),
-            504,
+            status_code=504,
+            kind="provider_timeout",
+            error_text=error_text,
         )
 
     if _is_rate_limit_error(error_text):
-        await runtime.repo.record_account_error(
-            account_id,
-            error_text,
-            cooldown_seconds=runtime.config.cooldown_seconds,
-        )
         logger.warning(
             "provider_error_classified status=429 type=rate_limit_error account_id={} session_id={} detail={}",
             mask_secret(account_id),
             session_id,
             error_text,
         )
-        return build_openai_error(429, "rate_limit_error", "Rate limit reached. Retry with backoff.", metadata), 429
+        return AccountErrorDecision(
+            payload=build_openai_error(429, "rate_limit_error", "Rate limit reached. Retry with backoff.", metadata),
+            status_code=429,
+            kind="rate_limit",
+            error_text=error_text,
+        )
 
-    await runtime.repo.record_account_error(
-        account_id,
-        error_text,
-        cooldown_seconds=runtime.config.cooldown_seconds,
-    )
     logger.error(
         "provider_error_classified status=500 type=provider_error account_id={} session_id={} detail={}",
         mask_secret(account_id),
         session_id,
         error_text,
     )
-    return build_openai_error(500, "provider_error", f"Provider error: {error_text}", metadata), 500
+    return AccountErrorDecision(
+        payload=build_openai_error(500, "provider_error", f"Provider error: {error_text}", metadata),
+        status_code=500,
+        kind="provider_error",
+        error_text=error_text,
+    )
+
+
+async def _finalize_account_use(
+    runtime: GatewayRuntime,
+    *,
+    account_id: str,
+    lease: Optional[AccountLease] = None,
+    session_id: str = "ephemeral",
+    persistent_session: bool = False,
+    success: bool = False,
+    error_decision: Optional[AccountErrorDecision] = None,
+    schedule_refresh: bool = True,
+    evict_client: bool = True,
+    release_lease: bool = True,
+) -> None:
+    if success:
+        await runtime.repo.mark_account_success(account_id)
+    elif error_decision:
+        if error_decision.kind == "depleted":
+            await runtime.repo.mark_account_depleted(account_id, error_decision.error_text)
+            if persistent_session:
+                await runtime.sessions.break_session(session_id, "bound account is depleted")
+        elif error_decision.kind == "invalid":
+            await runtime.repo.mark_account_invalid(account_id, error_decision.error_text)
+            if persistent_session:
+                await runtime.sessions.break_session(session_id, "bound account is invalid")
+        elif error_decision.kind == "provider_timeout":
+            await runtime.repo.record_account_error(
+                account_id,
+                error_decision.error_text,
+                cooldown_seconds=runtime.config.cooldown_seconds,
+                error_threshold=2,
+            )
+        elif error_decision.kind in {"rate_limit", "provider_error"}:
+            await runtime.repo.record_account_error(
+                account_id,
+                error_decision.error_text,
+                cooldown_seconds=runtime.config.cooldown_seconds,
+            )
+
+    if schedule_refresh:
+        runtime.refresher.schedule_refresh(account_id)
+    if evict_client:
+        await runtime.pool.invalidate_client(account_id)
+    if lease and release_lease:
+        await lease.release()
 
 
 async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
@@ -1627,10 +1680,6 @@ async def create_completion_data(
     return completion_data.model_dump()
 
 
-async def _finalize_success(runtime: GatewayRuntime, account_id: str) -> None:
-    await runtime.repo.mark_account_success(account_id)
-
-
 async def generate_chunks(
     *,
     runtime: GatewayRuntime,
@@ -1655,6 +1704,8 @@ async def generate_chunks(
     emitted_done = False
     completion_tokens = 0
     finish_reason = "stop"
+    succeeded = False
+    error_decision: Optional[AccountErrorDecision] = None
     try:
         if not raw_tool_calls:
             async for chunk in client.send_message(
@@ -1723,20 +1774,33 @@ async def generate_chunks(
 
         yield b"data: [DONE]\n\n"
         emitted_done = True
-        await _finalize_success(runtime, account_id)
+        succeeded = True
     except asyncio.CancelledError:
         # Client closed the streaming connection; avoid noisy ASGI stack traces.
         pass
     except Exception as exc:
-        payload, _ = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
-        yield b"data: " + orjson.dumps(payload) + b"\n\n"
+        error_decision = await _account_error_payload(
+            account_id=account_id,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            exc=exc,
+        )
+        yield b"data: " + orjson.dumps(error_decision.payload) + b"\n\n"
         if not emitted_done:
             yield b"data: [DONE]\n\n"
     finally:
         _cleanup_temp_files(temp_files)
-        runtime.refresher.schedule_refresh(account_id)
-        await runtime.pool.invalidate_client(account_id)
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=succeeded,
+            error_decision=error_decision,
+            schedule_refresh=True,
+            evict_client=True,
+        )
 
 
 async def streaming_response(
@@ -1803,6 +1867,8 @@ async def non_streaming_response(
     account_id: str,
     lease: AccountLease,
 ) -> JSONResponse:
+    succeeded = False
+    error_decision: Optional[AccountErrorDecision] = None
     try:
         if not raw_tool_calls:
             finish_reason = "stop"
@@ -1872,16 +1938,29 @@ async def non_streaming_response(
                 )
             ],
         )
-        await _finalize_success(runtime, account_id)
+        succeeded = True
         return JSONResponse(content.model_dump())
     except Exception as exc:
-        payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
-        raise HTTPException(status_code=status, detail=payload)
+        error_decision = await _account_error_payload(
+            account_id=account_id,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            exc=exc,
+        )
+        raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
     finally:
         _cleanup_temp_files(temp_files)
-        runtime.refresher.schedule_refresh(account_id)
-        await runtime.pool.invalidate_client(account_id)
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=succeeded,
+            error_decision=error_decision,
+            schedule_refresh=True,
+            evict_client=True,
+        )
 
 
 async def _acquire_account_for_chat(
@@ -2013,9 +2092,24 @@ async def _chat_completions_impl(
     try:
         client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
     except Exception as exc:
-        payload, status = await _account_error_payload(runtime, account_id, session_id, persistent_session, exc)
-        await lease.release()
-        raise HTTPException(status_code=status, detail=payload)
+        error_decision = await _account_error_payload(
+            account_id=account_id,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            exc=exc,
+        )
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id=session_id,
+            persistent_session=persistent_session,
+            success=False,
+            error_decision=error_decision,
+            schedule_refresh=False,
+            evict_client=True,
+        )
+        raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
 
     text_messages, image_urls = await helpers.__split_content(messages)
     response = await message_handler(base_model, text_messages, tokens_limit)
@@ -2141,6 +2235,8 @@ async def create_images(
         await lease.release()
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
+    succeeded = False
+    error_decision: Optional[AccountErrorDecision] = None
     try:
         client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
         response = await image_handler(base_model, prompt, tokens_limit)
@@ -2166,19 +2262,32 @@ async def create_images(
                 if not content_type.startswith("image/"):
                     _openai_http_error(500, "provider_error", "The content returned was not an image")
 
-        await _finalize_success(runtime, account_id)
+        succeeded = True
         return JSONResponse(
             {"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]}
         )
     except HTTPException:
         raise
     except Exception as exc:
-        payload, status = await _account_error_payload(runtime, account_id, "ephemeral", False, exc)
-        raise HTTPException(status_code=status, detail=payload)
+        error_decision = await _account_error_payload(
+            account_id=account_id,
+            session_id="ephemeral",
+            persistent_session=False,
+            exc=exc,
+        )
+        raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
     finally:
-        runtime.refresher.schedule_refresh(account_id)
-        await runtime.pool.invalidate_client(account_id)
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id="ephemeral",
+            persistent_session=False,
+            success=succeeded,
+            error_decision=error_decision,
+            schedule_refresh=True,
+            evict_client=True,
+        )
 
 
 @app.api_route("/images/edits", methods=["POST", "OPTIONS"], response_model=None)
@@ -2257,6 +2366,8 @@ async def edit_images(
 
     edit_attachment = image
     edit_temp_files: List[str] = []
+    succeeded = False
+    error_decision: Optional[AccountErrorDecision] = None
     try:
         if isinstance(image, (UploadFile, StarletteUploadFile)):
             suffix = Path(image.filename or "").suffix
@@ -2307,20 +2418,33 @@ async def edit_images(
                 if not content_type.startswith("image/"):
                     _openai_http_error(500, "provider_error", "The content returned was not an image")
 
-        await _finalize_success(runtime, account_id)
+        succeeded = True
         return JSONResponse(
             {"created": await helpers.__generate_timestamp(), "data": [{"url": url} for url in urls]}
         )
     except HTTPException:
         raise
     except Exception as exc:
-        payload, status = await _account_error_payload(runtime, account_id, "ephemeral", False, exc)
-        raise HTTPException(status_code=status, detail=payload)
+        error_decision = await _account_error_payload(
+            account_id=account_id,
+            session_id="ephemeral",
+            persistent_session=False,
+            exc=exc,
+        )
+        raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
     finally:
         _cleanup_temp_files(edit_temp_files)
-        runtime.refresher.schedule_refresh(account_id)
-        await runtime.pool.invalidate_client(account_id)
-        await lease.release()
+        await _finalize_account_use(
+            runtime,
+            account_id=account_id,
+            lease=lease,
+            session_id="ephemeral",
+            persistent_session=False,
+            success=succeeded,
+            error_decision=error_decision,
+            schedule_refresh=True,
+            evict_client=True,
+        )
 
 
 def _normalize_responses_input(input_data: Any) -> list[dict[str, Any]]:

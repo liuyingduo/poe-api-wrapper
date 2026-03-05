@@ -1241,6 +1241,7 @@ class AccountHealthRefresher:
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self._refresh_semaphore = asyncio.Semaphore(10)
+        self._scheduled_refresh_tasks: dict[str, asyncio.Task] = {}
         try:
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         except Exception:
@@ -1269,9 +1270,36 @@ class AccountHealthRefresher:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        pending_tasks = list(self._scheduled_refresh_tasks.values())
+        self._scheduled_refresh_tasks.clear()
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     def schedule_refresh(self, account_id: str) -> None:
-        asyncio.create_task(self.refresh_account(account_id))
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            return
+        existing = self._scheduled_refresh_tasks.get(account_id)
+        if existing and not existing.done():
+            return
+
+        task = asyncio.create_task(self.refresh_account(account_id), name=f"refresh-account-{account_id}")
+        self._scheduled_refresh_tasks[account_id] = task
+
+        def _on_done(done_task: asyncio.Task, aid: str = account_id) -> None:
+            current = self._scheduled_refresh_tasks.get(aid)
+            if current is done_task:
+                self._scheduled_refresh_tasks.pop(aid, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("Scheduled refresh task failed for {}: {}", mask_secret(aid), exc)
+
+        task.add_done_callback(_on_done)
 
     def _compute_next_daily_reset_utc(self, now_utc: Optional[datetime] = None) -> datetime:
         now_utc = now_utc or utc_now()
