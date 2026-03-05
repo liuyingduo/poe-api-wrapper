@@ -1012,10 +1012,13 @@ class PoeClientPool:
         self,
         repo: AccountRepository,
         default_poe_revision: Optional[str] = None,
+        client_max_age_seconds: int = 600,
     ):
         self.repo = repo
         self.default_poe_revision = (default_poe_revision or "").strip()
+        self.client_max_age_seconds = client_max_age_seconds
         self._clients: dict[str, "AsyncPoeApi"] = {}
+        self._client_created_at: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1089,6 +1092,13 @@ class PoeClientPool:
     def has_client(self, account_id: str) -> bool:
         return account_id in self._clients
 
+    def is_client_expired(self, account_id: str) -> bool:
+        import time
+        created_at = self._client_created_at.get(account_id)
+        if created_at is None:
+            return True
+        return (time.time() - created_at) > self.client_max_age_seconds
+
     def store_prewarmed_client(self, account_id: str, client: "AsyncPoeApi") -> None:
         """Store a client that was prewarmed on a separate event loop.
 
@@ -1096,8 +1106,10 @@ class PoeClientPool:
         The caller is responsible for having already called
         ``client.migrate_to_loop(main_loop)`` before invoking this.
         """
+        import time
         self._register_reconnect_callback(account_id, client)
         self._clients[account_id] = client
+        self._client_created_at[account_id] = time.time()
 
     async def get_client_for_account(
         self,
@@ -1119,10 +1131,12 @@ class PoeClientPool:
                 return existing
             if not create_if_missing:
                 raise RuntimeError(f"Client is not prewarmed for account {account_id}")
+            import time
             creds = await self.repo.get_account_credentials(account_doc)
             client = await self._create_client_with_fallback(account_id, creds)
             self._register_reconnect_callback(account_id, client)
             self._clients[account_id] = client
+            self._client_created_at[account_id] = time.time()
             return client
 
     def _register_reconnect_callback(self, account_id: str, client: "AsyncPoeApi") -> None:
@@ -1172,6 +1186,7 @@ class PoeClientPool:
 
     async def invalidate_client(self, account_id: str) -> None:
         client = self._clients.pop(account_id, None)
+        self._client_created_at.pop(account_id, None)
         if client:
             await self._close_client(client)
 
