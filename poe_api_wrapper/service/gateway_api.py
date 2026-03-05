@@ -5,11 +5,14 @@ import mimetypes
 import os
 import queue as thread_queue
 import re
+import statistics
 import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
@@ -59,6 +62,7 @@ from .gateway import (
     fetch_poe_revision,
     hash_api_key,
     mask_secret,
+    utc_now,
 )
 from .types import (
     AccountUpsertData,
@@ -193,10 +197,6 @@ class GatewayConfig:
     prewarm_on_startup: bool
     prewarm_account_timeout_seconds: int
     prewarm_scan_interval_seconds: int
-    prewarm_rolling_refresh_enabled: bool
-    prewarm_rolling_refresh_interval_seconds: int
-    prewarm_rolling_refresh_batch_size: int
-    prewarm_rolling_refresh_reuse_cooldown_seconds: int
     acquire_wait_poll_seconds: float
     auto_fetch_poe_revision: bool
     daily_reset_timezone: str
@@ -227,13 +227,6 @@ class GatewayConfig:
             prewarm_on_startup=_env_bool("PREWARM_ON_STARTUP", True),
             prewarm_account_timeout_seconds=_env_int("PREWARM_ACCOUNT_TIMEOUT_SECONDS", 20),
             prewarm_scan_interval_seconds=_env_int("PREWARM_SCAN_INTERVAL_SECONDS", 15),
-            prewarm_rolling_refresh_enabled=_env_bool("PREWARM_ROLLING_REFRESH_ENABLED", True),
-            prewarm_rolling_refresh_interval_seconds=_env_int("PREWARM_ROLLING_REFRESH_INTERVAL_SECONDS", 120),
-            prewarm_rolling_refresh_batch_size=_env_int("PREWARM_ROLLING_REFRESH_BATCH_SIZE", 10),
-            prewarm_rolling_refresh_reuse_cooldown_seconds=_env_int(
-                "PREWARM_ROLLING_REFRESH_REUSE_COOLDOWN_SECONDS",
-                600,
-            ),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
@@ -258,51 +251,40 @@ class GatewayRuntime:
 
 
 class PrewarmQueueCoordinator:
-    """Prewarm accounts on a **dedicated background thread + event loop**.
+    """Dedicated prewarm loop with a DB-order round-robin queue.
 
-    This isolates the heavy I/O work (HTTP to poe.com, WebSocket handshake)
-    from the main uvicorn event loop so that user requests are never delayed
-    by ongoing prewarm activity.
-
-    Architecture:
-      main loop (uvicorn)          prewarm loop (background thread)
-      ========================     ===================================
-      enqueue_account() -------->  _enqueue_q (thread-safe Queue)
-                                        |
-                                   _consumer_loop picks up account_id
-                                        |
-                                   _prewarm_account():
-                                     - repo.get_account_by_id()
-                                     - pool._create_client_with_fallback()
-                                     - client.migrate_to_loop(main_loop)
-                                     - pool.store_prewarmed_client()
-                                        |
-      pool._clients[id] = client  <---- done
+    Rules:
+    - Build a total queue from Mongo storage order (`_id` ASC).
+    - Only accounts with `balance >= current_median_balance` are prewarmed.
+    - Warm pool upper bound is always `PREWARM_MAX_ACCOUNTS`.
+    - Evicted/expired accounts are moved to the tail of total queue.
     """
 
     def __init__(self, runtime: GatewayRuntime):
         self.runtime = runtime
-        # Thread-safe queue for cross-loop enqueue.
-        self._enqueue_q: thread_queue.Queue[str] = thread_queue.Queue()
-        self._queued_ids: set[str] = set()
-        self._queued_ids_lock = threading.Lock()
+        # Cross-thread signal queue: move these accounts to total-queue tail.
+        self._tail_request_q: thread_queue.Queue[str] = thread_queue.Queue()
+        self._tail_requested_ids: set[str] = set()
+        self._tail_requested_lock = threading.Lock()
+
+        # Prewarm work queue consumed by background workers.
+        self._prewarm_q: thread_queue.Queue[str] = thread_queue.Queue()
+        self._queued_prewarm_ids: set[str] = set()
+        self._queued_prewarm_lock = threading.Lock()
+
         self._failed_backoff_until: dict[str, float] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._prewarm_loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
-        cfg = self.runtime.config
-        self._target_max = max(1, int(cfg.prewarm_max_accounts))
-        self._rolling_refresh_enabled = bool(cfg.prewarm_rolling_refresh_enabled)
-        self._rolling_refresh_interval_seconds = max(30, int(cfg.prewarm_rolling_refresh_interval_seconds))
-        self._rolling_refresh_batch_size = max(1, int(cfg.prewarm_rolling_refresh_batch_size))
-        self._rolling_refresh_reuse_cooldown_seconds = max(
-            self._rolling_refresh_interval_seconds,
-            int(cfg.prewarm_rolling_refresh_reuse_cooldown_seconds),
-        )
-        self._rolling_refresh_last_mono = 0.0
-        self._recently_rotated_until: dict[str, float] = {}
+        self._target_max = max(1, int(self.runtime.config.prewarm_max_accounts))
+
+        # Round-robin snapshot (owned by prewarm loop).
+        self._round_robin_ids: deque[str] = deque()
+        self._round_robin_known: set[str] = set()
+        self._round_robin_meta: dict[str, dict[str, Any]] = {}
+        self._median_balance: float = 0.0
 
     # -- helpers ---------------------------------------------------------------
 
@@ -313,68 +295,6 @@ class PrewarmQueueCoordinator:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
         cooldown = max(1, int(self.runtime.config.cooldown_seconds))
         return max(scan_interval, min(cooldown, 300))
-
-    def _cleanup_recently_rotated(self, now: float) -> None:
-        expired = [aid for aid, until in self._recently_rotated_until.items() if until <= now]
-        for aid in expired:
-            self._recently_rotated_until.pop(aid, None)
-
-    def _in_recently_rotated(self, account_id: str, now: float) -> bool:
-        until = self._recently_rotated_until.get(account_id)
-        return bool(until and until > now)
-
-    async def _maybe_rotate_cached_clients(self) -> None:
-        if not self._rolling_refresh_enabled:
-            return
-        now = time.monotonic()
-        if (now - self._rolling_refresh_last_mono) < self._rolling_refresh_interval_seconds:
-            return
-        self._rolling_refresh_last_mono = now
-        self._cleanup_recently_rotated(now)
-
-        target_count = self._target_count()
-        cached_ids = self.runtime.pool.cached_account_ids_in_order()
-        if not cached_ids:
-            return
-
-        # Keep most of the warm pool alive while rotating a small batch.
-        keep_floor = max(1, target_count - self._rolling_refresh_batch_size)
-        max_evict = min(
-            self._rolling_refresh_batch_size,
-            max(0, len(cached_ids) - keep_floor),
-        )
-        if max_evict <= 0:
-            return
-
-        evicted_ids: list[str] = []
-        for account_id in cached_ids:
-            if len(evicted_ids) >= max_evict:
-                break
-            if self._in_recently_rotated(account_id, now):
-                continue
-
-            await self.runtime.limiter.block_account(account_id)
-            try:
-                # Only evict idle clients so ongoing streams are not interrupted.
-                inflight = await self.runtime.limiter.inflight_for(account_id)
-                if inflight > 0:
-                    continue
-                await self.runtime.pool.invalidate_client(account_id)
-                self._recently_rotated_until[account_id] = now + self._rolling_refresh_reuse_cooldown_seconds
-                evicted_ids.append(account_id)
-            except Exception as exc:
-                logger.debug("Rolling refresh evict failed for {}: {}", mask_secret(account_id), exc)
-            finally:
-                await self.runtime.limiter.unblock_account(account_id)
-
-        if evicted_ids:
-            logger.info(
-                "Rolling refresh evicted {} idle prewarmed client(s) (interval={}s batch={} cooldown={}s)",
-                len(evicted_ids),
-                self._rolling_refresh_interval_seconds,
-                self._rolling_refresh_batch_size,
-                self._rolling_refresh_reuse_cooldown_seconds,
-            )
 
     def _cleanup_failure_backoff(self, now: float) -> None:
         expired = [aid for aid, until in self._failed_backoff_until.items() if until <= now]
@@ -394,22 +314,133 @@ class PrewarmQueueCoordinator:
     # -- public API (called from main loop) ------------------------------------
 
     async def enqueue_account(self, account_id: str) -> bool:
-        """Enqueue an account for prewarm.  Called from main loop."""
+        """Request this account to be moved to the total-queue tail."""
         account_id = str(account_id or "").strip()
         if not account_id:
             return False
-        with self._queued_ids_lock:
-            if account_id in self._queued_ids or self.runtime.pool.has_client(account_id):
+        with self._tail_requested_lock:
+            if account_id in self._tail_requested_ids:
                 return False
-            if (len(self.runtime.pool.cached_account_ids()) + len(self._queued_ids)) >= self._target_count():
-                return False
-            self._queued_ids.add(account_id)
-        self._enqueue_q.put(account_id)
+            self._tail_requested_ids.add(account_id)
+        self._tail_request_q.put(account_id)
         return True
 
-    def _dequeue_mark_done(self, account_id: str) -> None:
-        with self._queued_ids_lock:
-            self._queued_ids.discard(account_id)
+    # -- queue state maintenance -----------------------------------------------
+
+    async def _sync_round_robin_snapshot(self) -> None:
+        docs = await self.runtime.repo.list_accounts_round_robin_snapshot(limit=0)
+        db_ids: list[str] = []
+        db_meta: dict[str, dict[str, Any]] = {}
+        balances: list[int] = []
+
+        for doc in docs:
+            account_id = str(doc["_id"])
+            balance = int(doc.get("message_point_balance", 0) or 0)
+            db_ids.append(account_id)
+            balances.append(balance)
+            db_meta[account_id] = {
+                "status": str(doc.get("status", "unknown")),
+                "cooldown_until": doc.get("cooldown_until"),
+                "message_point_balance": balance,
+            }
+
+        self._median_balance = float(statistics.median(balances)) if balances else 0.0
+        self._round_robin_meta = db_meta
+
+        db_set = set(db_ids)
+        if self._round_robin_ids:
+            self._round_robin_ids = deque(aid for aid in self._round_robin_ids if aid in db_set)
+        self._round_robin_known = set(self._round_robin_ids)
+
+        for account_id in db_ids:
+            if account_id not in self._round_robin_known:
+                self._round_robin_ids.append(account_id)
+                self._round_robin_known.add(account_id)
+
+    def _move_to_tail(self, account_id: str) -> bool:
+        if account_id not in self._round_robin_known:
+            if account_id not in self._round_robin_meta:
+                return False
+            self._round_robin_ids.append(account_id)
+            self._round_robin_known.add(account_id)
+            return True
+
+        try:
+            self._round_robin_ids.remove(account_id)
+        except ValueError:
+            pass
+        self._round_robin_ids.append(account_id)
+        return True
+
+    async def _drain_tail_requests(self) -> int:
+        moved = 0
+        while True:
+            try:
+                account_id = self._tail_request_q.get_nowait()
+            except thread_queue.Empty:
+                break
+
+            with self._tail_requested_lock:
+                self._tail_requested_ids.discard(account_id)
+            if self._move_to_tail(account_id):
+                moved += 1
+        return moved
+
+    async def _evict_cached_below_median(self) -> int:
+        """Evict idle prewarmed clients whose balance is below current median."""
+        cached_ids = self.runtime.pool.cached_account_ids_in_order()
+        if not cached_ids:
+            return 0
+
+        evicted = 0
+        for account_id in cached_ids:
+            meta = self._round_robin_meta.get(account_id)
+            if not meta:
+                continue
+            balance = int(meta.get("message_point_balance", 0) or 0)
+            if balance >= self._median_balance:
+                continue
+
+            await self.runtime.limiter.block_account(account_id)
+            try:
+                # Do not interrupt in-flight requests; retry in next scan.
+                inflight = await self.runtime.limiter.inflight_for(account_id)
+                if inflight > 0:
+                    continue
+                await self.runtime.pool.invalidate_client(account_id)
+                self._move_to_tail(account_id)
+                evicted += 1
+            except Exception as exc:
+                logger.debug(
+                    "Evict-below-median failed for {}: {}",
+                    mask_secret(account_id),
+                    exc,
+                )
+            finally:
+                await self.runtime.limiter.unblock_account(account_id)
+
+        if evicted > 0:
+            logger.info(
+                "Evicted {} prewarmed account(s) below median balance (median_balance={})",
+                evicted,
+                int(self._median_balance),
+            )
+        return evicted
+
+    def _enqueue_prewarm_job(self, account_id: str) -> bool:
+        cached_count = len(self.runtime.pool.cached_account_ids())
+        with self._queued_prewarm_lock:
+            if account_id in self._queued_prewarm_ids:
+                return False
+            if (cached_count + len(self._queued_prewarm_ids)) >= self._target_count():
+                return False
+            self._queued_prewarm_ids.add(account_id)
+        self._prewarm_q.put(account_id)
+        return True
+
+    def _mark_prewarm_done(self, account_id: str) -> None:
+        with self._queued_prewarm_lock:
+            self._queued_prewarm_ids.discard(account_id)
 
     # -- prewarm logic (runs on background loop) -------------------------------
 
@@ -513,49 +544,72 @@ class PrewarmQueueCoordinator:
         scan_interval = max(1, int(self.runtime.config.prewarm_scan_interval_seconds))
         while not self._stop_event.is_set():
             try:
-                await self._maybe_rotate_cached_clients()
+                await self._sync_round_robin_snapshot()
+                moved = await self._drain_tail_requests()
+                if moved > 0:
+                    logger.info("Prewarm total-queue moved {} account(s) to tail", moved)
+                await self._evict_cached_below_median()
+
                 target_count = self._target_count()
                 cached_count = len(self.runtime.pool.cached_account_ids())
-                with self._queued_ids_lock:
-                    queued_count = len(self._queued_ids)
+                with self._queued_prewarm_lock:
+                    queued_count = len(self._queued_prewarm_ids)
                 deficit = target_count - cached_count - queued_count
                 if deficit <= 0:
                     await asyncio.sleep(scan_interval)
                     continue
 
-                candidates = await self.runtime.repo.list_candidate_accounts(limit=0)
+                if not self._round_robin_ids:
+                    await asyncio.sleep(scan_interval)
+                    continue
+
+                now_utc = utc_now()
                 now = time.monotonic()
                 self._cleanup_failure_backoff(now)
-                self._cleanup_recently_rotated(now)
+
                 enqueue_count = 0
-                for allow_recently_rotated in (False, True):
-                    for account_doc in candidates:
-                        if enqueue_count >= deficit:
-                            break
-                        account_id = str(account_doc["_id"])
-                        if self.runtime.pool.has_client(account_id):
-                            continue
-                        if self._in_failure_backoff(account_id, now):
-                            continue
-                        if (not allow_recently_rotated) and self._in_recently_rotated(account_id, now):
-                            continue
-                        with self._queued_ids_lock:
-                            if account_id in self._queued_ids:
-                                continue
-                            if (cached_count + len(self._queued_ids)) >= target_count:
-                                break
-                            self._queued_ids.add(account_id)
-                        self._enqueue_q.put(account_id)
-                        enqueue_count += 1
+                scan_budget = len(self._round_robin_ids)
+                for _ in range(scan_budget):
                     if enqueue_count >= deficit:
                         break
+                    account_id = self._round_robin_ids[0]
+                    self._round_robin_ids.rotate(-1)
+
+                    if self.runtime.pool.has_client(account_id):
+                        continue
+                    if self._in_failure_backoff(account_id, now):
+                        continue
+
+                    meta = self._round_robin_meta.get(account_id)
+                    if not meta:
+                        continue
+                    if meta.get("status") != "active":
+                        continue
+
+                    cooldown_until = meta.get("cooldown_until")
+                    in_cooldown = bool(
+                        cooldown_until
+                        and isinstance(cooldown_until, datetime)
+                        and cooldown_until > now_utc
+                    )
+                    if in_cooldown:
+                        continue
+
+                    balance = int(meta.get("message_point_balance", 0) or 0)
+                    if balance < self._median_balance:
+                        continue
+
+                    if self._enqueue_prewarm_job(account_id):
+                        enqueue_count += 1
+
                 if enqueue_count > 0:
                     logger.info(
-                        "Prewarm producer queued {} account(s); target={} cached={} queued={}",
+                        "Prewarm producer queued {} account(s); target={} cached={} queued={} median_balance={}",
                         enqueue_count,
                         target_count,
                         cached_count,
                         queued_count + enqueue_count,
+                        int(self._median_balance),
                     )
             except Exception as exc:
                 logger.warning("Prewarm producer loop failed: {}", exc)
@@ -569,7 +623,7 @@ class PrewarmQueueCoordinator:
             # stop event periodically.
             try:
                 account_id = await loop.run_in_executor(
-                    None, lambda: self._enqueue_q.get(timeout=1.0),
+                    None, lambda: self._prewarm_q.get(timeout=1.0),
                 )
             except thread_queue.Empty:
                 continue
@@ -584,7 +638,7 @@ class PrewarmQueueCoordinator:
             except Exception as exc:
                 logger.warning("Prewarm consumer {} unexpected error: {}", worker_idx, exc)
             finally:
-                self._dequeue_mark_done(account_id)
+                self._mark_prewarm_done(account_id)
 
     async def _ttl_cleanup_loop(self) -> None:
         check_interval = max(30, int(self.runtime.config.prewarm_scan_interval_seconds))
@@ -632,12 +686,10 @@ class PrewarmQueueCoordinator:
         ]
         ttl_cleanup = asyncio.create_task(self._ttl_cleanup_loop(), name="ttl-cleanup")
         logger.info(
-            "Started prewarm coordinator with {} consumers; fixed_target={} rolling_refresh={} interval={}s batch={}",
+            "Started prewarm coordinator with {} consumers; fixed_target={} scan_interval={}s",
             worker_count,
             self._target_count(),
-            self._rolling_refresh_enabled,
-            self._rolling_refresh_interval_seconds,
-            self._rolling_refresh_batch_size,
+            max(1, int(self.runtime.config.prewarm_scan_interval_seconds)),
         )
         # Block until the coordinator is asked to stop.
         while not self._stop_event.is_set():
@@ -833,44 +885,6 @@ async def _account_error_payload(
         error_text,
     )
     return build_openai_error(500, "provider_error", f"Provider error: {error_text}", metadata), 500
-
-
-async def _prewarm_pool(runtime: GatewayRuntime) -> None:
-    try:
-        primary_pool = await runtime.selector.get_primary_pool(max_accounts=runtime.config.prewarm_max_accounts)
-    except NoAccountAvailableError:
-        logger.info("Prewarm skipped: no active accounts yet. Service will wait for admin account upsert.")
-        return
-    if not primary_pool:
-        logger.warning("Prewarm skipped: no candidate accounts available")
-        return
-
-    semaphore = asyncio.Semaphore(runtime.config.prewarm_concurrency)
-
-    async def _prewarm_one(account_doc: dict[str, Any]) -> None:
-        account_id = str(account_doc["_id"])
-        async with semaphore:
-            try:
-                await asyncio.wait_for(
-                    runtime.pool.get_client(account_doc),
-                    timeout=max(1, runtime.config.prewarm_account_timeout_seconds),
-                )
-                logger.info("Prewarmed account {}", mask_secret(account_id))
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Prewarm timed out for account {} after {}s",
-                    mask_secret(account_id),
-                    runtime.config.prewarm_account_timeout_seconds,
-                )
-            except Exception as exc:
-                logger.warning("Prewarm failed for account {}: {}", mask_secret(account_id), exc)
-                await runtime.repo.record_account_error(
-                    account_id,
-                    f"prewarm_error: {exc}",
-                    cooldown_seconds=runtime.config.cooldown_seconds,
-                )
-
-    await asyncio.gather(*(_prewarm_one(account) for account in primary_pool), return_exceptions=True)
 
 
 async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:

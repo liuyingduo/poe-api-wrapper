@@ -36,21 +36,21 @@ for chunk in stream:
 # print()
 
 # # # ── Vision / Image-Input Example ───────────────────────────────────────────────
-IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
+# IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
 
-image_input = client.chat.completions.create(
-    model="GPT-4o",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What's in this image?"},
-                {"type": "image_url", "image_url": {"url": IMAGE_URL}},
-            ],
-        }
-    ],
-)
-print(image_input.choices[0].message.content)
+# image_input = client.chat.completions.create(
+#     model="GPT-4o",
+#     messages=[
+#         {
+#             "role": "user",
+#             "content": [
+#                 {"type": "text", "text": "What's in this image?"},
+#                 {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+#             ],
+#         }
+#     ],
+# )
+# print(image_input.choices[0].message.content)
 
 # ── Image-Edit Example ─────────────────────────────────────────────────────────
 # Download the reference image and pass it as a file-like object.
@@ -69,64 +69,64 @@ print(image_input.choices[0].message.content)
 # 支持图片、PDF 等文件 URL，模型会分析文件内容并回答问题。
 # 多个文件直接在 content 列表里追加多个 image_url 条目即可。
 
-ANALYZE_FILES = [
-    "https://lib.hueb.edu.cn/__local/C/03/BD/ABAB4CD4F1A81D63A6B2C978081_B112E78E_1198F9.pdf?e=.pdf",
-]
-ANALYZE_PROMPT = "请分析这些文件的主要内容，用中文回答。"
-ANALYZE_MODEL = "GPT-4o"
+# ANALYZE_FILES = [
+#     "https://lib.hueb.edu.cn/__local/C/03/BD/ABAB4CD4F1A81D63A6B2C978081_B112E78E_1198F9.pdf?e=.pdf",
+# ]
+# ANALYZE_PROMPT = "请分析这些文件的主要内容，用中文回答。"
+# ANALYZE_MODEL = "GPT-4o"
 
-content_parts = [{"type": "text", "text": ANALYZE_PROMPT}]
-for f in ANALYZE_FILES:
-    content_parts.append({"type": "file", "file": {"url": f}})
+# content_parts = [{"type": "text", "text": ANALYZE_PROMPT}]
+# for f in ANALYZE_FILES:
+#     content_parts.append({"type": "file", "file": {"url": f}})
 
-file_analysis = client.chat.completions.create(
-    model=ANALYZE_MODEL,
-    messages=[{"role": "user", "content": content_parts}],
-    stream=True,
-)
-print(f"\n=== 文件分析结果 ({len(ANALYZE_FILES)} 个文件) ===")
-for chunk in file_analysis:
-    if chunk.choices[0].delta.content is not None:
-        print(chunk.choices[0].delta.content, end="")
-print()
+# file_analysis = client.chat.completions.create(
+#     model=ANALYZE_MODEL,
+#     messages=[{"role": "user", "content": content_parts}],
+#     stream=True,
+# )
+# print(f"\n=== 文件分析结果 ({len(ANALYZE_FILES)} 个文件) ===")
+# for chunk in file_analysis:
+#     if chunk.choices[0].delta.content is not None:
+#         print(chunk.choices[0].delta.content, end="")
+# print()
 
 
-# import concurrent.futures
-# import time
+import concurrent.futures
+import time
 
-# TOTAL_REQUESTS = 5
-# PROMPT = "A cute girl with a little flower"
-# MODEL = "Qwen-Image"
+TOTAL_REQUESTS = 5
+PROMPT = "A cute girl with a little flower"
+MODEL = "Qwen-Image"
 
-# def generate_image(index: int):
-#     try:
-#         start = time.time()
-#         result = client.images.generate(
-#             model=MODEL,
-#             prompt=PROMPT,
-#             n=1,
-#         )
-#         elapsed = time.time() - start
-#         url = result.data[0].url if result.data else None
-#         print(f"[{index:03d}] 成功 ({elapsed:.2f}s): {url}")
-#         return {"index": index, "success": True, "url": url, "elapsed": elapsed}
-#     except Exception as e:
-#         print(f"[{index:03d}] 失败: {e}")
-#         return {"index": index, "success": False, "error": str(e)}
+def generate_image(index: int):
+    try:
+        start = time.time()
+        result = client.images.generate(
+            model=MODEL,
+            prompt=PROMPT,
+            n=1,
+        )
+        elapsed = time.time() - start
+        url = result.data[0].url if result.data else None
+        print(f"[{index:03d}] 成功 ({elapsed:.2f}s): {url}")
+        return {"index": index, "success": True, "url": url, "elapsed": elapsed}
+    except Exception as e:
+        print(f"[{index:03d}] 失败: {e}")
+        return {"index": index, "success": False, "error": str(e)}
 
-# print(f"开始发起 {TOTAL_REQUESTS} 个并发图片生成请求...")
-# overall_start = time.time()
+print(f"开始发起 {TOTAL_REQUESTS} 个并发图片生成请求...")
+overall_start = time.time()
 
-# with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_REQUESTS) as executor:
-#     futures = {executor.submit(generate_image, i): i for i in range(1, TOTAL_REQUESTS + 1)}
-#     results = [future.result() for future in concurrent.futures.as_completed(futures)]
+with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_REQUESTS) as executor:
+    futures = {executor.submit(generate_image, i): i for i in range(1, TOTAL_REQUESTS + 1)}
+    results = [future.result() for future in concurrent.futures.as_completed(futures)]
 
-# overall_elapsed = time.time() - overall_start
-# success_count = sum(1 for r in results if r["success"])
-# fail_count = TOTAL_REQUESTS - success_count
+overall_elapsed = time.time() - overall_start
+success_count = sum(1 for r in results if r["success"])
+fail_count = TOTAL_REQUESTS - success_count
 
-# print(f"\n===== 测试完成 =====")
-# print(f"总请求数: {TOTAL_REQUESTS}")
-# print(f"成功: {success_count} | 失败: {fail_count}")
+print(f"\n===== 测试完成 =====")
+print(f"总请求数: {TOTAL_REQUESTS}")
+print(f"成功: {success_count} | 失败: {fail_count}")
 # print(f"总耗时: {overall_elapsed:.2f}s")
 

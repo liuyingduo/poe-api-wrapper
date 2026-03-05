@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import os
 import re
-import statistics
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -581,6 +580,25 @@ class AccountRepository:
 
         return await self._run(_op)
 
+    async def list_accounts_round_robin_snapshot(self, *, limit: int = 0) -> list[dict[str, Any]]:
+        """Return all accounts (or first N) in storage order for prewarm round-robin."""
+
+        def _op():
+            cursor = self.accounts.find(
+                {},
+                {
+                    "_id": 1,
+                    "status": 1,
+                    "cooldown_until": 1,
+                    "message_point_balance": 1,
+                },
+            ).sort("_id", ASCENDING)
+            if limit > 0:
+                cursor = cursor.limit(limit)
+            return list(cursor)
+
+        return await self._run(_op)
+
     async def list_candidate_accounts(self, limit: int = 1000) -> list[dict[str, Any]]:
         now = utc_now()
         query = {
@@ -595,9 +613,8 @@ class AccountRepository:
         def _op():
             cursor = self.accounts.find(query).sort(
                 [
-                    ("health_score", DESCENDING),
                     ("message_point_balance", DESCENDING),
-                    ("last_success_at", DESCENDING),
+                    ("_id", ASCENDING),
                 ]
             )
             if limit > 0:
@@ -949,7 +966,7 @@ class AccountSelector:
             return []
         return [account for account in candidates if str(account["_id"]) in cached_ids]
 
-    async def _top_and_primary_pool(self, *, prewarmed_only: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    async def _top_pool(self, *, prewarmed_only: bool = False) -> list[dict[str, Any]]:
         candidates = await self.repo.list_candidate_accounts(limit=5000)
         if not candidates:
             raise NoAccountAvailableError("No active accounts are available")
@@ -958,19 +975,7 @@ class AccountSelector:
             if not candidates:
                 raise CapacityLimitError("No prewarmed accounts are currently available")
         top_limit = min(self.top_n, len(candidates))
-        top_accounts = candidates[:top_limit]
-        balances = [int(a.get("message_point_balance", 0) or 0) for a in top_accounts]
-        median_balance = float(statistics.median(balances)) if balances else 0.0
-        primary = [a for a in top_accounts if int(a.get("message_point_balance", 0) or 0) >= median_balance]
-        if not primary:
-            primary = top_accounts
-        return top_accounts, primary, median_balance
-
-    async def get_primary_pool(self, *, max_accounts: Optional[int] = None) -> list[dict[str, Any]]:
-        _, primary, _ = await self._top_and_primary_pool(prewarmed_only=False)
-        if max_accounts is not None:
-            return primary[: max(0, int(max_accounts))]
-        return primary
+        return candidates[:top_limit]
 
     async def _score_account(self, account: dict[str, Any]) -> float:
         account_id = str(account["_id"])
@@ -994,12 +999,7 @@ class AccountSelector:
         return None
 
     async def select_account(self, *, prewarmed_only: bool = False) -> tuple[dict[str, Any], AccountLease]:
-        top_accounts, primary, _ = await self._top_and_primary_pool(prewarmed_only=prewarmed_only)
-
-        selected = await self._select_from_pool(primary)
-        if selected:
-            return selected
-
+        top_accounts = await self._top_pool(prewarmed_only=prewarmed_only)
         selected = await self._select_from_pool(top_accounts)
         if selected:
             return selected

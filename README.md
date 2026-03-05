@@ -100,6 +100,7 @@ start_server(address="127.0.0.1", port="8000")
 
 - `python scripts/smoke.py`
 - `python scripts/refresh_all_points.py --dry-run`
+- `python scripts/get_accounts_summary.py --available-only`
 - `python scripts/manual_e2e_test.py`
 - `python scripts/example.py`
 
