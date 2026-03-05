@@ -50,6 +50,7 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 )
+DEFAULT_NEW_ACCOUNT_POINT_BALANCE = 3000
 
 
 def utc_now() -> datetime:
@@ -382,6 +383,8 @@ class AccountRepository:
         user_agent: Optional[str] = None,
     ) -> dict[str, Any]:
         now = utc_now()
+        initial_balance = int(DEFAULT_NEW_ACCOUNT_POINT_BALANCE)
+        initial_health_score = min(100.0, float(initial_balance) / 10.0)
         credentials = {
             "poe_p_b": poe_p_b,
             "poe_cf_clearance": poe_cf_clearance,
@@ -403,14 +406,14 @@ class AccountRepository:
                         "updated_at": now,
                     },
                     "$setOnInsert": {
-                        "message_point_balance": 0,
+                        "message_point_balance": initial_balance,
                         "subscription_active": False,
                         "last_refresh_at": None,
                         "last_success_at": None,
                         "last_error": None,
                         "error_count": 0,
                         "cooldown_until": None,
-                        "health_score": 50.0,
+                        "health_score": initial_health_score,
                         "created_at": now,
                     },
                 },
