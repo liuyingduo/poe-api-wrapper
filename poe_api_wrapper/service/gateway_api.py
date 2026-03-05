@@ -2111,6 +2111,7 @@ async def create_images(
         raise HTTPException(status_code=status, detail=payload)
     finally:
         runtime.refresher.schedule_refresh(account_id)
+        await runtime.pool.invalidate_client(account_id)
         await lease.release()
 
 
@@ -2252,6 +2253,7 @@ async def edit_images(
     finally:
         _cleanup_temp_files(edit_temp_files)
         runtime.refresher.schedule_refresh(account_id)
+        await runtime.pool.invalidate_client(account_id)
         await lease.release()
 
 
