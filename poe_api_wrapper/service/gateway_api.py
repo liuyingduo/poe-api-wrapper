@@ -1029,7 +1029,7 @@ def _create_temp_file_path(*, prefix: str, suffix: str) -> str:
     return tmp_path
 
 
-def _parse_image_parameters(parameters: Any) -> Optional[dict[str, Any]]:
+def _parse_poe_parameters(parameters: Any) -> Optional[dict[str, Any]]:
     if parameters is None:
         return None
     if isinstance(parameters, dict):
@@ -1041,14 +1041,32 @@ def _parse_image_parameters(parameters: Any) -> Optional[dict[str, Any]]:
         try:
             parsed = orjson.loads(stripped)
         except Exception:
-            _openai_http_error(400, "invalid_request_error", "Invalid image parameters JSON")
+            _openai_http_error(400, "invalid_request_error", "Invalid parameters JSON")
             raise AssertionError("unreachable")
         if not isinstance(parsed, dict):
-            _openai_http_error(400, "invalid_request_error", "Image parameters must be a JSON object")
+            _openai_http_error(400, "invalid_request_error", "Parameters must be a JSON object")
             raise AssertionError("unreachable")
         return dict(parsed)
-    _openai_http_error(400, "invalid_request_error", "Invalid image parameters")
+    _openai_http_error(400, "invalid_request_error", "Invalid parameters")
     raise AssertionError("unreachable")
+
+
+def _extract_chat_parameters(data: ChatData) -> Optional[dict[str, Any]]:
+    # Priority: explicit top-level `parameters` > `extra_body.parameters`
+    if data.parameters is not None:
+        return _parse_poe_parameters(data.parameters)
+
+    extra_fields = getattr(data, "__pydantic_extra__", None) or {}
+    top_level_parameters = extra_fields.get("parameters")
+    if top_level_parameters is not None:
+        return _parse_poe_parameters(top_level_parameters)
+
+    extra_body = data.extra_body
+    if isinstance(extra_body, dict):
+        body_parameters = extra_body.get("parameters")
+        if body_parameters is not None:
+            return _parse_poe_parameters(body_parameters)
+    return None
 
 
 def _normalize_aspect_value(value: str) -> Optional[str]:
@@ -1105,7 +1123,7 @@ def _resolve_image_generation_config(
     model_meta = app.state.models.get(model, {})
     model_sizes = model_meta.get("sizes", {})
     image_sizes = model_meta.get("image_sizes", {})
-    resolved_parameters = _parse_image_parameters(parameters) or {}
+    resolved_parameters = _parse_poe_parameters(parameters) or {}
 
     resolved_image_size_key = ""
     normalized_image_size = (image_size or "").strip().lower()
@@ -1239,6 +1257,38 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     return resolved_paths, temp_files
 
 
+def _extract_attachment_urls(message_chunk: dict[str, Any], mime_prefix: Optional[str] = None) -> list[str]:
+    attachments = message_chunk.get("attachments") or []
+    urls: list[str] = []
+    seen: set[str] = set()
+    expected_prefix = (mime_prefix or "").strip().lower()
+
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        file_info = att.get("file") or {}
+        url = str(file_info.get("url") or att.get("url") or "").strip()
+        if not url:
+            continue
+
+        mime = str(file_info.get("mimeType") or "").strip().lower()
+        if expected_prefix and mime and not mime.startswith(expected_prefix):
+            continue
+
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _is_audio_generation_model(model: str) -> bool:
+    model_meta = app.state.models.get(model, {})
+    base_model = str(model_meta.get("baseModel") or "").strip().lower()
+    model_name = str(model or "").strip().lower()
+    text = f"{model_name} {base_model}"
+    return ("music" in text) or ("audio" in text)
+
+
 async def generate_image(
     client,
     response: dict,
@@ -1260,15 +1310,7 @@ async def generate_image(
         ):
             pass
         # 优先从 attachments 中提取图片 URL（如 Qwen-Image 等把图片作为附件返回的模型）
-        attachments = chunk.get("attachments") or []
-        attachment_urls = []
-        for att in attachments:
-            # 优先取 file.url（不带 pmaid 参数的干净 URL），其次取顶层 url
-            file_info = att.get("file") or {}
-            url = file_info.get("url") or att.get("url") or ""
-            mime = file_info.get("mimeType") or ""
-            if url and (mime.startswith("image/") or not mime):
-                attachment_urls.append(url)
+        attachment_urls = _extract_attachment_urls(chunk, mime_prefix="image/")
         if attachment_urls:
             return " ".join(attachment_urls)
         # fallback：从文本中解析 URL（适用于把 URL 直接写在文本里的模型）
@@ -1357,6 +1399,7 @@ async def generate_chunks(
     persistent_session: bool,
     account_id: str,
     lease: AccountLease,
+    chat_parameters: Optional[dict[str, Any]],
     shared_state: dict[str, Any],  # 用于与 BackgroundTask 共享执行结果
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
@@ -1371,6 +1414,7 @@ async def generate_chunks(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
+                parameters=chat_parameters,
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -1399,6 +1443,19 @@ async def generate_chunks(
                     include_usage=include_usage,
                 )
                 yield b"data: " + orjson.dumps(content) + b"\n\n"
+
+                if str(chunk.get("state", "")).lower() == "complete":
+                    attachment_urls = _extract_attachment_urls(chunk)
+                    extra_urls = [url for url in attachment_urls if url and url not in str(chunk.get("text") or "")]
+                    if extra_urls:
+                        attachment_chunk = await create_completion_data(
+                            completion_id=completion_id,
+                            created=completion_timestamp,
+                            model=model,
+                            chunk="\n".join(extra_urls),
+                            include_usage=False,
+                        )
+                        yield b"data: " + orjson.dumps(attachment_chunk) + b"\n\n"
                 await asyncio.sleep(0.001)
 
             end_chunk = await create_completion_data(
@@ -1468,6 +1525,7 @@ async def streaming_response(
     persistent_session: bool,
     account_id: str,
     lease: AccountLease,
+    chat_parameters: Optional[dict[str, Any]],
 ) -> StreamingResponse:
 
     # 用于在生成器和后台任务间共享执行结果
@@ -1507,6 +1565,7 @@ async def streaming_response(
             persistent_session=persistent_session,
             account_id=account_id,
             lease=lease,
+            chat_parameters=chat_parameters,
             shared_state=shared_state,  # 传入共享状态
         ),
         status_code=200,
@@ -1533,6 +1592,7 @@ async def non_streaming_response(
     persistent_session: bool,
     account_id: str,
     lease: AccountLease,
+    chat_parameters: Optional[dict[str, Any]],
 ) -> JSONResponse:
     succeeded = False
     error_decision: Optional[AccountErrorDecision] = None
@@ -1545,6 +1605,7 @@ async def non_streaming_response(
                 file_path=attachment_paths,
                 chatCode=chat_code,
                 chatId=chat_id,
+                parameters=chat_parameters,
             ):
                 if persistent_session:
                     incoming_chat_code = chunk.get("chatCode") or chat_code
@@ -1565,6 +1626,23 @@ async def non_streaming_response(
                     break
             completion_tokens = await helpers.__tokenize(chunk["text"])
             message_content = chunk["text"]
+            attachment_urls = _extract_attachment_urls(chunk)
+            if _is_audio_generation_model(model):
+                audio_urls = _extract_attachment_urls(chunk, mime_prefix="audio/")
+                if not audio_urls:
+                    _openai_http_error(
+                        500,
+                        "provider_error",
+                        f"Audio model {model} returned no audio attachment URL",
+                    )
+                message_content = "\n".join(audio_urls)
+            elif attachment_urls:
+                attachment_block = "\n".join(attachment_urls)
+                if message_content:
+                    if any(url not in message_content for url in attachment_urls):
+                        message_content = f"{message_content}\n{attachment_block}"
+                else:
+                    message_content = attachment_block
         else:
             completion_tokens = await helpers.__tokenize(
                 "".join([str(tool_call["name"]) + str(tool_call["arguments"]) for tool_call in raw_tool_calls])
@@ -1708,6 +1786,7 @@ async def _chat_completions_impl(
     tool_choice = data.tool_choice
     metadata = data.metadata
     user = data.user
+    chat_parameters = _extract_chat_parameters(data)
     request.state.model = model
 
     messages_valid, messages_error = await helpers.__validate_messages_format_detail(messages)
@@ -1720,6 +1799,8 @@ async def _chat_completions_impl(
         )
     if model not in app.state.models:
         _openai_http_error(404, "not_found_error", "Invalid model")
+    if streaming and _is_audio_generation_model(model):
+        _openai_http_error(400, "invalid_request_error", "Streaming is not supported for audio/music models")
     if data.n not in (None, 1):
         _openai_http_error(400, "invalid_request_error", "n must be exactly 1")
     if tools and len(tools) > 20:
@@ -1879,6 +1960,7 @@ async def _chat_completions_impl(
             persistent_session=persistent_session,
             account_id=account_id,
             lease=lease,
+            chat_parameters=chat_parameters,
         )
 
     return await non_streaming_response(
@@ -1898,6 +1980,7 @@ async def _chat_completions_impl(
         persistent_session=persistent_session,
         account_id=account_id,
         lease=lease,
+        chat_parameters=chat_parameters,
     )
 
 

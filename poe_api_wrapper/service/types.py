@@ -18,6 +18,7 @@ class ChatData(BaseModel, extra=Extra.allow):
     user: Optional[str] = None
     n: Optional[int] = 1
     extra_body: Optional[dict[str, Any]] = None
+    parameters: Optional[dict[str, Any]] = None
     
 class ImagesGenData(BaseModel, extra=Extra.allow):
     prompt: Any
