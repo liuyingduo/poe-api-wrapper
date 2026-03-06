@@ -27,7 +27,6 @@ DeepSeek-R1
 DeepSeek-R1-DI
 DeepSeek-R1-N
 DeepSeek-R1-Turbo-DI
-DeepSeek-V3
 DeepSeek-V3-DI
 DeepSeek-V3-Turbo-DI
 DeepSeek-V3.1
@@ -109,6 +108,10 @@ GPT-5.2-Codex
 GPT-5.2-Instant
 GPT-5.2-Pro
 GPT-5.3-Codex
+GPT-5.3-Codex-Spark
+GPT-5.3-Instant
+GPT-5.4
+GPT-5.4-Pro
 GPT-Image-1
 GPT-Image-1-Mini
 GPT-Image-1.5
@@ -128,6 +131,7 @@ Gemini-2.5-Pro
 Gemini-2.5-Pro-TTS
 Gemini-3-Flash
 Gemini-3-Pro
+Gemini-3.1-Flash-Lite
 Gemini-3.1-Pro
 Gemini-Deep-Research
 Gemma-3-27B
@@ -195,7 +199,6 @@ LTX-2-Pro
 Linkup-Deep-Search
 Linkup-Standard
 LivePortrait
-Llama-3.1-70B-T
 Llama-3.1-8B-CS
 Llama-3.1-8B-DI
 Llama-3.1-8B-FP16
@@ -207,6 +210,7 @@ Llama-4-Maverick-T
 Luma-Photon
 Luma-Photon-Flash
 Lyria
+MOSS-Video-and-Audio
 Magistral-Medium-2509-Thinking
 Manus
 MarkItDown
@@ -225,9 +229,8 @@ Mistral-Small-3.1
 Mixtral8x22b-Inst-FW
 Mochi-preview
 Nano-Banana
+Nano-Banana-2
 Nano-Banana-Pro
-Nano-Banana-Pro-cc
-Nano-Banana-cc
 Nova-Lite-1.0
 Nova-Lite-2
 Nova-Micro-1.0
@@ -237,8 +240,10 @@ OmniHuman
 OpenAI-GPT-OSS-120B
 OpenAI-GPT-OSS-20B
 Orpheus-TTS
+Perplexity-Adv-Deep-Research
 Perplexity-Deep-Research
 Perplexity-Pro-Search
+Perplexity-Search
 Perplexity-Sonar
 Perplexity-Sonar-Pro
 Perplexity-Sonar-Rsn-Pro
@@ -247,6 +252,7 @@ Phoenix-1.0
 Pika-v1.5-Effects
 Pixverse-v4.5
 Pixverse-v5
+Pixverse-v5.6
 Poe-System-Bot
 Python
 Qwen-2.5-7B-T
@@ -256,7 +262,6 @@ Qwen-3-Next-80B-Think
 Qwen-Edit
 Qwen-Image
 Qwen-Image-20B
-Qwen2.5-Coder-32B
 Qwen3-235B-A22B-DI
 Qwen3-235B-A22B-N
 Qwen3-Coder-480B-N
@@ -271,7 +276,6 @@ Qwen3-Next-Instruct-T
 Qwen3-Next-Think-T
 Qwen3-VL-235B-A22B-I
 Qwen3-VL-235B-A22B-T
-Qwen3-VL-32B-T
 Qwen3.5-397B-A17B
 Qwen3.5-397B-A17B-T
 Qwen3.5-Flash
@@ -289,12 +293,14 @@ Runway-Gen-4.5
 SVI-2.0-Pro
 Sana-T2I
 Script-Bot-Creator
+Seed-2.0-Mini
 SeedEdit-3.0
 Seedance-1.0-Lite
 Seedance-1.0-Pro
 Seedance-1.0-Pro-Fast
 Seedream-3.0
 Seedream-4.0
+Seedream-5.0-Lite
 Sketch-to-Image
 Solar-Pro-2
 Sonic-3.0

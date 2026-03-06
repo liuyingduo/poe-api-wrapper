@@ -1871,6 +1871,26 @@
         "owned_by": "google",
         "tokens": 128000
     },
+    "gemini-3.1-flash-lite": {
+        "baseModel": "Gemini-3.1-Flash-Lite",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "google",
+        "tokens": 128000
+    },
+    "Gemini-3.1-Flash-Lite": {
+        "baseModel": "Gemini-3.1-Flash-Lite",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "google",
+        "tokens": 128000
+    },
     "gemini-deep-research": {
         "baseModel": "Gemini-Deep-Research",
         "endpoints": [
@@ -2753,6 +2773,86 @@
     },
     "GPT-5.3-Codex": {
         "baseModel": "GPT-5.3-Codex",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "gpt-5.3-codex-spark": {
+        "baseModel": "GPT-5.3-Codex-Spark",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "GPT-5.3-Codex-Spark": {
+        "baseModel": "GPT-5.3-Codex-Spark",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "gpt-5.3-instant": {
+        "baseModel": "GPT-5.3-Instant",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "GPT-5.3-Instant": {
+        "baseModel": "GPT-5.3-Instant",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "gpt-5.4": {
+        "baseModel": "GPT-5.4",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "GPT-5.4": {
+        "baseModel": "GPT-5.4",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "gpt-5.4-pro": {
+        "baseModel": "GPT-5.4-Pro",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "openai",
+        "tokens": 128000
+    },
+    "GPT-5.4-Pro": {
+        "baseModel": "GPT-5.4-Pro",
         "endpoints": [
             "/v1/chat/completions"
         ],
@@ -4635,6 +4735,26 @@
         "owned_by": "poe",
         "tokens": 128000
     },
+    "moss-video-and-audio": {
+        "baseModel": "MOSS-Video-and-Audio",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "MOSS-Video-and-Audio": {
+        "baseModel": "MOSS-Video-and-Audio",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
     "minimax-m2": {
         "baseModel": "Minimax-M2",
         "endpoints": [
@@ -5325,6 +5445,26 @@
         "owned_by": "google",
         "tokens": 128000
     },
+    "perplexity-adv-deep-research": {
+        "baseModel": "Perplexity-Adv-Deep-Research",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "Perplexity-Adv-Deep-Research": {
+        "baseModel": "Perplexity-Adv-Deep-Research",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
     "perplexity-deep-research": {
         "baseModel": "Perplexity-Deep-Research",
         "endpoints": [
@@ -5357,6 +5497,26 @@
     },
     "Perplexity-Pro-Search": {
         "baseModel": "Perplexity-Pro-Search",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "perplexity-search": {
+        "baseModel": "Perplexity-Search",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "Perplexity-Search": {
+        "baseModel": "Perplexity-Search",
         "endpoints": [
             "/v1/chat/completions"
         ],
@@ -5517,6 +5677,26 @@
     },
     "Pixverse-v5": {
         "baseModel": "Pixverse-v5",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "pixverse-v5.6": {
+        "baseModel": "Pixverse-v5.6",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "Pixverse-v5.6": {
+        "baseModel": "Pixverse-v5.6",
         "endpoints": [
             "/v1/chat/completions"
         ],
@@ -6452,6 +6632,26 @@
         "object": "model",
         "owned_by": "bytedance",
         "tokens": 80
+    },
+    "seed-2.0-mini": {
+        "baseModel": "Seed-2.0-Mini",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
+    },
+    "Seed-2.0-Mini": {
+        "baseModel": "Seed-2.0-Mini",
+        "endpoints": [
+            "/v1/chat/completions"
+        ],
+        "premium_model": false,
+        "object": "model",
+        "owned_by": "poe",
+        "tokens": 128000
     },
     "seedance-1.0-lite": {
         "baseModel": "Seedance-1.0-Lite",

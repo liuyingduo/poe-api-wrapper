@@ -80,6 +80,7 @@ from .types import (
 )
 
 DIR = Path(__file__).resolve().parent
+MODELS_PATH = DIR / "models.json"
 DEFAULT_MODEL_TOKENS = 128000
 DEFAULT_MODEL_ENDPOINTS = [
     "/v1/chat/completions",
@@ -304,8 +305,30 @@ class GatewayRuntime:
     sessions: SessionManager
 
 
-with (DIR / "models.json").open("rb") as f:
-    app.state.models = orjson.loads(f.read())
+def _load_models_from_disk() -> dict[str, Any]:
+    with MODELS_PATH.open("rb") as f:
+        loaded = orjson.loads(f.read())
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Invalid models data in {MODELS_PATH}: root must be an object")
+    return loaded
+
+
+def _reload_models_in_state() -> dict[str, Any]:
+    models = _load_models_from_disk()
+    app.state.models = models
+    stat = MODELS_PATH.stat()
+    loaded_at = int(utc_now().timestamp())
+    return {
+        "status": "ok",
+        "models_count": len(models),
+        "loaded_at": loaded_at,
+        "models_path": str(MODELS_PATH),
+        "file_mtime": int(stat.st_mtime),
+        "file_size_bytes": int(stat.st_size),
+    }
+
+
+app.state.models = _load_models_from_disk()
 
 
 def _runtime() -> GatewayRuntime:
@@ -849,6 +872,23 @@ async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
     result = await runtime.refresher.refresh_all_accounts(
         statuses=statuses,
         concurrency=concurrency,
+    )
+    return JSONResponse(result)
+
+
+@app.post("/admin/models/reload", response_model=None, dependencies=[Depends(require_admin_auth)])
+async def admin_reload_models() -> JSONResponse:
+    try:
+        result = _reload_models_in_state()
+    except Exception as exc:
+        logger.exception("Failed to reload models from {}: {}", MODELS_PATH, exc)
+        _openai_http_error(500, "provider_error", f"Failed to reload models: {exc}")
+
+    logger.info(
+        "admin_reload_models succeeded: models_count={} file_mtime={} path={}",
+        result["models_count"],
+        result["file_mtime"],
+        result["models_path"],
     )
     return JSONResponse(result)
 
