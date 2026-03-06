@@ -24,6 +24,9 @@ class ImagesGenData(BaseModel, extra=Extra.allow):
     model: Any
     n: Optional[int] = 1
     size: Optional[str] = '1024x1024'
+    aspect_ratio: Optional[str] = None
+    image_size: Optional[str] = None
+    parameters: Optional[dict[str, Any]] = None
     
 class ImagesEditData(BaseModel, extra=Extra.allow):
     image: Any
@@ -31,6 +34,9 @@ class ImagesEditData(BaseModel, extra=Extra.allow):
     model: Any
     n: Optional[int] = 1
     size: Optional[str] = '1024x1024'
+    aspect_ratio: Optional[str] = None
+    image_size: Optional[str] = None
+    parameters: Optional[dict[str, Any]] = None
 
 
 class ResponsesData(BaseModel, extra=Extra.allow):

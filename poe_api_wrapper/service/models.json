@@ -5090,6 +5090,12 @@
         "endpoints": [
             "/v1/chat/completions"
         ],
+        "image_sizes": {
+            "none": "",
+            "1k": "1K",
+            "2k": "2K",
+            "4k": "4K"
+        },
         "premium_model": false,
         "object": "model",
         "owned_by": "poe",
@@ -5100,6 +5106,12 @@
         "endpoints": [
             "/v1/chat/completions"
         ],
+        "image_sizes": {
+            "none": "",
+            "1k": "1K",
+            "2k": "2K",
+            "4k": "4K"
+        },
         "premium_model": false,
         "object": "model",
         "owned_by": "poe",

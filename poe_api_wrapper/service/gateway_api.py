@@ -1029,43 +1029,159 @@ def _create_temp_file_path(*, prefix: str, suffix: str) -> str:
     return tmp_path
 
 
-def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
-    # `auto` means "let provider choose default size/aspect", so we do not force any aspect.
-    normalized_size = (size or "").strip().lower()
-    if normalized_size in ("", "auto", "default", "1024x1024"):
-        return ""
+def _parse_image_parameters(parameters: Any) -> Optional[dict[str, Any]]:
+    if parameters is None:
+        return None
+    if isinstance(parameters, dict):
+        return dict(parameters)
+    if isinstance(parameters, str):
+        stripped = parameters.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = orjson.loads(stripped)
+        except Exception:
+            _openai_http_error(400, "invalid_request_error", "Invalid image parameters JSON")
+            raise AssertionError("unreachable")
+        if not isinstance(parsed, dict):
+            _openai_http_error(400, "invalid_request_error", "Image parameters must be a JSON object")
+            raise AssertionError("unreachable")
+        return dict(parsed)
+    _openai_http_error(400, "invalid_request_error", "Invalid image parameters")
+    raise AssertionError("unreachable")
 
-    model_sizes = app.state.models.get(model, {}).get("sizes", {})
-    if size in model_sizes:
-        return model_sizes[size]
 
-    # Accept ratio form like "16:9" and pass through.
-    if ":" in normalized_size:
-        parts = normalized_size.split(":", 1)
+def _normalize_aspect_value(value: str) -> Optional[str]:
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    if text.startswith("--aspect "):
+        text = text[len("--aspect "):].strip()
+    elif text.startswith("--ar "):
+        text = text[len("--ar "):].strip()
+
+    if ":" in text:
+        parts = text.split(":", 1)
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             left = int(parts[0])
             right = int(parts[1])
             if left > 0 and right > 0:
-                return f"--aspect {left}:{right}"
+                return f"{left}:{right}"
 
-    # Accept free-form WxH (e.g. 1536x1024) and convert to reduced ratio.
-    if "x" in normalized_size:
-        parts = normalized_size.split("x", 1)
+    if "x" in text:
+        parts = text.split("x", 1)
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             width = int(parts[0])
             height = int(parts[1])
             if width > 0 and height > 0:
                 gcd_value = math.gcd(width, height)
-                return f"--aspect {width // gcd_value}:{height // gcd_value}"
+                return f"{width // gcd_value}:{height // gcd_value}"
 
-    supported_sizes = ["auto", "1024x1024"]
+    return None
+
+
+def _aspect_parameter_key(model: str, model_meta: dict[str, Any], params: dict[str, Any]) -> str:
+    if "aspect_ratio" in params:
+        return "aspect_ratio"
+    if "aspect" in params:
+        return "aspect"
+    configured = model_meta.get("aspect_parameter")
+    if isinstance(configured, str) and configured.strip() in {"aspect", "aspect_ratio"}:
+        return configured.strip()
+    base_model = str(model_meta.get("baseModel", "")).strip().lower()
+    normalized_model = str(model or "").strip().lower()
+    if "nano-banana" in normalized_model or "nano-banana" in base_model:
+        return "aspect_ratio"
+    return "aspect"
+
+
+def _resolve_image_generation_config(
+    model: str,
+    size: Optional[str],
+    aspect_ratio: Optional[str] = None,
+    image_size: Optional[str] = None,
+    parameters: Any = None,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    model_meta = app.state.models.get(model, {})
+    model_sizes = model_meta.get("sizes", {})
+    image_sizes = model_meta.get("image_sizes", {})
+    resolved_parameters = _parse_image_parameters(parameters) or {}
+
+    resolved_image_size_key = ""
+    normalized_image_size = (image_size or "").strip().lower()
+    if normalized_image_size:
+        resolved_image_size_key = normalized_image_size
+    else:
+        normalized_size = (size or "").strip().lower()
+        if isinstance(image_sizes, dict):
+            normalized_image_sizes = {str(k).strip().lower(): v for k, v in image_sizes.items()}
+            if normalized_size in normalized_image_sizes:
+                resolved_image_size_key = normalized_size
+
+    if isinstance(image_sizes, dict) and resolved_image_size_key:
+        normalized_image_sizes = {str(k).strip().lower(): v for k, v in image_sizes.items()}
+        normalized_image_values = {str(v).strip().lower(): str(v).strip() for v in image_sizes.values()}
+        image_size_value = normalized_image_sizes.get(resolved_image_size_key)
+        if image_size_value is None:
+            image_size_value = normalized_image_values.get(resolved_image_size_key)
+        if image_size_value is not None:
+            image_size_text = str(image_size_value).strip()
+            if image_size_text:
+                resolved_parameters["image_size"] = image_size_text
+        else:
+            supported_image_sizes = sorted(set(str(k) for k in image_sizes.keys()) | set(str(v) for v in image_sizes.values()))
+            _openai_http_error(
+                400,
+                "invalid_request_error",
+                f"Invalid image_size for model {model}. Supported values: {supported_image_sizes}",
+            )
+            raise AssertionError("unreachable")
+
+    candidate_aspect = (aspect_ratio or "").strip()
+    if not candidate_aspect:
+        normalized_size = (size or "").strip().lower()
+        if normalized_size not in ("", "auto", "default", "1024x1024") and normalized_size != resolved_image_size_key:
+            candidate_aspect = (size or "").strip()
+
+    normalized_aspect = candidate_aspect.lower()
+    if normalized_aspect in ("", "auto", "default", "1024x1024"):
+        return "", resolved_parameters or None
+
+    resolved_ratio: Optional[str] = None
     if isinstance(model_sizes, dict):
-        supported_sizes.extend(model_sizes.keys())
+        direct = model_sizes.get(candidate_aspect)
+        if isinstance(direct, str):
+            resolved_ratio = _normalize_aspect_value(direct)
+        if resolved_ratio is None:
+            normalized_size_map = {str(k).strip().lower(): v for k, v in model_sizes.items()}
+            normalized_hit = normalized_size_map.get(normalized_aspect)
+            if isinstance(normalized_hit, str):
+                resolved_ratio = _normalize_aspect_value(normalized_hit)
+
+    if resolved_ratio is None:
+        resolved_ratio = _normalize_aspect_value(candidate_aspect)
+
+    if resolved_ratio is not None:
+        key = _aspect_parameter_key(model, model_meta, resolved_parameters)
+        resolved_parameters[key] = resolved_ratio
+        return "", resolved_parameters or None
+
+    supported_sizes = ["auto", "default", "1024x1024"]
+    if isinstance(model_sizes, dict):
+        supported_sizes.extend(str(k) for k in model_sizes.keys())
+    if isinstance(image_sizes, dict):
+        supported_sizes.extend(str(k) for k in image_sizes.keys())
     _openai_http_error(
         400,
         "invalid_request_error",
-        f"Invalid size for model {model}. Supported values: {sorted(set(supported_sizes))}",
+        f"Invalid aspect ratio or size for model {model}. Supported values: {sorted(set(supported_sizes))}",
     )
+    raise AssertionError("unreachable")
+
+
+def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
+    aspect_ratio, _ = _resolve_image_generation_config(model, size)
+    return aspect_ratio
 
 
 async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[str], List[str]]:
@@ -1123,7 +1239,13 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     return resolved_paths, temp_files
 
 
-async def generate_image(client, response: dict, aspect_ratio: str, image: list = None) -> str:
+async def generate_image(
+    client,
+    response: dict,
+    aspect_ratio: str,
+    image: list = None,
+    parameters: Optional[dict[str, Any]] = None,
+) -> str:
     image = image or []
     message = (response.get("message") or "").strip()
     normalized_aspect = (aspect_ratio or "").strip()
@@ -1134,6 +1256,7 @@ async def generate_image(client, response: dict, aspect_ratio: str, image: list 
             bot=response["bot"],
             message=message,
             file_path=image,
+            parameters=parameters,
         ):
             pass
         # 优先从 attachments 中提取图片 URL（如 Qwen-Image 等把图片作为附件返回的模型）
@@ -1787,6 +1910,9 @@ async def create_images(
 ) -> JSONResponse:
     runtime = _runtime()
     prompt, model, n, size = data.prompt, data.model, data.n, data.size
+    aspect_ratio = data.aspect_ratio
+    image_size = data.image_size
+    raw_parameters = data.parameters
     request.state.model = model
 
     if not isinstance(prompt, str):
@@ -1796,7 +1922,13 @@ async def create_images(
     if not isinstance(n, int) or n < 1:
         _openai_http_error(400, "invalid_request_error", "Invalid n value")
 
-    aspect_ratio = _resolve_image_aspect(model, size)
+    aspect_ratio, image_parameters = _resolve_image_generation_config(
+        model,
+        size,
+        aspect_ratio=aspect_ratio,
+        image_size=image_size,
+        parameters=raw_parameters,
+    )
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
@@ -1830,7 +1962,7 @@ async def create_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio)
+            image_generation = await generate_image(client, response, aspect_ratio, parameters=image_parameters)
             logger.info("Raw image generation response for model={}: {!r}", model, image_generation)
             extracted = [url for url in image_generation.split() if url.startswith("https://")]
             if not extracted:
@@ -1908,15 +2040,23 @@ async def edit_images(
         model = form.get("model")
         raw_n = form.get("n", 1)
         raw_size = form.get("size", "1024x1024")
+        raw_aspect_ratio = form.get("aspect_ratio")
+        raw_image_size = form.get("image_size")
+        raw_parameters = form.get("parameters")
         try:
             n = int(raw_n)
         except Exception:
             _openai_http_error(400, "invalid_request_error", "Invalid n value")
         size = raw_size if isinstance(raw_size, str) else "1024x1024"
+        aspect_ratio = raw_aspect_ratio if isinstance(raw_aspect_ratio, str) else None
+        image_size = raw_image_size if isinstance(raw_image_size, str) else None
     else:
         payload = await request.json()
         data = ImagesEditData(**payload)
         image, prompt, model, n, size = data.image, data.prompt, data.model, data.n, data.size
+        aspect_ratio = data.aspect_ratio
+        image_size = data.image_size
+        raw_parameters = data.parameters
 
     request.state.model = model
 
@@ -1932,7 +2072,13 @@ async def edit_images(
     if not isinstance(n, int) or n < 1:
         _openai_http_error(400, "invalid_request_error", "Invalid n value")
 
-    aspect_ratio = _resolve_image_aspect(model, size)
+    aspect_ratio, image_parameters = _resolve_image_generation_config(
+        model,
+        size,
+        aspect_ratio=aspect_ratio,
+        image_size=image_size,
+        parameters=raw_parameters,
+    )
 
     model_data = app.state.models[model]
     base_model = model_data["baseModel"]
@@ -1993,7 +2139,13 @@ async def edit_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio, [edit_attachment])
+            image_generation = await generate_image(
+                client,
+                response,
+                aspect_ratio,
+                [edit_attachment],
+                parameters=image_parameters,
+            )
             logger.info("Raw edit generation response for model={}: {!r}", model, image_generation)
             extracted = [url for url in image_generation.split() if url.startswith("https://")]
             if not extracted:

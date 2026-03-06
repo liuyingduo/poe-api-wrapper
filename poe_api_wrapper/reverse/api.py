@@ -3,7 +3,7 @@ from httpx import Client
 from requests_toolbelt import MultipartEncoder
 import os, secrets, string, random, websocket, threading, queue, ssl, hashlib, re, uuid
 from loguru import logger
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 try:
     import orjson
@@ -965,6 +965,7 @@ class PoeApi:
         chatCode: str = None,
         msgPrice: int = 20,
         file_path: Optional[list] = None,
+        parameters: Optional[dict[str, Any] | str] = None,
         suggest_replies: bool = False,
         timeout: int = 5,
     ) -> Generator[dict, None, None]:
@@ -1001,6 +1002,12 @@ class PoeApi:
             file_hash_jwts = self.finish_upload(file_form)
         
         msgPrice = None
+        serialized_parameters: Optional[str] = None
+        if isinstance(parameters, str):
+            stripped = parameters.strip()
+            serialized_parameters = stripped or None
+        elif isinstance(parameters, dict):
+            serialized_parameters = orjson.dumps(parameters).decode("utf-8")
             
         if (chatId == None and chatCode == None):
             try:
@@ -1015,7 +1022,7 @@ class PoeApi:
                                 "existingMessageAttachmentsIds":[],
                                 "chatNonce": generate_nonce(),
                                 "referencedMessageId": None,
-                                "parameters": None,
+                                "parameters": serialized_parameters,
                                 "fileHashJwts": file_hash_jwts
                             }
                 message_data = None
@@ -1088,7 +1095,7 @@ class PoeApi:
                             "existingMessageAttachmentsIds":[],
                             "chatNonce": generate_nonce(),
                             "referencedMessageId": None,
-                            "parameters": None,
+                            "parameters": serialized_parameters,
                             "fileHashJwts": file_hash_jwts
                         }
             

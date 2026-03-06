@@ -1,6 +1,6 @@
 from httpx import AsyncClient
 import asyncio, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid, time
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
 
@@ -1298,6 +1298,7 @@ class AsyncPoeApi:
         chatCode: str = None,
         msgPrice: int = 20,
         file_path: Optional[list] = None,
+        parameters: Optional[dict[str, Any] | str] = None,
         suggest_replies: bool = False,
         timeout: int = 5,
     ) -> AsyncIterator[dict]:
@@ -1335,7 +1336,13 @@ class AsyncPoeApi:
             file_hash_jwts = await self.finish_upload(file_form)
         
         msgPrice = None
-        
+        serialized_parameters: Optional[str] = None
+        if isinstance(parameters, str):
+            stripped = parameters.strip()
+            serialized_parameters = stripped or None
+        elif isinstance(parameters, dict):
+            serialized_parameters = orjson.dumps(parameters).decode("utf-8")
+
         if (chatId == None and chatCode == None):
             try:
                 variables = {
@@ -1349,7 +1356,7 @@ class AsyncPoeApi:
                                 "existingMessageAttachmentsIds":[],
                                 "chatNonce": generate_nonce(),
                                 "referencedMessageId": None,
-                                "parameters": None,
+                                "parameters": serialized_parameters,
                                 "fileHashJwts": file_hash_jwts
                             }
                 message_data = None
@@ -1418,11 +1425,11 @@ class AsyncPoeApi:
                             'source': { "sourceType": "chat_input", "chatInputMetadata": {"useVoiceRecord": False}}, 
                             "clientNonce": generate_nonce(), 
                             'sdid': str(uuid.uuid4()), 
-                            'attachments': attachments, 
+                            'attachments': attachments,
                             "existingMessageAttachmentsIds":[],
                             "chatNonce": generate_nonce(),
                             "referencedMessageId": None,
-                            "parameters": None,
+                            "parameters": serialized_parameters,
                             "fileHashJwts": file_hash_jwts
                         }
             
