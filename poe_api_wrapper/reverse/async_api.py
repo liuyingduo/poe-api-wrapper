@@ -36,6 +36,8 @@ from .utils import (
                     BOTS_LIST, 
                     REVERSE_BOTS_LIST, 
                     bot_map, 
+                    ensure_model_parameters,
+                    is_nano_banana_model,
                     generate_nonce, 
                     generate_file,
                     extract_tchannel_data_from_html,
@@ -1320,6 +1322,8 @@ class AsyncPoeApi:
         bot_candidates = [bot]
         if bot_input != bot:
             bot_candidates.append(bot_input)
+        if is_nano_banana_model(bot_input) or is_nano_banana_model(bot):
+            parameters = ensure_model_parameters(bot_input, parameters)
         attachments = []
         file_hash_jwts = []
         

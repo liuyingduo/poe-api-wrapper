@@ -136,6 +136,37 @@ def bot_map(bot):
         return BOTS_LIST[bot]
     return bot.lower().replace(' ', '')
 
+
+def is_nano_banana_model(bot: Optional[str]) -> bool:
+    normalized = str(bot or "").strip().lower()
+    return "nano-banana-2" in normalized
+
+
+def ensure_model_parameters(bot: Optional[str], parameters: Any) -> Any:
+    if not is_nano_banana_model(bot):
+        return parameters
+
+    if parameters is None:
+        return {"image_only": True}
+
+    if isinstance(parameters, dict):
+        next_parameters = dict(parameters)
+        next_parameters["image_only"] = True
+        return next_parameters
+
+    if isinstance(parameters, str):
+        stripped = parameters.strip()
+        if not stripped:
+            return {"image_only": True}
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return parameters
+        if isinstance(parsed, dict):
+            parsed["image_only"] = True
+            return parsed
+    return parameters
+
 def generate_nonce(length:int=16):
       return "".join(secrets.choice(string.ascii_letters + string.digits) for i in range(length))
 
