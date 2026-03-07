@@ -1546,7 +1546,9 @@ class PoolMonitor:
         repo: AccountRepository,
         pool: PoeClientPool,
         *,
-        target_pool_size: int = 30,
+        target_pool_size: int = 20,
+        min_pool_size: int = 5,
+        max_pool_size: int = 30,
         fill_concurrency: int = 10,
         monitor_interval_seconds: int = 5,
         connect_timeout_seconds: int = 20,
@@ -1554,7 +1556,14 @@ class PoolMonitor:
     ):
         self.repo = repo
         self.pool = pool
-        self.target_pool_size = max(1, target_pool_size)
+        # 动态调整范围
+        self.min_pool_size = max(1, min_pool_size)
+        self.max_pool_size = max(self.min_pool_size, max_pool_size)
+        # 初始值在范围内
+        self.target_pool_size = max(
+            self.min_pool_size,
+            min(self.max_pool_size, target_pool_size),
+        )
         self.fill_concurrency = max(1, fill_concurrency)
         self.monitor_interval_seconds = max(1, monitor_interval_seconds)
         self.connect_timeout_seconds = max(5, connect_timeout_seconds)
@@ -1576,8 +1585,10 @@ class PoolMonitor:
         self._monitor_task = asyncio.create_task(self._monitor_loop(), name="pool-monitor")
         self._ttl_task = asyncio.create_task(self._ttl_loop(), name="pool-ttl-cleanup")
         logger.info(
-            "PoolMonitor started: target={} concurrency={} interval={}s ttl_check={}s",
+            "PoolMonitor started: target={} (range {}-{}) concurrency={} interval={}s ttl_check={}s",
             self.target_pool_size,
+            self.min_pool_size,
+            self.max_pool_size,
             self.fill_concurrency,
             self.monitor_interval_seconds,
             self.ttl_check_interval_seconds,
@@ -1634,16 +1645,42 @@ class PoolMonitor:
         if not expired_ids:
             return
         logger.info("PoolMonitor TTL: evicting {} expired client(s)", len(expired_ids))
+        evicted_count = 0
         for account_id in expired_ids:
             try:
                 await self.pool.invalidate_client(account_id)
+                evicted_count += 1
             except Exception as exc:
                 logger.debug("TTL evict failed for {}: {}", mask_secret(account_id), exc)
+        # TTL 正常过期销毁，动态降低池子大小
+        if evicted_count > 0:
+            old_size = self.target_pool_size
+            self.target_pool_size = max(self.min_pool_size, self.target_pool_size - evicted_count)
+            if self.target_pool_size != old_size:
+                logger.info(
+                    "PoolMonitor: TTL evicted {} client(s), target_pool_size {} -> {}",
+                    evicted_count,
+                    old_size,
+                    self.target_pool_size,
+                )
 
     async def _fill_pool(self) -> None:
         current_count = len(self.pool.cached_account_ids())
         async with self._connecting_lock:
             in_flight = len(self._connecting)
+
+        # 动态调整：池子数量过低时增加 target_pool_size
+        if current_count < 3:
+            old_size = self.target_pool_size
+            self.target_pool_size = min(self.max_pool_size, self.target_pool_size + 10)
+            if self.target_pool_size != old_size:
+                logger.info(
+                    "PoolMonitor: pool too low ({}), target_pool_size {} -> {}",
+                    current_count,
+                    old_size,
+                    self.target_pool_size,
+                )
+
         deficit = self.target_pool_size - current_count - in_flight
 
         # 每次都计算中位数（用于监控和日志）

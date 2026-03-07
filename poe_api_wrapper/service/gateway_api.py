@@ -255,6 +255,8 @@ class GatewayConfig:
     depleted_threshold: int
     cooldown_seconds: int
     target_pool_size: int
+    min_pool_size: int
+    max_pool_size: int
     pool_fill_concurrency: int
     pool_monitor_interval_seconds: int
     pool_connect_timeout_seconds: int
@@ -279,7 +281,9 @@ class GatewayConfig:
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
-            target_pool_size=_env_int("TARGET_POOL_SIZE", 30),
+            target_pool_size=_env_int("TARGET_POOL_SIZE", 20),
+            min_pool_size=_env_int("MIN_POOL_SIZE", 5),
+            max_pool_size=_env_int("MAX_POOL_SIZE", 30),
             pool_fill_concurrency=_env_int("POOL_FILL_CONCURRENCY", 10),
             pool_monitor_interval_seconds=_env_int("POOL_MONITOR_INTERVAL_SECONDS", 5),
             pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 20),
@@ -590,6 +594,8 @@ async def startup_event() -> None:
         repo=repo,
         pool=pool,
         target_pool_size=config.target_pool_size,
+        min_pool_size=config.min_pool_size,
+        max_pool_size=config.max_pool_size,
         fill_concurrency=config.pool_fill_concurrency,
         monitor_interval_seconds=config.pool_monitor_interval_seconds,
         connect_timeout_seconds=config.pool_connect_timeout_seconds,
