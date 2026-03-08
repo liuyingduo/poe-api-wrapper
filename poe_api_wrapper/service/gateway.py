@@ -333,6 +333,7 @@ class AccountRepository:
         self.accounts = self.db["accounts"]
         self.sessions = self.db["sessions"]
         self.service_api_keys = self.db["service_api_keys"]
+        self.metadata = self.db["metadata"]
         self.crypto = crypto
 
     async def _run(self, fn, *args, **kwargs):
@@ -611,6 +612,23 @@ class AccountRepository:
             )
 
         return await self._run(_op)
+
+    async def get_cursor(self, key: str) -> Optional[Any]:
+        """从 metadata 集合读取持久化游标值，不存在则返回 None。"""
+        def _op():
+            doc = self.metadata.find_one({"_id": key})
+            return doc.get("value") if doc else None
+        return await self._run(_op)
+
+    async def set_cursor(self, key: str, value: Any) -> None:
+        """原子更新持久化游标值（upsert）。"""
+        def _op():
+            self.metadata.find_one_and_update(
+                {"_id": key},
+                {"$set": {"value": value, "updated_at": utc_now()}},
+                upsert=True,
+            )
+        await self._run(_op)
 
     async def get_used_account_balances(self) -> list[int]:
         """返回所有 ever_connected=True 的 active 账号余额，用于计算中位数。"""
@@ -1572,8 +1590,10 @@ class PoolMonitor:
         self._stopped = asyncio.Event()
         self._monitor_task: Optional[asyncio.Task] = None
         self._ttl_task: Optional[asyncio.Task] = None
-        # 记录扫描游标（上次扫到的最后一个 _id）
+        # 记录扫描游标（上次扫到的最后一个 _id），启动时从 DB 加载
         self._last_scanned_id: Optional[Any] = None
+        self._cursor_loaded = False
+        self._cursor_key = "pool_monitor_cursor"
         # 正在建连的账号 id 集合，避免重复
         self._connecting: set[str] = set()
         self._connecting_lock = asyncio.Lock()
@@ -1665,6 +1685,12 @@ class PoolMonitor:
                 )
 
     async def _fill_pool(self) -> None:
+        # 首次执行时从 DB 加载游标位置
+        if not self._cursor_loaded:
+            self._last_scanned_id = await self.repo.get_cursor(self._cursor_key)
+            self._cursor_loaded = True
+            logger.info("PoolMonitor: loaded cursor from DB: {}", self._last_scanned_id)
+
         current_count = len(self.pool.cached_account_ids())
         async with self._connecting_lock:
             in_flight = len(self._connecting)
@@ -1767,6 +1793,9 @@ class PoolMonitor:
                 # 这批没取满，说明已到末尾，重置游标
                 self._last_scanned_id = None
                 break
+
+        # 持久化游标到 DB
+        await self.repo.set_cursor(self._cursor_key, self._last_scanned_id)
 
         if enqueued > 0:
             logger.info(
