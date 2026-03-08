@@ -316,7 +316,7 @@ class GatewayConfig:
             max_pool_size=_env_int("MAX_POOL_SIZE", 30),
             pool_fill_concurrency=_env_int("POOL_FILL_CONCURRENCY", 10),
             pool_monitor_interval_seconds=_env_int("POOL_MONITOR_INTERVAL_SECONDS", 5),
-            pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 20),
+            pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 40),
             pool_ttl_check_interval_seconds=_env_int("POOL_TTL_CHECK_INTERVAL_SECONDS", 30),
             client_max_age_seconds=_env_int("CLIENT_MAX_AGE_SECONDS", 600),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
