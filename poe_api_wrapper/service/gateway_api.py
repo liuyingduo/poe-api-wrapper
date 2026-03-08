@@ -90,6 +90,25 @@ DEFAULT_MODEL_ENDPOINTS = [
 
 # Poe 上游以累积全文（而非增量 delta）返回 chunk 的 baseModel 列表（小写匹配）。
 # gateway 层会自动做差值处理，将其转换为标准逐块流。
+_RETRYABLE_STATUS_CODES = {402, 403, 429, 500, 502, 503, 504}
+_MAX_CHAT_ATTEMPTS = 2
+
+# 重试时的模型降级映射（前缀 → 降级目标 baseModel）
+_RETRY_DOWNGRADE_RULES: list[tuple[str, str]] = [
+    ("gpt", "GPT-5-nano"),
+    ("claude", "Claude-Haiku-4.5"),
+    ("gemini", "Gemini-3.1-Flash-Lite"),
+]
+
+
+def _downgrade_bot_for_retry(bot: str) -> str:
+    """重试时将高端模型降级为轻量模型，减少资源消耗。返回降级后的 baseModel 名。"""
+    lower = bot.lower()
+    for prefix, fallback_bot in _RETRY_DOWNGRADE_RULES:
+        if lower.startswith(prefix):
+            return fallback_bot
+    return bot
+
 CUMULATIVE_RESPONSE_BOTS: set[str] = {
     "deepseek-v3.1-t",
     "deepseek-v3.2",
@@ -1416,6 +1435,7 @@ async def generate_chunks(
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
     emitted_done = False
+    has_content = False
     completion_tokens = 0
     finish_reason = "stop"
     is_cumulative = response["bot"].lower() in CUMULATIVE_RESPONSE_BOTS
@@ -1467,6 +1487,7 @@ async def generate_chunks(
                     include_usage=include_usage,
                 )
                 yield b"data: " + orjson.dumps(content) + b"\n\n"
+                has_content = True
 
                 if str(chunk.get("state", "")).lower() == "complete":
                     attachment_urls = _extract_attachment_urls(chunk)
@@ -1522,8 +1543,117 @@ async def generate_chunks(
             session_id=session_id,
             persistent_session=persistent_session,
             exc=exc,
+            model=model,
         )
-        shared_state["error_decision"] = error_decision  # 保存错误决策，供 BackgroundTask 使用
+
+        # --- 流式重试：尚未向客户端发送任何内容时，换账号重试一次 ---
+        if not has_content:
+            # 先清理失败的账号（原有逻辑不变）
+            await _finalize_account_use(
+                runtime,
+                account_id=account_id,
+                lease=lease,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                success=False,
+                error_decision=error_decision,
+                evict_client=True,
+                release_lease=True,
+            )
+            # 尝试获取新账号重试
+            try:
+                new_doc, new_lease = await _acquire_prewarmed_account(runtime)
+                new_account_id = str(new_doc["_id"])
+                new_client = await runtime.pool.get_client_for_account(new_doc, create_if_missing=False)
+            except Exception:
+                # 拿不到新账号，回退到原有错误输出
+                logger.warning("stream_retry failed: no account available for retry, model={}", model)
+            else:
+                retry_bot = _downgrade_bot_for_retry(response["bot"])
+                logger.warning(
+                    "stream_retry account_id={} -> {} bot={} -> {} model={}",
+                    mask_secret(account_id), mask_secret(new_account_id),
+                    response["bot"], retry_bot, model,
+                )
+                # 更新 shared_state，让 BackgroundTask 清理新账号
+                shared_state["account_id"] = new_account_id
+                shared_state["lease"] = new_lease
+                account_id = new_account_id
+                client = new_client
+                lease = new_lease
+
+                # 重试 send_message（使用降级后的模型）
+                retry_ok = False
+                is_cumulative = retry_bot.lower() in CUMULATIVE_RESPONSE_BOTS
+                try:
+                    prev_cumulative_text = ""
+                    async for chunk in new_client.send_message(
+                        bot=retry_bot,
+                        message=response["message"],
+                        file_path=attachment_paths,
+                        chatCode=None,
+                        chatId=None,
+                        parameters=chat_parameters,
+                    ):
+                        completion_tokens = await helpers.__tokenize(chunk["text"])
+                        if max_tokens and completion_tokens >= max_tokens:
+                            await new_client.cancel_message(chunk)
+                            finish_reason = "length"
+                            break
+
+                        if is_cumulative:
+                            full_text = chunk["text"] or ""
+                            delta = full_text[len(prev_cumulative_text):]
+                            prev_cumulative_text = full_text
+                        else:
+                            delta = chunk["response"]
+
+                        if not delta:
+                            continue
+
+                        retry_content = await create_completion_data(
+                            completion_id=completion_id,
+                            created=completion_timestamp,
+                            model=model,
+                            chunk=delta,
+                            include_usage=include_usage,
+                        )
+                        yield b"data: " + orjson.dumps(retry_content) + b"\n\n"
+                        has_content = True
+                        await asyncio.sleep(0.001)
+
+                    end_chunk = await create_completion_data(
+                        completion_id=completion_id,
+                        created=completion_timestamp,
+                        model=model,
+                        finish_reason=finish_reason,
+                        include_usage=include_usage,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
+                    yield b"data: " + orjson.dumps(end_chunk) + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+                    emitted_done = True
+                    shared_state["succeeded"] = True
+                    retry_ok = True
+                except Exception as retry_exc:
+                    retry_decision = await _account_error_payload(
+                        account_id=new_account_id,
+                        session_id=session_id,
+                        persistent_session=persistent_session,
+                        exc=retry_exc,
+                        model=model,
+                    )
+                    shared_state["error_decision"] = retry_decision
+                    yield b"data: " + orjson.dumps(retry_decision.payload) + b"\n\n"
+                    if not emitted_done:
+                        yield b"data: [DONE]\n\n"
+                    return
+                if retry_ok:
+                    return
+
+        # 无法重试或已有内容输出，按原逻辑返回错误
+        shared_state["error_decision"] = error_decision
         yield b"data: " + orjson.dumps(error_decision.payload) + b"\n\n"
         if not emitted_done:
             yield b"data: [DONE]\n\n"
@@ -1552,17 +1682,22 @@ async def streaming_response(
     chat_parameters: Optional[dict[str, Any]],
 ) -> StreamingResponse:
 
-    # 用于在生成器和后台任务间共享执行结果
-    shared_state = {"succeeded": False, "error_decision": None}
+    # 用于在生成器和后台任务间共享执行结果（含重试后的账号信息）
+    shared_state: dict[str, Any] = {
+        "succeeded": False,
+        "error_decision": None,
+        "account_id": account_id,
+        "lease": lease,
+    }
 
     # 定义后台清理任务，在流式响应彻底结束后必定执行
     async def cleanup_task():
         _cleanup_temp_files(temp_files)
-        # 销毁 client 并释放 lease
+        # 销毁 client 并释放 lease（可能已被重试更新为新账号）
         await _finalize_account_use(
             runtime,
-            account_id=account_id,
-            lease=lease,
+            account_id=shared_state["account_id"],
+            lease=shared_state["lease"],
             session_id=session_id,
             persistent_session=persistent_session,
             success=shared_state["succeeded"],
@@ -1839,82 +1974,18 @@ async def _chat_completions_impl(
     session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
     request.state.session_id = session_id
 
-    account_doc, lease, chat_code, chat_id = await _acquire_account_for_chat(
-        runtime,
-        session_id=session_id,
-        persistent_session=persistent_session,
-        model=model,
-    )
-    account_id = str(account_doc["_id"])
-    request.state.account_id = account_id
-
-    # Premium model 检查：如果需要 subscription 但账号没有，直接拒绝
-    if premium_model and not bool(account_doc.get("subscription_active", False)):
-        await _finalize_account_use(
-            runtime,
-            account_id=account_id,
-            lease=lease,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            success=False,
-            evict_client=True,
-        )
-        _openai_http_error(
-            402,
-            "insufficient_credits",
-            "Premium model requires an active subscription on selected account",
-        )
-
-    try:
-        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
-    except Exception as exc:
-        error_decision = await _account_error_payload(
-            account_id=account_id,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            exc=exc,
-        )
-        await _finalize_account_use(
-            runtime,
-            account_id=account_id,
-            lease=lease,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            success=False,
-            error_decision=error_decision,
-            evict_client=True,
-        )
-        raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
-
+    # --- 消息预处理（与账号无关，只做一次）---
     text_messages, image_urls = await helpers.__split_content(messages)
-    response = await message_handler(base_model, text_messages, tokens_limit)
-    prompt_tokens = await helpers.__tokenize("".join([str(message) for message in response["message"]]))
+    msg_response = await message_handler(base_model, text_messages, tokens_limit)
+    prompt_tokens = await helpers.__tokenize("".join([str(message) for message in msg_response["message"]]))
 
     if prompt_tokens > tokens_limit:
-        await _finalize_account_use(
-            runtime,
-            account_id=account_id,
-            lease=lease,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            success=False,
-            evict_client=True,
-        )
         _openai_http_error(
             413,
             "request_too_large",
             f"Your prompt exceeds the maximum context length of {tokens_limit} tokens",
         )
     if max_tokens and (max_tokens + prompt_tokens) > tokens_limit:
-        await _finalize_account_use(
-            runtime,
-            account_id=account_id,
-            lease=lease,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            success=False,
-            evict_client=True,
-        )
         _openai_http_error(
             413,
             "request_too_large",
@@ -1924,88 +1995,178 @@ async def _chat_completions_impl(
             ),
         )
 
-    raw_tool_calls = None
-    if tools:
-        raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
-    if raw_tool_calls:
-        response = {"bot": "gpt4_o_mini", "message": ""}
-        prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
+    # --- 重试循环（账号相关）---
+    last_exc: Optional[HTTPException] = None
+    for attempt in range(_MAX_CHAT_ATTEMPTS):
+        is_last = attempt >= _MAX_CHAT_ATTEMPTS - 1
 
-    completion_id = await helpers.__generate_completion_id()
-
-    attachment_paths: List[str] = []
-    temp_files: List[str] = []
-    if not raw_tool_calls and image_urls:
-        try:
-            attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
-        except HTTPException:
-            await _finalize_account_use(
-                runtime,
-                account_id=account_id,
-                lease=lease,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                success=False,
-                evict_client=True,
-            )
-            raise
-        except Exception as exc:
-            await _finalize_account_use(
-                runtime,
-                account_id=account_id,
-                lease=lease,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                success=False,
-                evict_client=True,
-            )
-            _openai_http_error(
-                400,
-                "invalid_request_error",
-                f"Failed to process attachments: {exc}",
-            )
-
-    if streaming:
-        return await streaming_response(
-            runtime=runtime,
-            client=client,
-            response=response,
-            model=model,
-            completion_id=completion_id,
-            prompt_tokens=prompt_tokens,
-            attachment_paths=attachment_paths,
-            temp_files=temp_files,
-            max_tokens=max_tokens,
-            include_usage=include_usage,
-            raw_tool_calls=raw_tool_calls,
-            chat_code=chat_code,
-            chat_id=chat_id,
+        account_doc, lease, chat_code, chat_id = await _acquire_account_for_chat(
+            runtime,
             session_id=session_id,
             persistent_session=persistent_session,
-            account_id=account_id,
-            lease=lease,
-            chat_parameters=chat_parameters,
+            model=model,
         )
+        account_id = str(account_doc["_id"])
+        request.state.account_id = account_id
 
-    return await non_streaming_response(
-        runtime=runtime,
-        client=client,
-        response=response,
-        model=model,
-        completion_id=completion_id,
-        prompt_tokens=prompt_tokens,
-        attachment_paths=attachment_paths,
-        temp_files=temp_files,
-        max_tokens=max_tokens,
-        raw_tool_calls=raw_tool_calls,
-        chat_code=chat_code,
-        chat_id=chat_id,
-        session_id=session_id,
-        persistent_session=persistent_session,
-        account_id=account_id,
-        lease=lease,
-        chat_parameters=chat_parameters,
-    )
+        # Premium model 检查
+        if premium_model and not bool(account_doc.get("subscription_active", False)):
+            await _finalize_account_use(
+                runtime,
+                account_id=account_id,
+                lease=lease,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                success=False,
+                evict_client=True,
+            )
+            if not is_last:
+                logger.warning(
+                    "chat_retry attempt={}/{} reason=no_subscription account_id={} model={}",
+                    attempt + 1, _MAX_CHAT_ATTEMPTS, mask_secret(account_id), model,
+                )
+                continue
+            _openai_http_error(
+                402,
+                "insufficient_credits",
+                "Premium model requires an active subscription on selected account",
+            )
+
+        try:
+            client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
+        except Exception as exc:
+            error_decision = await _account_error_payload(
+                account_id=account_id,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                exc=exc,
+                model=model,
+            )
+            await _finalize_account_use(
+                runtime,
+                account_id=account_id,
+                lease=lease,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                success=False,
+                error_decision=error_decision,
+                evict_client=True,
+            )
+            if not is_last:
+                logger.warning(
+                    "chat_retry attempt={}/{} status={} account_id={} model={}",
+                    attempt + 1, _MAX_CHAT_ATTEMPTS, error_decision.status_code, mask_secret(account_id), model,
+                )
+                continue
+            raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
+
+        # 重试时降级模型
+        if attempt > 0:
+            retry_bot = _downgrade_bot_for_retry(msg_response["bot"])
+            response = {**msg_response, "bot": retry_bot}
+            logger.warning(
+                "chat_retry downgrade bot={} -> {} model={}",
+                msg_response["bot"], retry_bot, model,
+            )
+        else:
+            response = msg_response
+
+        # Tool calls（依赖 client）
+        raw_tool_calls = None
+        if tools:
+            raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
+        if raw_tool_calls:
+            response = {"bot": "gpt4_o_mini", "message": ""}
+            prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
+
+        completion_id = await helpers.__generate_completion_id()
+
+        attachment_paths: List[str] = []
+        temp_files: List[str] = []
+        if not raw_tool_calls and image_urls:
+            try:
+                attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
+            except HTTPException:
+                await _finalize_account_use(
+                    runtime,
+                    account_id=account_id,
+                    lease=lease,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    success=False,
+                    evict_client=True,
+                )
+                raise
+            except Exception as exc:
+                await _finalize_account_use(
+                    runtime,
+                    account_id=account_id,
+                    lease=lease,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    success=False,
+                    evict_client=True,
+                )
+                _openai_http_error(
+                    400,
+                    "invalid_request_error",
+                    f"Failed to process attachments: {exc}",
+                )
+
+        if streaming:
+            return await streaming_response(
+                runtime=runtime,
+                client=client,
+                response=response,
+                model=model,
+                completion_id=completion_id,
+                prompt_tokens=prompt_tokens,
+                attachment_paths=attachment_paths,
+                temp_files=temp_files,
+                max_tokens=max_tokens,
+                include_usage=include_usage,
+                raw_tool_calls=raw_tool_calls,
+                chat_code=chat_code,
+                chat_id=chat_id,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                account_id=account_id,
+                lease=lease,
+                chat_parameters=chat_parameters,
+            )
+
+        try:
+            return await non_streaming_response(
+                runtime=runtime,
+                client=client,
+                response=response,
+                model=model,
+                completion_id=completion_id,
+                prompt_tokens=prompt_tokens,
+                attachment_paths=attachment_paths,
+                temp_files=temp_files,
+                max_tokens=max_tokens,
+                raw_tool_calls=raw_tool_calls,
+                chat_code=chat_code,
+                chat_id=chat_id,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                account_id=account_id,
+                lease=lease,
+                chat_parameters=chat_parameters,
+            )
+        except HTTPException as exc:
+            # non_streaming_response 已在 finally 中完成了账号清理
+            last_exc = exc
+            if not is_last and exc.status_code in _RETRYABLE_STATUS_CODES:
+                logger.warning(
+                    "chat_retry attempt={}/{} status={} account_id={} model={}",
+                    attempt + 1, _MAX_CHAT_ATTEMPTS, exc.status_code, mask_secret(account_id), model,
+                )
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
 
 
 @app.api_route("/images/generations", methods=["POST", "OPTIONS"], response_model=None)
