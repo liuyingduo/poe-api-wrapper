@@ -1546,7 +1546,6 @@ async def generate_chunks(
             session_id=session_id,
             persistent_session=persistent_session,
             exc=exc,
-            model=model,
         )
 
         # --- 流式重试：尚未向客户端发送任何内容时，换账号重试一次 ---
@@ -1563,13 +1562,18 @@ async def generate_chunks(
                 evict_client=True,
                 release_lease=True,
             )
+            # 旧账号已清理完毕，防止 cleanup_task 再次清理
+            shared_state["already_finalized"] = True
             # 尝试获取新账号重试
+            new_lease = None
             try:
                 new_doc, new_lease = await _acquire_prewarmed_account(runtime)
                 new_account_id = str(new_doc["_id"])
                 new_client = await runtime.pool.get_client_for_account(new_doc, create_if_missing=False)
             except Exception:
-                # 拿不到新账号，回退到原有错误输出
+                # 拿不到新账号，释放可能已获取的 lease，回退到原有错误输出
+                if new_lease:
+                    await new_lease.release()
                 logger.warning("stream_retry failed: no account available for retry, model={}", model)
             else:
                 retry_bot = _downgrade_bot_for_retry(response["bot"])
@@ -1579,6 +1583,7 @@ async def generate_chunks(
                     response["bot"], retry_bot, model,
                 )
                 # 更新 shared_state，让 BackgroundTask 清理新账号
+                shared_state["already_finalized"] = False
                 shared_state["account_id"] = new_account_id
                 shared_state["lease"] = new_lease
                 account_id = new_account_id
@@ -1645,7 +1650,6 @@ async def generate_chunks(
                         session_id=session_id,
                         persistent_session=persistent_session,
                         exc=retry_exc,
-                        model=model,
                     )
                     shared_state["error_decision"] = retry_decision
                     yield b"data: " + orjson.dumps(retry_decision.payload) + b"\n\n"
@@ -1696,6 +1700,9 @@ async def streaming_response(
     # 定义后台清理任务，在流式响应彻底结束后必定执行
     async def cleanup_task():
         _cleanup_temp_files(temp_files)
+        # 如果账号已在重试路径中被清理，则跳过二次清理
+        if shared_state.get("already_finalized"):
+            return
         # 销毁 client 并释放 lease（可能已被重试更新为新账号）
         await _finalize_account_use(
             runtime,
