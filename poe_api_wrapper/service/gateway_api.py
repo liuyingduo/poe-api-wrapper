@@ -88,6 +88,17 @@ DEFAULT_MODEL_ENDPOINTS = [
     "/v1/images/edits",
 ]
 
+# Poe 上游以累积全文（而非增量 delta）返回 chunk 的 baseModel 列表（小写匹配）。
+# gateway 层会自动做差值处理，将其转换为标准逐块流。
+CUMULATIVE_RESPONSE_BOTS: set[str] = {
+    "deepseek-v3.1-t",
+    "deepseek-v3.2",
+    "glm-4.7-fw",
+    "kimi-k2-thinking",
+    "kimi-k2.5",
+    "qwen3-max",
+}
+
 app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
 app.add_middleware(
     CORSMiddleware,
@@ -1412,6 +1423,8 @@ async def generate_chunks(
     emitted_done = False
     completion_tokens = 0
     finish_reason = "stop"
+    is_cumulative = response["bot"].lower() in CUMULATIVE_RESPONSE_BOTS
+    prev_cumulative_text = ""
     try:
         if not raw_tool_calls:
             async for chunk in client.send_message(
@@ -1441,11 +1454,21 @@ async def generate_chunks(
                     finish_reason = "length"
                     break
 
+                if is_cumulative:
+                    full_text = chunk["text"] or ""
+                    delta = full_text[len(prev_cumulative_text):]
+                    prev_cumulative_text = full_text
+                else:
+                    delta = chunk["response"]
+
+                if not delta:
+                    continue
+
                 content = await create_completion_data(
                     completion_id=completion_id,
                     created=completion_timestamp,
                     model=model,
-                    chunk=chunk["response"],
+                    chunk=delta,
                     include_usage=include_usage,
                 )
                 yield b"data: " + orjson.dumps(content) + b"\n\n"
