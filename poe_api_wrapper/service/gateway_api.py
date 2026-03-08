@@ -629,12 +629,7 @@ async def startup_event() -> None:
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
 
-    # 服务启动时重置所有账号的"已使用"标记，让所有账号从未使用状态开始
-    reset_count = await repo.reset_all_ever_connected()
-    logger.info(
-        "Gateway startup: reset {} accounts to 'unused' state (ever_connected=False)",
-        reset_count,
-    )
+
 
     refresher.start()
     pool_monitor.start()
