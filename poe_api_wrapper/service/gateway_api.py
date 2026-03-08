@@ -116,6 +116,9 @@ CUMULATIVE_RESPONSE_BOTS: set[str] = {
     "kimi-k2-thinking",
     "kimi-k2.5",
     "qwen3-max",
+    "grok-4-fast-reasoning",
+    "grok-4.1-fast-non-reasoning",
+    "grok-4.1-fast-reasoning"
 }
 
 app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
