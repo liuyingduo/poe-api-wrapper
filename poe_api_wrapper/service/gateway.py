@@ -1597,6 +1597,8 @@ class PoolMonitor:
         # 正在建连的账号 id 集合，避免重复
         self._connecting: set[str] = set()
         self._connecting_lock = asyncio.Lock()
+        # 限制同时建连的并发数，防止线程池/网络被打满
+        self._connect_semaphore = asyncio.Semaphore(self.fill_concurrency)
 
     def start(self) -> None:
         if self._monitor_task and not self._monitor_task.done():
@@ -1807,53 +1809,54 @@ class PoolMonitor:
             )
 
     async def _connect_one(self, account_id: str) -> None:
-        try:
-            account_doc = await self.repo.get_account_by_id(account_id)
-            if not account_doc or str(account_doc.get("status", "")) != "active":
-                return
-            if self.pool.has_client(account_id):
-                return
-
-            creds = await self.repo.get_account_credentials(account_doc)
+        async with self._connect_semaphore:
             try:
-                client = await asyncio.wait_for(
-                    self.pool._create_client_with_fallback(account_id, creds),
-                    timeout=self.connect_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "PoolMonitor: connect timeout for account {} after {}s",
+                account_doc = await self.repo.get_account_by_id(account_id)
+                if not account_doc or str(account_doc.get("status", "")) != "active":
+                    return
+                if self.pool.has_client(account_id):
+                    return
+
+                creds = await self.repo.get_account_credentials(account_doc)
+                try:
+                    client = await asyncio.wait_for(
+                        self.pool._create_client_with_fallback(account_id, creds),
+                        timeout=self.connect_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "PoolMonitor: connect timeout for account {} after {}s",
+                        mask_secret(account_id),
+                        self.connect_timeout_seconds,
+                    )
+                    await self.repo.record_account_error(
+                        account_id,
+                        "pool_monitor_connect_timeout",
+                        cooldown_seconds=120,
+                    )
+                    return
+
+                import time
+                self.pool._register_reconnect_callback(account_id, client)
+                self.pool._clients[account_id] = client
+                self.pool._client_created_at[account_id] = time.time()
+                await self.repo.mark_account_ever_connected(account_id)
+                logger.info(
+                    "PoolMonitor: connected account {} | pool_size={}",
                     mask_secret(account_id),
-                    self.connect_timeout_seconds,
+                    len(self.pool.cached_account_ids()),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PoolMonitor: connect failed for account {}: {}",
+                    mask_secret(account_id),
+                    exc,
                 )
                 await self.repo.record_account_error(
                     account_id,
-                    "pool_monitor_connect_timeout",
+                    f"pool_monitor_connect_error: {exc}",
                     cooldown_seconds=120,
                 )
-                return
-
-            import time
-            self.pool._register_reconnect_callback(account_id, client)
-            self.pool._clients[account_id] = client
-            self.pool._client_created_at[account_id] = time.time()
-            await self.repo.mark_account_ever_connected(account_id)
-            logger.info(
-                "PoolMonitor: connected account {} | pool_size={}",
-                mask_secret(account_id),
-                len(self.pool.cached_account_ids()),
-            )
-        except Exception as exc:
-            logger.warning(
-                "PoolMonitor: connect failed for account {}: {}",
-                mask_secret(account_id),
-                exc,
-            )
-            await self.repo.record_account_error(
-                account_id,
-                f"pool_monitor_connect_error: {exc}",
-                cooldown_seconds=120,
-            )
-        finally:
-            async with self._connecting_lock:
-                self._connecting.discard(account_id)
+            finally:
+                async with self._connecting_lock:
+                    self._connecting.discard(account_id)

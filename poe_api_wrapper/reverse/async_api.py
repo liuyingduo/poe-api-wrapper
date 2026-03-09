@@ -1,5 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from httpx import AsyncClient
-import asyncio, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid, time
+import asyncio, os, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid, time
 from typing import Any, AsyncIterator, Optional
 from loguru import logger
 from requests_toolbelt import MultipartEncoder
@@ -49,6 +50,14 @@ from .bundles import AsyncPoeBundle
 This API is modified and maintained by @snowby666
 Credit to @ading2210 for the GraphQL queries
 """
+
+# Dedicated thread pool for CPU-heavy JS operations (formkey derivation).
+# Keeps these off the default asyncio executor so that DNS resolution
+# (getaddrinfo) and other system-level operations are never starved.
+_formkey_executor = ThreadPoolExecutor(
+    max_workers=min(4, (os.cpu_count() or 2)),
+    thread_name_prefix="formkey",
+)
 
 
 class AsyncPoeApi:
@@ -251,7 +260,10 @@ class AsyncPoeApi:
                     html,
                     fetch_client=self.client,
                 )
-                self.formkey = await asyncio.to_thread(self.bundle.get_form_key)
+                loop = asyncio.get_running_loop()
+                self.formkey = await loop.run_in_executor(
+                    _formkey_executor, self.bundle.get_form_key
+                )
                 self.client.headers.update({
                     'Poe-Formkey': self.formkey,
                 })
