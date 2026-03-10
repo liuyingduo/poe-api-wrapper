@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import sys
 from typing import Optional
 
 from httpx import AsyncClient, Client
@@ -62,8 +64,23 @@ class _BundleBase:
 
     def _get_form_key_by_quickjs(self, expression: str) -> str:
         script = self._window + f"\nString({expression}).slice(0, 32);"
-        context = quickjs.Context()
-        return str(context.eval(script))
+        # Run in a subprocess so that the QuickJS C extension does NOT hold
+        # the main process GIL — otherwise the asyncio event loop freezes
+        # for the entire duration of JS evaluation (2-5 s per call).
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, quickjs; print(quickjs.Context().eval(sys.stdin.read()))"],
+            input=script, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"quickjs subprocess failed (rc={result.returncode}): "
+                f"{result.stderr.strip()[:500]}"
+            )
+        formkey = result.stdout.strip()
+        if not formkey:
+            raise RuntimeError("quickjs subprocess returned empty result")
+        return formkey
 
     def get_form_key(self) -> str:
         expression = self._resolve_formkey_expression()
@@ -155,16 +172,24 @@ class AsyncPoeBundle(_BundleBase):
         # initialize the window object with document scripts
         logger.info("Initializing web data")
 
-        scripts = BeautifulSoup(document, "html.parser").find_all("script")
+        # Phase 1: parse HTML in a thread so the event loop is not blocked
+        # (BeautifulSoup on a 2-5 MB Poe page can take 1-3 s of CPU).
+        scripts = await asyncio.to_thread(
+            lambda: BeautifulSoup(document, "html.parser").find_all("script")
+        )
+
+        # Phase 2: classify scripts — accumulate inline JS immediately,
+        # collect remote-fetch coroutines for parallel execution.
+        remote_tasks: list = []
         for script in scripts:
             if (src := script.attrs.get("src")) and (src not in self._src_scripts):
                 if "_app" in src:
-                    await self.init_app(src)
+                    remote_tasks.append(self.init_app(src))
                 if "buildManifest" in src:
-                    await self.extend_src_scripts(src)
+                    remote_tasks.append(self.extend_src_scripts(src))
                 elif "webpack" in src:
                     self._webpack_script = src
-                    await self.extend_src_scripts(src)
+                    remote_tasks.append(self.extend_src_scripts(src))
                 else:
                     self._src_scripts.append(src)
             elif ("document." in script.text) or ("function" not in script.text):
@@ -172,6 +197,10 @@ class AsyncPoeBundle(_BundleBase):
             elif script.attrs.get("type") == "application/json":
                 continue
             self._window += script.text
+
+        # Phase 3: fetch remote scripts in parallel (was sequential before).
+        if remote_tasks:
+            await asyncio.gather(*remote_tasks)
 
         logger.info("Web data initialized")
 
