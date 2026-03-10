@@ -29,10 +29,14 @@ def _ensure_nltk_resources_sync() -> None:
             resource_find("corpora/stopwords")
         except LookupError:
             missing.append("stopwords")
+        # New NLTK versions renamed 'punkt' to 'punkt_tab'; check both.
         try:
-            resource_find("tokenizers/punkt")
+            resource_find("tokenizers/punkt_tab")
         except LookupError:
-            missing.append("punkt")
+            try:
+                resource_find("tokenizers/punkt")
+            except LookupError:
+                missing.append("punkt_tab")
         for package in missing:
             logger.warning("NLTK {} not found. Downloading...", package)
             nltk_download(package, quiet=True)
