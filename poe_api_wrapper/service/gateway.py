@@ -1542,6 +1542,110 @@ class SessionManager:
         await self.repo.mark_session_broken(session_id, reason)
 
 
+class ProxyRotator:
+    """根据连接成功/失败率自动轮换代理地区。
+
+    代理 URL 格式: http://{user}-res-{REGION}:{password}@{host}:{port}
+    从环境变量 PROXY_ROTATE_TEMPLATE 读取模板，其中地区占位符为 ``{region}``。
+    若未配置模板，则从当前 https_proxy 自动推断。
+
+    当连续失败次数达到阈值时，切换到下一个地区并更新 os.environ，
+    使后续新建的 httpx AsyncClient (trust_env=True) 自动走新代理。
+    """
+
+    REGIONS = ("US", "GB", "SG", "KR", "TW", "JP")
+
+    def __init__(
+        self,
+        *,
+        fail_threshold: int = 5,
+    ):
+        self._fail_threshold = max(1, fail_threshold)
+        self._consecutive_failures = 0
+        self._region_index = 0
+        self._template: Optional[str] = None
+        self._init_template()
+
+    def _init_template(self) -> None:
+        """尝试从环境变量构建代理模板。"""
+        explicit = os.getenv("PROXY_ROTATE_TEMPLATE", "").strip()
+        if explicit:
+            self._template = explicit
+            logger.info("ProxyRotator: using explicit template from PROXY_ROTATE_TEMPLATE")
+            return
+
+        # 从当前 https_proxy 自动推断
+        current = (
+            os.getenv("https_proxy", "").strip()
+            or os.getenv("HTTPS_PROXY", "").strip()
+            or os.getenv("http_proxy", "").strip()
+            or os.getenv("HTTP_PROXY", "").strip()
+        )
+        if not current:
+            logger.info("ProxyRotator: no proxy configured, rotation disabled")
+            return
+
+        # 匹配 -res-XX 模式，替换为 {region} 占位符
+        pattern = re.compile(r"(-res-)([A-Z]{2})")
+        match = pattern.search(current)
+        if not match:
+            logger.info(
+                "ProxyRotator: proxy URL does not contain -res-XX pattern, rotation disabled"
+            )
+            return
+
+        self._template = pattern.sub(r"\1{region}", current)
+        # 当前地区对齐到 REGIONS 列表
+        current_region = match.group(2)
+        try:
+            self._region_index = list(self.REGIONS).index(current_region)
+        except ValueError:
+            self._region_index = 0
+        logger.info(
+            "ProxyRotator: inferred template from current proxy, starting region={}",
+            self.REGIONS[self._region_index],
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._template is not None
+
+    @property
+    def current_region(self) -> str:
+        return self.REGIONS[self._region_index]
+
+    def record_success(self) -> None:
+        if not self.enabled:
+            return
+        self._consecutive_failures = 0
+
+    def record_failure(self) -> None:
+        if not self.enabled:
+            return
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._fail_threshold:
+            self._rotate()
+
+    def _rotate(self) -> None:
+        old_region = self.REGIONS[self._region_index]
+        self._region_index = (self._region_index + 1) % len(self.REGIONS)
+        new_region = self.REGIONS[self._region_index]
+        self._consecutive_failures = 0
+
+        new_url = self._template.format(region=new_region)
+        os.environ["https_proxy"] = new_url
+        os.environ["http_proxy"] = new_url
+        os.environ["HTTPS_PROXY"] = new_url
+        os.environ["HTTP_PROXY"] = new_url
+        logger.warning(
+            "ProxyRotator: {} consecutive failures, rotating proxy {} -> {} | url={}",
+            self._fail_threshold,
+            old_region,
+            new_region,
+            re.sub(r"://[^@]+@", "://***@", new_url),  # 脱敏
+        )
+
+
 class PoolMonitor:
     """单一后台任务：监控 pool 中 client 数量，低于阈值时从 DB 顺序补充。
 
@@ -1571,9 +1675,11 @@ class PoolMonitor:
         monitor_interval_seconds: int = 5,
         connect_timeout_seconds: int = 20,
         ttl_check_interval_seconds: int = 30,
+        proxy_rotator: Optional[ProxyRotator] = None,
     ):
         self.repo = repo
         self.pool = pool
+        self.proxy_rotator = proxy_rotator or ProxyRotator()
         # 动态调整范围
         self.min_pool_size = max(1, min_pool_size)
         self.max_pool_size = max(self.min_pool_size, max_pool_size)
@@ -1716,13 +1822,15 @@ class PoolMonitor:
         used_balances = await self.repo.get_used_account_balances()
         median_balance = float(statistics.median(used_balances)) if used_balances else 0.0
 
+        proxy_region = self.proxy_rotator.current_region if self.proxy_rotator.enabled else "n/a"
         logger.info(
-            "PoolMonitor: check | pool={} connecting={} deficit={} used_accounts={} median_balance={}",
+            "PoolMonitor: check | pool={} connecting={} deficit={} used_accounts={} median_balance={} proxy_region={}",
             current_count,
             in_flight,
             deficit,
             len(used_balances),
             int(median_balance),
+            proxy_region,
         )
 
         if deficit <= 0:
@@ -1834,6 +1942,7 @@ class PoolMonitor:
                         "pool_monitor_connect_timeout",
                         cooldown_seconds=120,
                     )
+                    self.proxy_rotator.record_failure()
                     return
 
                 import time
@@ -1841,6 +1950,7 @@ class PoolMonitor:
                 self.pool._clients[account_id] = client
                 self.pool._client_created_at[account_id] = time.time()
                 await self.repo.mark_account_ever_connected(account_id)
+                self.proxy_rotator.record_success()
                 logger.info(
                     "PoolMonitor: connected account {} | pool_size={}",
                     mask_secret(account_id),
@@ -1857,6 +1967,7 @@ class PoolMonitor:
                     f"pool_monitor_connect_error: {exc}",
                     cooldown_seconds=120,
                 )
+                self.proxy_rotator.record_failure()
             finally:
                 async with self._connecting_lock:
                     self._connecting.discard(account_id)
