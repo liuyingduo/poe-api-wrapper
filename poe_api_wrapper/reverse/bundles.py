@@ -16,7 +16,7 @@ except ImportError:
 
 
 class _BundleBase:
-    SCRIPT_FETCH_TIMEOUT_SECONDS = 20.0
+    SCRIPT_FETCH_TIMEOUT_SECONDS = 12.0
     form_key_pattern = r"window\.([a-zA-Z0-9_]+)=function\(\)\{return window"
     seeded_call_pattern = r'window\.([a-zA-Z0-9_]+)\(\s*["\']([^"\']{16,})["\']\s*\)'
     window_secret_pattern = r'let useFormkeyDecode=[\s\S]*?(window\.[\w]+="[^"]+")'
@@ -70,7 +70,7 @@ class _BundleBase:
         result = subprocess.run(
             [sys.executable, "-c",
              "import sys, quickjs; print(quickjs.Context().eval(sys.stdin.read()))"],
-            input=script, capture_output=True, text=True, timeout=30,
+            input=script, capture_output=True, text=True, timeout=15,
         )
         if result.returncode != 0:
             raise RuntimeError(

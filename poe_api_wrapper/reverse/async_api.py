@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from httpx import AsyncClient
+from httpx import AsyncClient, Timeout as _HttpxTimeout
 import asyncio, os, random, ssl, threading, websocket, string, secrets, hashlib, re, aiofiles, uuid, time
 from typing import Any, AsyncIterator, Optional
 from loguru import logger
@@ -125,7 +125,7 @@ class AsyncPoeApi:
     def _build_http_client(self) -> AsyncClient:
         kwargs = {
             "headers": self.HEADERS.copy(),
-            "timeout": None,
+            "timeout": _HttpxTimeout(connect=15.0, read=20.0, write=15.0, pool=10.0),
             "http2": True,
         }
         client = AsyncClient(**kwargs)
@@ -495,7 +495,7 @@ class AsyncPoeApi:
 
         if self.ws_connecting:
             waited = 0.0
-            while self.ws_connecting and not self.ws_connected and waited < 30.0:
+            while self.ws_connecting and not self.ws_connected and waited < 15.0:
                 await asyncio.sleep(0.05)
                 waited += 0.05
             if self.ws_connected:
@@ -551,7 +551,7 @@ class AsyncPoeApi:
             t.start()
 
             waited = 0.0
-            while not self.ws_connected and waited < 30.0:
+            while not self.ws_connected and waited < 15.0:
                 await asyncio.sleep(0.05)
                 waited += 0.05
             if not self.ws_connected:

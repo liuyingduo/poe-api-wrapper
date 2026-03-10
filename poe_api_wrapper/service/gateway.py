@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import os
 import re
+import sys
+import time as _time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -1553,7 +1555,7 @@ class ProxyRotator:
     使后续新建的 httpx AsyncClient (trust_env=True) 自动走新代理。
     """
 
-    REGIONS = ("US", "GB", "SG", "KR", "TW", "JP")
+    REGIONS = ("US", "UK", "SG", "KR", "TW", "JP")
 
     def __init__(
         self,
@@ -1705,6 +1707,10 @@ class PoolMonitor:
         self._connecting_lock = asyncio.Lock()
         # 限制同时建连的并发数，防止线程池/网络被打满
         self._connect_semaphore = asyncio.Semaphore(self.fill_concurrency)
+        # 滚动窗口错误统计 — 过去 N 秒内失败次数超过阈值则自杀重启
+        self._error_window_seconds = int(os.getenv("POOL_ERROR_WINDOW_SECONDS", "300"))
+        self._error_restart_threshold = int(os.getenv("POOL_ERROR_RESTART_THRESHOLD", "10"))
+        self._error_timestamps: deque[float] = deque()
 
     def start(self) -> None:
         if self._monitor_task and not self._monitor_task.done():
@@ -1733,6 +1739,24 @@ class PoolMonitor:
                     pass
         self._monitor_task = None
         self._ttl_task = None
+
+    def _record_connect_error(self) -> None:
+        now = _time.monotonic()
+        self._error_timestamps.append(now)
+        # 清理窗口外的旧记录
+        cutoff = now - self._error_window_seconds
+        while self._error_timestamps and self._error_timestamps[0] < cutoff:
+            self._error_timestamps.popleft()
+        recent = len(self._error_timestamps)
+        if recent >= self._error_restart_threshold:
+            logger.critical(
+                "PoolMonitor: {} connect errors in the last {}s (threshold={}), "
+                "forcing process restart!",
+                recent,
+                self._error_window_seconds,
+                self._error_restart_threshold,
+            )
+            os._exit(1)
 
     async def _monitor_loop(self) -> None:
         while not self._stopped.is_set():
@@ -1943,12 +1967,12 @@ class PoolMonitor:
                         cooldown_seconds=120,
                     )
                     self.proxy_rotator.record_failure()
+                    self._record_connect_error()
                     return
 
-                import time
                 self.pool._register_reconnect_callback(account_id, client)
                 self.pool._clients[account_id] = client
-                self.pool._client_created_at[account_id] = time.time()
+                self.pool._client_created_at[account_id] = _time.time()
                 await self.repo.mark_account_ever_connected(account_id)
                 self.proxy_rotator.record_success()
                 logger.info(
@@ -1968,6 +1992,7 @@ class PoolMonitor:
                     cooldown_seconds=120,
                 )
                 self.proxy_rotator.record_failure()
+                self._record_connect_error()
             finally:
                 async with self._connecting_lock:
                     self._connecting.discard(account_id)
