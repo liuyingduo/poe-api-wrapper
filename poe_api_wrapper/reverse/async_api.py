@@ -44,7 +44,7 @@ from .utils import (
                     extract_tchannel_data_from_html,
                     )
 from .queries import generate_payload, resolve_query_name
-from .bundles import AsyncPoeBundle
+from .bundles import AsyncPoeBundle, extract_homepage_version
 
 """
 This API is modified and maintained by @snowby666
@@ -64,6 +64,11 @@ class AsyncPoeApi:
     BASE_URL = BASE_URL
     HEADERS = HEADERS
     MAX_CONCURRENT_MESSAGES = 3
+    _bundle_cache_lock = threading.Lock()
+    _bundle_cache: dict[str, str] = {
+        "version": "",
+        "formkey": "",
+    }
     
     def __init__(
         self,
@@ -205,9 +210,32 @@ class AsyncPoeApi:
             if removed_headers:
                 self.client.headers.update(removed_headers)
     
-    async def load_bundle(self):
+    def _should_force_bundle_refresh(
+        self,
+        *,
+        status_code: int,
+        response_text: str,
+        content_type: str,
+    ) -> bool:
+        if status_code in (401, 403):
+            return True
+        lowered = f"{content_type}\n{response_text}".lower()
+        for marker in (
+            "invalid form key",
+            "poe-formkey",
+            "poe-tag-id",
+            "csrf",
+            "unauthorized",
+            "forbidden",
+        ):
+            if marker in lowered:
+                return True
+        return False
+
+    async def load_bundle(self, force_refresh: bool = False):
         logger.debug(
-            "load_bundle start: has_formkey={} has_tchannel={} has_p_b={} has_cf_clearance={} has_cf_bm={}",
+            "load_bundle start: force_refresh={} has_formkey={} has_tchannel={} has_p_b={} has_cf_clearance={} has_cf_bm={}",
+            force_refresh,
             bool(self.formkey),
             bool(self.tchannel_data),
             bool(self.client.cookies.get("p-b")),
@@ -254,20 +282,46 @@ class AsyncPoeApi:
             )
             return
 
-        if self.formkey == "":
+        homepage_version = extract_homepage_version(html) or ""
+
+        if self.formkey == "" or force_refresh:
             try:
-                self.bundle = await AsyncPoeBundle.create(
-                    html,
-                    fetch_client=self.client,
-                )
-                loop = asyncio.get_running_loop()
-                self.formkey = await loop.run_in_executor(
-                    _formkey_executor, self.bundle.get_form_key
-                )
-                self.client.headers.update({
-                    'Poe-Formkey': self.formkey,
-                })
-                logger.debug("load_bundle extract_formkey success; formkey_len={}", len(self.formkey))
+                cached_formkey = ""
+                if homepage_version and not force_refresh:
+                    with self._bundle_cache_lock:
+                        if self._bundle_cache.get("version") == homepage_version:
+                            cached_formkey = self._bundle_cache.get("formkey", "")
+                if cached_formkey:
+                    self.formkey = cached_formkey
+                    self.client.headers.update({
+                        'Poe-Formkey': self.formkey,
+                    })
+                    logger.debug(
+                        "load_bundle reuse cached formkey for version={} formkey_len={}",
+                        homepage_version,
+                        len(self.formkey),
+                    )
+                else:
+                    self.bundle = await AsyncPoeBundle.create(
+                        html,
+                        fetch_client=self.client,
+                    )
+                    loop = asyncio.get_running_loop()
+                    self.formkey = await loop.run_in_executor(
+                        _formkey_executor, self.bundle.get_form_key
+                    )
+                    self.client.headers.update({
+                        'Poe-Formkey': self.formkey,
+                    })
+                    if homepage_version:
+                        with self._bundle_cache_lock:
+                            self._bundle_cache["version"] = homepage_version
+                            self._bundle_cache["formkey"] = self.formkey
+                    logger.debug(
+                        "load_bundle extract_formkey success; version={} formkey_len={}",
+                        homepage_version,
+                        len(self.formkey),
+                    )
             except Exception as exc:
                 self._log_load_bundle_failure(
                     "extract_formkey",
@@ -388,6 +442,7 @@ class AsyncPoeApi:
         variables: Optional[dict] = None,
         file_form: Optional[list] = None,
         knowledge: bool = False,
+        _after_bundle_refresh: bool = False,
     ):
         variables = variables or {}
         file_form = file_form or []
@@ -442,6 +497,23 @@ class AsyncPoeApi:
                 if err_msg == "Server Error":
                     raise RuntimeError(f"Server Error. Raw response data: {json_data}")
                 else:
+                    if (not _after_bundle_refresh) and self._should_force_bundle_refresh(
+                        status_code=status_code,
+                        response_text=response.text,
+                        content_type=content_type,
+                    ):
+                        logger.warning(
+                            "send_request detected possible stale formkey/revision; forcing bundle refresh and retry once"
+                        )
+                        await self.load_bundle(force_refresh=True)
+                        return await self.send_request(
+                            path,
+                            query_name,
+                            variables,
+                            file_form,
+                            knowledge,
+                            True,
+                        )
                     logger.error(response.status_code)
                     logger.error(response.text)
                     raise Exception(response.text)

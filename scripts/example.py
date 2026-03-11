@@ -8,7 +8,7 @@ http_client = httpx.Client(
 )
 client = openai.OpenAI(
     api_key="svc_app_zaiwen",
-    base_url="http://207.180.218.216:8003/v1/",
+    base_url="http://207.180.218.216:8004/v1/",
     http_client=http_client,
 )
 
