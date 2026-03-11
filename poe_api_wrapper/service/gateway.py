@@ -79,6 +79,26 @@ _BROWSE_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# For curl_cffi impersonation, avoid forcing a potentially inconsistent
+# UA/sec-ch header set. Let curl_cffi craft browser-consistent fingerprints.
+_CURL_CFFI_BROWSE_HEADERS = {
+    k: v
+    for k, v in _BROWSE_HEADERS.items()
+    if k
+    not in {
+        "User-Agent",
+        "Priority",
+        "Sec-Ch-Ua",
+        "Sec-Ch-Ua-Mobile",
+        "Sec-Ch-Ua-Platform",
+        "Sec-Fetch-Dest",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-User",
+        "Upgrade-Insecure-Requests",
+    }
+}
+
 
 async def fetch_poe_revision(
     *,
@@ -123,14 +143,14 @@ async def fetch_poe_revision(
 
     def _fetch_once_with_curl_cffi(*, timeout_sec: float, proxy_url: str) -> Optional[str]:
         session_kwargs: dict[str, Any] = {
-            "impersonate": os.getenv("POE_FETCH_IMPERSONATE", "chrome131").strip() or "chrome131",
+            "impersonate": os.getenv("POE_FETCH_IMPERSONATE", "chrome").strip() or "chrome",
             "timeout": timeout_sec,
         }
         if proxy_url:
             session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
 
         with cffi_requests.Session(**session_kwargs) as session:
-            home = session.get("https://poe.com/", headers=_BROWSE_HEADERS, allow_redirects=False)
+            home = session.get("https://poe.com/", headers=_CURL_CFFI_BROWSE_HEADERS, allow_redirects=False)
             p_b = session.cookies.get("p-b", "") or home.cookies.get("p-b", "")
             cf_bm = session.cookies.get("__cf_bm", "") or home.cookies.get("__cf_bm", "")
             cf_clearance = _resolve_cf_clearance() or session.cookies.get("cf_clearance", "")
@@ -146,18 +166,14 @@ async def fetch_poe_revision(
             if revision:
                 return revision
 
-            cookies: dict[str, str] = {}
-            if p_b:
-                cookies["p-b"] = p_b
-            if cf_bm:
-                cookies["__cf_bm"] = cf_bm
             if cf_clearance:
-                cookies["cf_clearance"] = cf_clearance
+                # Inject optional manual cf_clearance into session cookie jar.
+                session.cookies.set("cf_clearance", cf_clearance, domain=".poe.com", path="/")
+                session.cookies.set("cf_clearance", cf_clearance, domain="poe.com", path="/")
 
             login = session.get(
                 "https://poe.com/login?redirect_url=%2F",
-                headers=_BROWSE_HEADERS,
-                cookies=cookies if cookies else None,
+                headers=_CURL_CFFI_BROWSE_HEADERS,
                 allow_redirects=False,
             )
             logger.debug(
