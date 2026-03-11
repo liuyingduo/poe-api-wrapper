@@ -997,6 +997,17 @@ class AsyncPoeApi:
     async def delete_pending_messages(self, prompt_md5: str):
         if prompt_md5 in self.active_messages:
             del self.active_messages[prompt_md5]
+
+    def _get_message_state_error(self, message_payload: dict[str, Any]) -> Optional[str]:
+        state = str(message_payload.get("state") or "").strip()
+        if not state or state == "complete" or state == "error_user_message_too_long":
+            return None
+        if not state.startswith("error_"):
+            return None
+        state_text = str(message_payload.get("messageStateText") or message_payload.get("text") or "").strip()
+        if not state_text:
+            state_text = "No detailed message provided by Poe."
+        return f"Poe message failed with state '{state}': {state_text}"
             
     async def get_settings(self):
         response_json = await self.send_request('gql_POST', 'SettingsPageQuery', {})
@@ -1364,6 +1375,11 @@ class AsyncPoeApi:
                 response["response"] = ""
                 response["suggestedReplies"] = suggestedReplies
 
+                state_error = self._get_message_state_error(response)
+                if state_error:
+                    await self.delete_queues(chatId)
+                    raise RuntimeError(state_error)
+
                 if response["state"] == "error_user_message_too_long":
                     response["response"]  = "Message too long. Please try again!"
                     yield response
@@ -1667,6 +1683,11 @@ class AsyncPoeApi:
                 response["msgPrice"] = msgPrice
                 response["response"] = ""
                 response["suggestedReplies"] = suggestedReplies
+
+                state_error = self._get_message_state_error(response)
+                if state_error:
+                    await self.delete_queues(chatId)
+                    raise RuntimeError(state_error)
 
                 if response["state"] == "error_user_message_too_long":
                     response["response"]  = "Message too long. Please try again!"

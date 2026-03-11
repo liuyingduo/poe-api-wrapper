@@ -422,7 +422,19 @@ def _exception_summary(exc: BaseException) -> str:
 
 def _is_depleted_error(error_text: str) -> bool:
     lower = error_text.lower()
-    return any(token in lower for token in ("insufficient", "balance", "reached_limit", "402", "daily limit"))
+    return any(
+        token in lower
+        for token in (
+            "insufficient",
+            "balance",
+            "reached_limit",
+            "402",
+            "daily limit",
+            "error_insufficient_fund",
+            "need more points",
+            "积分",
+        )
+    )
 
 
 def _is_invalid_error(error_text: str) -> bool:
@@ -562,15 +574,7 @@ async def _finalize_account_use(
     if success:
         await runtime.repo.mark_account_success(account_id)
     elif error_decision:
-        if error_decision.kind == "depleted":
-            await runtime.repo.mark_account_depleted(account_id, error_decision.error_text)
-            if persistent_session:
-                await runtime.sessions.break_session(session_id, "bound account is depleted")
-        elif error_decision.kind == "invalid":
-            await runtime.repo.mark_account_invalid(account_id, error_decision.error_text)
-            if persistent_session:
-                await runtime.sessions.break_session(session_id, "bound account is invalid")
-        elif error_decision.kind == "provider_timeout":
+        if error_decision.kind == "provider_timeout":
             await runtime.repo.record_account_error(
                 account_id,
                 error_decision.error_text,
@@ -588,6 +592,18 @@ async def _finalize_account_use(
     should_evict = evict_client if evict_client is not None else (not success)
     if should_evict:
         await runtime.pool.invalidate_client(account_id)
+
+    # 强制终态写在客户端销毁之后，避免销毁时刷新余额把状态改回 active。
+    if error_decision:
+        if error_decision.kind == "depleted":
+            await runtime.repo.mark_account_depleted(account_id, error_decision.error_text)
+            if persistent_session:
+                await runtime.sessions.break_session(session_id, "bound account is depleted")
+        elif error_decision.kind == "invalid":
+            await runtime.repo.mark_account_invalid(account_id, error_decision.error_text)
+            if persistent_session:
+                await runtime.sessions.break_session(session_id, "bound account is invalid")
+
     if lease and release_lease:
         await lease.release()
 
