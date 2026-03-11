@@ -109,17 +109,36 @@ def _downgrade_bot_for_retry(bot: str) -> str:
             return fallback_bot
     return bot
 
-CUMULATIVE_RESPONSE_BOTS: set[str] = {
-    "deepseek-v3.1-t",
-    "deepseek-v3.2",
-    "glm-4.7-fw",
-    "kimi-k2-thinking",
-    "kimi-k2.5",
-    "qwen3-max",
-    "grok-4-fast-reasoning",
-    "grok-4.1-fast-non-reasoning",
-    "grok-4.1-fast-reasoning"
-}
+_CUMULATIVE_BOTS_PATH = DIR / "cumulative_bots.json"
+_cumulative_bots_cache: set[str] = set()
+_cumulative_bots_mtime: float = 0.0
+
+
+def _reload_cumulative_bots() -> None:
+    global _cumulative_bots_cache, _cumulative_bots_mtime
+    try:
+        st = _CUMULATIVE_BOTS_PATH.stat()
+    except FileNotFoundError:
+        return
+    if st.st_mtime == _cumulative_bots_mtime:
+        return
+    try:
+        raw = _CUMULATIVE_BOTS_PATH.read_bytes()
+        items = orjson.loads(raw)
+        if isinstance(items, list):
+            _cumulative_bots_cache = {str(s).strip().lower() for s in items if s}
+            _cumulative_bots_mtime = st.st_mtime
+            logger.info("Reloaded cumulative_bots.json: {} entries", len(_cumulative_bots_cache))
+    except Exception as exc:
+        logger.warning("Failed to reload cumulative_bots.json: {}", exc)
+
+
+def get_cumulative_bots() -> set[str]:
+    return _cumulative_bots_cache
+
+
+# 首次加载
+_reload_cumulative_bots()
 
 app = FastAPI(title="Poe API Mongo Gateway", description="OpenAI-Compatible Poe Gateway")
 app.add_middleware(
@@ -314,9 +333,9 @@ class GatewayConfig:
             global_inflight_limit=_env_int("GLOBAL_INFLIGHT_LIMIT", 200),
             depleted_threshold=_env_int("DEPLETED_THRESHOLD", 20),
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
-            target_pool_size=_env_int("TARGET_POOL_SIZE", 20),
+            target_pool_size=_env_int("TARGET_POOL_SIZE", 8),
             min_pool_size=_env_int("MIN_POOL_SIZE", 5),
-            max_pool_size=_env_int("MAX_POOL_SIZE", 30),
+            max_pool_size=_env_int("MAX_POOL_SIZE", 8),
             pool_fill_concurrency=_env_int("POOL_FILL_CONCURRENCY", 10),
             pool_monitor_interval_seconds=_env_int("POOL_MONITOR_INTERVAL_SECONDS", 5),
             pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 40),
@@ -658,6 +677,13 @@ async def startup_event() -> None:
     # Let the pool know about the main loop so reconnect-exhaustion callbacks
     # can schedule cleanup coroutines on it.
     pool._main_loop = asyncio.get_running_loop()
+    # 每 60 秒自动重载 cumulative_bots.json（仅文件 mtime 变化时才真正读取）
+    async def _cumulative_bots_reload_loop() -> None:
+        while True:
+            await asyncio.sleep(60)
+            _reload_cumulative_bots()
+
+    asyncio.create_task(_cumulative_bots_reload_loop(), name="cumulative-bots-reload")
     logger.info("Gateway startup complete")
 
 
@@ -1441,7 +1467,7 @@ async def generate_chunks(
     has_content = False
     completion_tokens = 0
     finish_reason = "stop"
-    is_cumulative = response["bot"].lower() in CUMULATIVE_RESPONSE_BOTS
+    is_cumulative = response["bot"].lower() in get_cumulative_bots()
     prev_cumulative_text = ""
     try:
         if not raw_tool_calls:
@@ -1592,7 +1618,7 @@ async def generate_chunks(
 
                 # 重试 send_message（使用降级后的模型）
                 retry_ok = False
-                is_cumulative = retry_bot.lower() in CUMULATIVE_RESPONSE_BOTS
+                is_cumulative = retry_bot.lower() in get_cumulative_bots()
                 try:
                     prev_cumulative_text = ""
                     async for chunk in new_client.send_message(

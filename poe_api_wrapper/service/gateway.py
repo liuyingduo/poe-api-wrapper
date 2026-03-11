@@ -1709,7 +1709,7 @@ class PoolMonitor:
         self._connect_semaphore = asyncio.Semaphore(self.fill_concurrency)
         # 滚动窗口错误统计 — 过去 N 秒内失败次数超过阈值则自杀重启
         self._error_window_seconds = int(os.getenv("POOL_ERROR_WINDOW_SECONDS", "300"))
-        self._error_restart_threshold = int(os.getenv("POOL_ERROR_RESTART_THRESHOLD", "10"))
+        self._error_restart_threshold = int(os.getenv("POOL_ERROR_RESTART_THRESHOLD", "5"))
         self._error_timestamps: deque[float] = deque()
 
     def start(self) -> None:
