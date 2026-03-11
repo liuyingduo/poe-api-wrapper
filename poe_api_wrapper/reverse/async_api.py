@@ -95,7 +95,7 @@ class AsyncPoeApi:
         self.retry_attempts: int = 3
         self.ws_refresh: int = 3
         self.ws_heartbeat_interval: int = 25
-        self.max_ws_reconnects: int = 5
+        self.max_ws_reconnects: int = 0
         self._ws_reconnect_count: int = 0
         self._on_reconnect_exhausted: Optional[callable] = None
         self.ws_max_lifetime_min_seconds: int = 20 * 60
@@ -586,6 +586,15 @@ class AsyncPoeApi:
         self.ws_refresh = 3
 
         try:
+            # 关闭旧的 WebSocket 连接和线程，防止泄漏
+            old_ws = getattr(self, "ws", None)
+            if old_ws:
+                try:
+                    old_ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+
             if not self.tchannel_data:
                 await self.load_bundle()
             self._build_channel_url_from_tchannel()
@@ -613,9 +622,9 @@ class AsyncPoeApi:
                                                     "Pragma": "no-cache",
                                                     "Cache-Control": "no-cache",
                                                 },
-                                                on_message=lambda ws, msg: self.on_message(ws, msg), 
-                                                on_open=lambda ws: self.on_ws_connect(ws), 
-                                                on_error=lambda ws, error: self.on_ws_error(ws, error), 
+                                                on_message=lambda ws, msg: self.on_message(ws, msg),
+                                                on_open=lambda ws: self.on_ws_connect(ws),
+                                                on_error=lambda ws, error: self.on_ws_error(ws, error),
                                                 on_close=lambda ws, close_status_code, close_message: self.on_ws_close(ws, close_status_code, close_message))
             )
 
@@ -1269,17 +1278,23 @@ class AsyncPoeApi:
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
+        _first_chunk_timeout = 30
         _queue_timeout = 120
+        _got_first_chunk = False
         _queue_idle = 0
         _ws_recovery_attempts = 0
         _max_ws_recovery_attempts = 1
-        
+
         while True:
             try:
                 try:
-                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_queue_timeout)
+                    _current_timeout = _queue_timeout if _got_first_chunk else _first_chunk_timeout
+                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_current_timeout)
+                    _got_first_chunk = True
                     _queue_idle = 0
                 except asyncio.TimeoutError:
+                    if not _got_first_chunk:
+                        raise RuntimeError(f"First chunk timeout: no response within {_first_chunk_timeout}s (chatId={chatId})")
                     _queue_idle += _queue_timeout
                     if _queue_idle >= 300:
                         if _ws_recovery_attempts < _max_ws_recovery_attempts:
@@ -1567,17 +1582,23 @@ class AsyncPoeApi:
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
+        _first_chunk_timeout = 30
         _queue_timeout = 120
+        _got_first_chunk = False
         _queue_idle = 0
         _ws_recovery_attempts = 0
         _max_ws_recovery_attempts = 1
-        
+
         while True:
             try:
                 try:
-                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_queue_timeout)
+                    _current_timeout = _queue_timeout if _got_first_chunk else _first_chunk_timeout
+                    ws_data = await asyncio.wait_for(self.message_queues[chatId].get(), timeout=_current_timeout)
+                    _got_first_chunk = True
                     _queue_idle = 0
                 except asyncio.TimeoutError:
+                    if not _got_first_chunk:
+                        raise RuntimeError(f"First chunk timeout: no response within {_first_chunk_timeout}s (chatId={chatId})")
                     _queue_idle += _queue_timeout
                     if _queue_idle >= 300:
                         if _ws_recovery_attempts < _max_ws_recovery_attempts:
