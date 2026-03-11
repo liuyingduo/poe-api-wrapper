@@ -1130,7 +1130,23 @@ class PoeClientPool:
 
         tokens = self._build_tokens(creds)
         headers = self._build_headers(creds)
-        return await AsyncPoeApi(tokens=tokens, headers=headers).create()
+        client = AsyncPoeApi(tokens=tokens, headers=headers)
+        ok = False
+        try:
+            await client.create()
+            ok = True
+            return client
+        finally:
+            if not ok:
+                # 创建失败（含被 cancel），清理半成品防止 WS/HTTP 泄漏
+                try:
+                    client.disconnect_ws()
+                except Exception:
+                    pass
+                try:
+                    await client.client.aclose()
+                except Exception:
+                    pass
 
     async def _create_client_with_fallback(self, account_id: str, creds: dict[str, Any]) -> "AsyncPoeApi":
         try:

@@ -1566,8 +1566,8 @@ async def generate_chunks(
         emitted_done = True
         shared_state["succeeded"] = True  # 标记成功，供 BackgroundTask 使用
     except asyncio.CancelledError:
-        # Client closed the streaming connection; avoid noisy ASGI stack traces.
-        pass
+        # 客户端主动断开连接，client 本身没问题，标记成功以保留复用
+        shared_state["succeeded"] = True
     except Exception as exc:
         error_decision = await _account_error_payload(
             account_id=account_id,

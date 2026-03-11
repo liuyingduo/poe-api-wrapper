@@ -638,9 +638,17 @@ class AsyncPoeApi:
             if not self.ws_connected:
                 raise RuntimeError("Timed out while waiting websocket connection to open")
             self._start_ws_heartbeat()
-        except Exception:
+        except BaseException:
             self.ws_connecting = False
             self.ws_connected = False
+            # 清理刚创建但连接失败的 WebSocket，防止线程泄漏
+            ws = getattr(self, "ws", None)
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                self.ws = None
             raise
 
     def migrate_to_loop(self, target_loop: asyncio.AbstractEventLoop) -> None:
