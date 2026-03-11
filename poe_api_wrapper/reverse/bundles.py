@@ -15,6 +15,18 @@ except ImportError:
     execjs = None
 
 
+def extract_homepage_version(document: str) -> Optional[str]:
+    build_id_match = re.search(r'"buildId"\s*:\s*"([^"]+)"', document)
+    if build_id_match:
+        return build_id_match.group(1)
+
+    static_match = re.search(r"/_next/static/([^/]+)/", document)
+    if static_match:
+        return static_match.group(1)
+
+    return None
+
+
 class _BundleBase:
     SCRIPT_FETCH_TIMEOUT_SECONDS = 12.0
     form_key_pattern = r"window\.([a-zA-Z0-9_]+)=function\(\)\{return window"
@@ -28,18 +40,6 @@ class _BundleBase:
         "var process = undefined;"
         "var QuickJS = undefined;"
     )
-
-
-def extract_homepage_version(document: str) -> Optional[str]:
-    build_id_match = re.search(r'"buildId"\s*:\s*"([^"]+)"', document)
-    if build_id_match:
-        return build_id_match.group(1)
-
-    static_match = re.search(r"/_next/static/([^/]+)/", document)
-    if static_match:
-        return static_match.group(1)
-
-    return None
 
     def __init__(self):
         self._window = self.js_bootstrap
