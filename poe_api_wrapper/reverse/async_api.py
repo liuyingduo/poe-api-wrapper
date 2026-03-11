@@ -2244,10 +2244,12 @@ class AsyncPoeApi:
     async def delete_group(self, group_name: str):
         if group_name not in self.groups:
             raise ValueError(f"Group {group_name} not found. Make sure the group exists before deleting.")
-        if self.groups[group_name]['bots'] != {}:
-            for bot, chatdata in self.groups[group_name]['bots'].items():
-                if chatdata['chatId'] != None:
-                    await self.delete_chat(bot, chatdata['chatId'])
+        bots = self.groups[group_name].get('bots') or []
+        for bot_data in bots:
+            bot_name = bot_data.get('bot')
+            chat_id = bot_data.get('chatId')
+            if bot_name is not None and chat_id is not None:
+                await self.delete_chat(bot_name, chat_id)
         del self.groups[group_name]
         logger.info(f"Group {group_name} deleted")
         
@@ -2261,7 +2263,7 @@ class AsyncPoeApi:
     
     async def save_group_history(self, group_name: str, file_path: str=None):
         try:
-            oldData = await self.load_group_history(group_name, file_path=file_path)
+            oldData = await self.load_group_history(file_path=file_path)
             oldData = oldData['group_data']['conversation_log']
         except:
             oldData = None
@@ -2285,7 +2287,7 @@ class AsyncPoeApi:
                 raise ValueError(f"File path {file_path} is invalid.")
             if not file_path.endswith('.json'):
                 raise ValueError(f"File path {file_path} is not a json file.")
-        async with aiofiles.open(file_path, 'w') as f:
+        async with aiofiles.open(file_path, 'wb') as f:
             await f.write(orjson.dumps(saveData, option=orjson.OPT_INDENT_2))
         logger.info(f"Group {group_name} saved to {file_path}")
         return file_path
@@ -2352,7 +2354,8 @@ class AsyncPoeApi:
                         last_text += text
                         last_text += "\n"
         else:
-            preset_log = await self.load_group_history(file_path=preset_history)['group_data']['conversation_log']
+            loaded_history = await self.load_group_history(file_path=preset_history)
+            preset_log = loaded_history['group_data']['conversation_log']
             if preset_log != []:
                 for text in preset_log:
                     if text.split(":")[0].strip() in bot_names:
@@ -2380,7 +2383,7 @@ class AsyncPoeApi:
         self.groups[group_name]['conversation_log'] = []
         
         max_turns = random.randint(len(bots), int(len(bots)*2))
-        async for _ in range(max_turns):
+        for _ in range(max_turns):
             await asyncio.sleep(random.randint(3, 5))
 
             async for chunk in self.send_message(current_bot['bot'], next_message, chatCode=current_bot['chatCode']):

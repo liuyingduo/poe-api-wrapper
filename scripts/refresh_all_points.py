@@ -1,26 +1,23 @@
-﻿"""Refresh all account points directly from Mongo + Poe.
+"""Refresh account points via gateway admin API.
 
 Usage:
   python scripts/refresh_all_points.py
+  python scripts/refresh_all_points.py --base-url http://127.0.0.1:8000
   python scripts/refresh_all_points.py --statuses active depleted cooldown
   python scripts/refresh_all_points.py --concurrency 20
-  python scripts/refresh_all_points.py --env-file /path/to/.env.gateway
+  python scripts/refresh_all_points.py --env-file .env.gateway
   python scripts/refresh_all_points.py --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
-# Ensure project root is importable when running as: python scripts/xxx.py
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+import httpx
 
 
 def _load_dotenv(path: Path) -> bool:
@@ -44,7 +41,7 @@ def _load_dotenv(path: Path) -> bool:
     return True
 
 
-def _bootstrap_env(explicit_path: Optional[str] = None) -> None:
+def _bootstrap_env(explicit_path: str | None = None) -> None:
     if explicit_path:
         explicit = Path(explicit_path)
         if _load_dotenv(explicit):
@@ -54,171 +51,58 @@ def _bootstrap_env(explicit_path: Optional[str] = None) -> None:
 
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
-
-    for candidate in (project_root / ".env.gateway",):
-        if _load_dotenv(candidate):
-            print(f"[env] loaded: {candidate}")
-            break
-
-
-async def run(
-    statuses: list[str],
-    concurrency: int,
-    dry_run: bool,
-    depleted_threshold: int,
-) -> None:
-    from poe_api_wrapper.service.gateway import (
-        AccountRepository,
-        CredentialCrypto,
-        PoeClientPool,
-        fetch_poe_revision,
-        mask_secret,
-        utc_now,
-    )
-
-    def _require(name: str) -> str:
-        value = os.environ.get(name, "").strip()
-        if not value:
-            print(f"[error] missing required env var: {name}", file=sys.stderr)
-            raise SystemExit(1)
-        return value
-
-    mongodb_uri = _require("MONGODB_URI")
-    mongodb_db = _require("MONGODB_DB")
-    fernet_key = _require("FERNET_KEY")
-    poe_revision = os.environ.get("POE_REVISION", "").strip()
-
-    print(f"[config] mongodb={mongodb_uri} db={mongodb_db}")
-    print(f"[config] statuses={statuses}")
-    print(f"[config] concurrency={concurrency} depleted_threshold={depleted_threshold}")
-    print(f"[config] dry_run={dry_run}")
-    print("-" * 60)
-
-    if not poe_revision:
-        print("[info] POE_REVISION not set, fetching from poe.com/login ...")
-        poe_revision = await fetch_poe_revision() or ""
-        if poe_revision:
-            print(f"[info] fetched poe-revision: {poe_revision}")
-        else:
-            print("[warn] failed to fetch poe-revision, requests will continue without it")
-
-    crypto = CredentialCrypto(fernet_key)
-    repo = AccountRepository(mongodb_uri, mongodb_db, crypto)
-    pool = PoeClientPool(repo=repo, default_poe_revision=poe_revision)
-
-    try:
-        all_docs = await repo.list_all_accounts_for_refresh(statuses=statuses, limit=5000)
-        total = len(all_docs)
-        print(f"[info] matched accounts={total}")
-
-        if total == 0:
-            print("[info] no accounts to refresh")
-            return
-
-        if dry_run:
-            print("[dry-run] accounts that would be refreshed:")
-            for doc in all_docs:
-                print(f"  - {doc['_id']}")
-            return
-
-        succeeded = 0
-        failed = 0
-        errors: list[dict[str, str]] = []
-        sem = asyncio.Semaphore(concurrency)
-        lock = asyncio.Lock()
-
-        async def _refresh_one(doc: dict) -> None:
-            nonlocal succeeded, failed
-            account_id = str(doc["_id"])
-            async with sem:
-                try:
-                    account_doc = await repo.get_account_by_id(account_id)
-                    if not account_doc:
-                        raise RuntimeError("account not found")
-
-                    client = await pool.get_client(account_doc)
-                    settings = await client.get_settings()
-                    message_info = settings.get("messagePointInfo", {})
-                    subscription = settings.get("subscription", {})
-                    balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
-                        message_info.get("addonPointBalance", 0) or 0
-                    )
-                    subscription_active = bool(subscription.get("isActive", False))
-
-                    await repo.update_account_health(
-                        account_id,
-                        balance=balance,
-                        subscription_active=subscription_active,
-                        depleted_threshold=depleted_threshold,
-                    )
-                    await repo.mark_account_success(account_id)
-
-                    status_tag = "depleted" if balance <= depleted_threshold else "active"
-                    async with lock:
-                        succeeded += 1
-                        done = succeeded + failed
-                        print(
-                            f"  [{done}/{total}] {mask_secret(account_id, 8)} "
-                            f"points={balance} subscription={subscription_active} status={status_tag}"
-                        )
-                except Exception as exc:
-                    async with lock:
-                        failed += 1
-                        done = succeeded + failed
-                        errors.append({"account_id": account_id, "error": str(exc)})
-                        print(f"  [{done}/{total}] {mask_secret(account_id, 8)} [FAILED] {str(exc)[:160]}")
-
-        print(f"[info] refreshing accounts (concurrency={concurrency}) ...")
-        start_at = utc_now()
-        await asyncio.gather(*(_refresh_one(doc) for doc in all_docs))
-        elapsed = (utc_now() - start_at).total_seconds()
-
-        print("-" * 60)
-        print(f"[done] elapsed={elapsed:.1f}s total={total} succeeded={succeeded} failed={failed}")
-        if errors:
-            print(f"[errors] showing first {min(len(errors), 20)} errors:")
-            for item in errors[:20]:
-                print(f"  account_id={item['account_id']} error={item['error']}")
-    finally:
-        await pool.close_all()
-        await repo.close()
+    default_env = project_root / ".env.gateway"
+    if _load_dotenv(default_env):
+        print(f"[env] loaded: {default_env}")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Refresh Poe account points directly from MongoDB (without running FastAPI service)."
+    parser = argparse.ArgumentParser(description="Refresh account points through gateway admin API.")
+    parser.add_argument(
+        "--base-url",
+        default=os.getenv("GATEWAY_BASE_URL", "http://207.180.218.216:8003"),
+        help="Gateway base URL (default: %(default)s or GATEWAY_BASE_URL).",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        default=None,
+        help="Admin API key. If omitted, read from ADMIN_API_KEY env.",
     )
     parser.add_argument(
         "--statuses",
         nargs="+",
         default=["depleted", "cooldown", "invalid"],
         metavar="STATUS",
-        help="Account statuses to refresh (default: depleted cooldown invalid)",
+        help="Account statuses to refresh (default: depleted cooldown invalid).",
     )
     parser.add_argument(
         "--concurrency",
         type=int,
         default=10,
         metavar="N",
-        help="Concurrent refresh workers (default: 10, max: 50)",
-    )
-    parser.add_argument(
-        "--depleted-threshold",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Balance <= threshold is considered depleted (default from DEPLETED_THRESHOLD or 20)",
+        help="Concurrent refresh workers (default: 10, max: 50).",
     )
     parser.add_argument(
         "--env-file",
         default=None,
         metavar="PATH",
-        help="Optional explicit .env.gateway path",
+        help="Optional explicit .env.gateway path.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="HTTP timeout seconds (default: %(default)s).",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Only list accounts, do not call Poe API",
+        help="Only print request payload, do not call gateway API.",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print raw JSON response.",
     )
     return parser.parse_args()
 
@@ -227,23 +111,68 @@ def main() -> None:
     args = _parse_args()
     _bootstrap_env(args.env_file)
 
-    concurrency = max(1, min(args.concurrency, 50))
+    admin_api_key = (args.admin_api_key or os.getenv("ADMIN_API_KEY", "")).strip()
+    if not admin_api_key:
+        print("[error] missing admin api key. use --admin-api-key or set ADMIN_API_KEY", file=sys.stderr)
+        raise SystemExit(1)
 
-    depleted_threshold = args.depleted_threshold
-    if depleted_threshold is None:
-        try:
-            depleted_threshold = int(os.environ.get("DEPLETED_THRESHOLD", "20"))
-        except ValueError:
-            depleted_threshold = 20
+    concurrency = max(1, min(int(args.concurrency), 50))
+    base_url = args.base_url.rstrip("/")
+    url = f"{base_url}/admin/accounts/refresh-all"
+    payload = {
+        "statuses": [s.strip() for s in args.statuses if s.strip()],
+        "concurrency": concurrency,
+    }
 
-    asyncio.run(
-        run(
-            statuses=args.statuses,
-            concurrency=concurrency,
-            dry_run=args.dry_run,
-            depleted_threshold=depleted_threshold,
-        )
+    print(f"[config] base_url={base_url}")
+    print(f"[config] statuses={payload['statuses']}")
+    print(f"[config] concurrency={concurrency}")
+    print(f"[request] POST {url}")
+
+    if args.dry_run:
+        print("[dry-run] request body:")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    try:
+        timeout = httpx.Timeout(args.timeout, connect=min(5.0, args.timeout))
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            resp = client.post(
+                url,
+                headers={"Authorization": f"Bearer {admin_api_key}"},
+                json=payload,
+            )
+    except Exception as exc:
+        print(f"[error] request failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if resp.status_code >= 400:
+        body = (resp.text or "")[:500].replace("\n", " ")
+        print(f"[error] http {resp.status_code}: {body}", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        print(f"[error] invalid json response: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.raw:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    print(
+        "[done] "
+        f"total={int(data.get('total', 0) or 0)} "
+        f"succeeded={int(data.get('succeeded', 0) or 0)} "
+        f"failed={int(data.get('failed', 0) or 0)}"
     )
+    errors = data.get("errors")
+    if isinstance(errors, list) and errors:
+        show = min(len(errors), 20)
+        print(f"[errors] showing first {show}:")
+        for item in errors[:show]:
+            print(f"  - {item}")
 
 
 if __name__ == "__main__":

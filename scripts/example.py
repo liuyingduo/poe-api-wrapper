@@ -1,55 +1,137 @@
+import io
 import httpx
 import openai
 
-
 http_client = httpx.Client(
-    trust_env=False,
+    trust_env=False,  # Do not route localhost calls through HTTP_PROXY/HTTPS_PROXY.
     timeout=httpx.Timeout(60.0, connect=5.0),
 )
-
 client = openai.OpenAI(
     api_key="svc_app_zaiwen",
     base_url="http://207.180.218.216:8003/v1/",
     http_client=http_client,
 )
 
+# client = openai.OpenAI(
+#     api_key="svc_app_zaiwen",
+#     base_url="http://127.0.0.1:8003/v1/",
+#     http_client=http_client,
+# )
 
-def generate_music_link(prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model="hailuo-music-v1.5",
-        messages=[{"role": "user", "content": prompt}],
-        stream=False,
-    )
-    content = (resp.choices[0].message.content or "").strip()
-    if not content:
-        raise RuntimeError("hailuo-music-v1.5 返回为空，未拿到音乐链接")
-    return content
+# ── Non-Streaming Example ──────────────────────────────────────────────────────
+# response = client.chat.completions.create(
+#     model="gpt-3.5-turbo",
+#     messages=[
+#         {"role": "system", "content": "You are a helpful assistant."},
+#         {"role": "user", "content": "Hello!"},
+#     ],
+# )
+# print(response.choices[0].message.content)
+
+# # ── Streaming Example ──────────────────────────────────────────────────────────
+stream = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[
+        {"role": "user", "content": "helloi"},
+    ],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content is not None:
+        print(chunk.choices[0].delta.content, end="")
+# print()
+
+# # # ── Vision / Image-Input Example ───────────────────────────────────────────────
+IMAGE_URL = "https://ossnew.zaiwen.top/images/e95211642901a534d1ae572b5615f138b2b78c07aade05f2265626d0410c8deb.jpeg"
+
+# image_input = client.chat.completions.create(
+#     model="GPT-4o",
+#     messages=[
+#         {
+#             "role": "user",
+#             "content": [
+#                 {"type": "text", "text": "What's in this image?"},
+#                 {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+#             ],
+#         }
+#     ],
+# )
+# print(image_input.choices[0].message.content)
+
+# ── Image-Edit Example ─────────────────────────────────────────────────────────
+# Download the reference image and pass it as a file-like object.
+image_bytes = http_client.get(IMAGE_URL).content
+edit_resp = client.images.edit(
+    model="flux-2-klein-9b-base",
+    image=("reference.jpg", image_bytes, "image/jpeg"),
+    prompt="add a little flower",
+    n=1,
+    size="1024x1024",
+)
+print(edit_resp.data[0].url)
 
 
-def generate_nano_banana_image(prompt: str, size: str = "16x9", image_size: str = "1K") -> str:
-    payload = {
-        "model": "nano-banana-2",
-        "prompt": prompt,
-        "n": 1,
-        "size": size,
-        "extra_body": {"image_size": image_size},
-    }
-    resp = client.images.generate(**payload)
-    if not resp.data:
-        raise RuntimeError("nano-banana-2 返回为空，未拿到图片链接")
-    first = resp.data[0]
-    if first is None or not first.url:
-        raise RuntimeError("nano-banana-2 返回为空，未拿到图片链接")
-    return first.url
+# ── File Analysis Example ──────────────────────────────────────────────────────
+# 支持图片、PDF 等文件 URL，模型会分析文件内容并回答问题。
+# 多个文件直接在 content 列表里追加多个 image_url 条目即可。
+
+# ANALYZE_FILES = [
+#     "https://lib.hueb.edu.cn/__local/C/03/BD/ABAB4CD4F1A81D63A6B2C978081_B112E78E_1198F9.pdf?e=.pdf",
+# ]
+# ANALYZE_PROMPT = "请分析这些文件的主要内容，用中文回答。"
+# ANALYZE_MODEL = "GPT-4o"
+
+# content_parts = [{"type": "text", "text": ANALYZE_PROMPT}]
+# for f in ANALYZE_FILES:
+#     content_parts.append({"type": "file", "file": {"url": f}})
+
+# file_analysis = client.chat.completions.create(
+#     model=ANALYZE_MODEL,
+#     messages=[{"role": "user", "content": content_parts}],
+#     stream=True,
+# )
+# print(f"\n=== 文件分析结果 ({len(ANALYZE_FILES)} 个文件) ===")
+# for chunk in file_analysis:
+#     if chunk.choices[0].delta.content is not None:
+#         print(chunk.choices[0].delta.content, end="")
+# print()
 
 
-if __name__ == "__main__":
-    music_url = generate_music_link("生成一段轻快的 lo-fi 音乐，时长约 20 秒")
-    print("Music URL:", music_url)
+# import concurrent.futures
+# import time
 
-    image_url = generate_nano_banana_image(
-        "A minimalist cat poster, warm color palette",
-        size="16x9",
-        image_size="1K",
-    )
-    print("Nano-Banana URL:", image_url)
+# TOTAL_REQUESTS = 1
+# PROMPT = "A cute girl with a little flower"
+# MODEL = "Qwen-Image"
+
+# def generate_image(index: int):
+#     try:
+#         start = time.time()
+#         result = client.images.generate(
+#             model=MODEL,
+#             prompt=PROMPT,
+#             n=1,
+#         )
+#         elapsed = time.time() - start
+#         url = result.data[0].url if result.data else None
+#         print(f"[{index:03d}] 成功 ({elapsed:.2f}s): {url}")
+#         return {"index": index, "success": True, "url": url, "elapsed": elapsed}
+#     except Exception as e:
+#         print(f"[{index:03d}] 失败: {e}")
+#         return {"index": index, "success": False, "error": str(e)}
+
+# print(f"开始发起 {TOTAL_REQUESTS} 个并发图片生成请求...")
+# overall_start = time.time()
+
+# with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_REQUESTS) as executor:
+#     futures = {executor.submit(generate_image, i): i for i in range(1, TOTAL_REQUESTS + 1)}
+#     results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+# overall_elapsed = time.time() - overall_start
+# success_count = sum(1 for r in results if r["success"])
+# fail_count = TOTAL_REQUESTS - success_count
+
+# print(f"\n===== 测试完成 =====")
+# print(f"总请求数: {TOTAL_REQUESTS}")
+# print(f"成功: {success_count} | 失败: {fail_count}")
+# print(f"总耗时: {overall_elapsed:.2f}s")

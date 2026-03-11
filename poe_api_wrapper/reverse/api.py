@@ -1841,10 +1841,12 @@ class PoeApi:
     def delete_group(self, group_name: str):
         if group_name not in self.groups:
             raise ValueError(f"Group {group_name} not found. Make sure the group exists before deleting.")
-        if self.groups[group_name]['bots'] != {}:
-            for bot, chatdata in self.groups[group_name]['bots'].items():
-                if chatdata['chatId'] != None:
-                    self.delete_chat(bot, chatdata['chatId'])
+        bots = self.groups[group_name].get('bots') or []
+        for bot_data in bots:
+            bot_name = bot_data.get('bot')
+            chat_id = bot_data.get('chatId')
+            if bot_name is not None and chat_id is not None:
+                self.delete_chat(bot_name, chat_id)
         del self.groups[group_name]
         logger.info(f"Group {group_name} deleted")
         
@@ -1858,7 +1860,7 @@ class PoeApi:
     
     def save_group_history(self, group_name: str, file_path: str=None):
         try:
-            oldData = self.load_group_history(group_name, file_path=file_path)
+            oldData = self.load_group_history(file_path=file_path)
             oldData = oldData['group_data']['conversation_log']
         except:
             oldData = None
@@ -1882,7 +1884,7 @@ class PoeApi:
                 raise ValueError(f"File path {file_path} is invalid.")
             if not file_path.endswith('.json'):
                 raise ValueError(f"File path {file_path} is not a json file.")
-        with open(file_path, 'w') as f:
+        with open(file_path, 'wb') as f:
             f.write(orjson.dumps(saveData, option=orjson.OPT_INDENT_2))
         logger.info(f"Group {group_name} saved to {file_path}")
         return file_path

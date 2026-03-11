@@ -2076,7 +2076,6 @@ async def _chat_completions_impl(
                 session_id=session_id,
                 persistent_session=persistent_session,
                 exc=exc,
-                model=model,
             )
             await _finalize_account_use(
                 runtime,
