@@ -353,12 +353,30 @@ class PoeApi:
 
         return find_token(parsed)
 
+    def _build_finish_upload_headers(self) -> dict:
+        keep_keys = (
+            "Accept",
+            "Accept-Language",
+            "Origin",
+            "Referer",
+            "User-Agent",
+            "Poe-Formkey",
+        )
+        headers = {}
+        for key in keep_keys:
+            value = self.client.headers.get(key)
+            if value:
+                headers[key] = value
+        return headers
+
     def finish_upload(self, file_form: list) -> list:
         file_hash_jwts = []
+        upload_headers = self._build_finish_upload_headers()
         for file in file_form:
             response = self.client.post(
                 f"{self.BASE_URL}/api/finish_upload_POST",
                 files={"file": file},
+                headers=upload_headers,
                 follow_redirects=True,
             )
             if response.status_code != 200:
