@@ -653,7 +653,18 @@ class AccountRepository:
             {"$set": {"ever_connected": True, "updated_at": utc_now()}},
         )
 
-    async def list_candidate_accounts(self, limit: int = 1000) -> list[dict[str, Any]]:
+    _candidate_cache: Optional[list[dict[str, Any]]] = None
+    _candidate_cache_at: float = 0.0
+    _CANDIDATE_CACHE_TTL: float = 5.0  # 缓存 5 秒
+
+    async def list_candidate_accounts(self, limit: int = 500) -> list[dict[str, Any]]:
+        now_mono = _time.monotonic()
+        if (
+            self._candidate_cache is not None
+            and (now_mono - self._candidate_cache_at) < self._CANDIDATE_CACHE_TTL
+        ):
+            return self._candidate_cache[:limit]
+
         now = utc_now()
         query = {
             "status": "active",
@@ -665,7 +676,16 @@ class AccountRepository:
         }
 
         def _op():
-            cursor = self.accounts.find(query).sort(
+            cursor = self.accounts.find(
+                query,
+                {
+                    "_id": 1,
+                    "message_point_balance": 1,
+                    "error_count": 1,
+                    "subscription_active": 1,
+                    "status": 1,
+                },
+            ).sort(
                 [
                     ("message_point_balance", DESCENDING),
                     ("_id", ASCENDING),
@@ -675,26 +695,37 @@ class AccountRepository:
                 cursor = cursor.limit(limit)
             return list(cursor)
 
-        return await self._run(_op)
+        result = await self._run(_op)
+        self._candidate_cache = result
+        self._candidate_cache_at = now_mono
+        return result
 
     async def mark_account_success(self, account_id: str) -> None:
         now = utc_now()
 
         def _op():
-            doc = self.accounts.find_one({"_id": self._object_id(account_id)})
-            if not doc:
-                return
-            error_count = int(doc.get("error_count", 0) or 0)
-            update_doc = {
-                "last_success_at": now,
-                "last_error": None,
-                "error_count": max(error_count - 1, 0),
-                "updated_at": now,
-            }
-            if doc.get("status") != "depleted":
-                update_doc["status"] = "active"
-                update_doc["cooldown_until"] = None
-            self.accounts.update_one({"_id": doc["_id"]}, {"$set": update_doc})
+            # 聚合管道更新：单次 IO 完成所有逻辑
+            self.accounts.update_one(
+                {"_id": self._object_id(account_id)},
+                [
+                    {
+                        "$set": {
+                            "last_success_at": now,
+                            "last_error": None,
+                            "updated_at": now,
+                            "error_count": {
+                                "$max": [0, {"$subtract": [{"$ifNull": ["$error_count", 0]}, 1]}]
+                            },
+                            "status": {
+                                "$cond": [{"$eq": ["$status", "depleted"]}, "$status", "active"]
+                            },
+                            "cooldown_until": {
+                                "$cond": [{"$eq": ["$status", "depleted"]}, "$cooldown_until", None]
+                            },
+                        }
+                    }
+                ],
+            )
 
         await self._run(_op)
 
@@ -1035,7 +1066,7 @@ class AccountSelector:
         return [account for account in candidates if str(account["_id"]) in cached_ids]
 
     async def _top_pool(self, *, prewarmed_only: bool = False) -> list[dict[str, Any]]:
-        candidates = await self.repo.list_candidate_accounts(limit=5000)
+        candidates = await self.repo.list_candidate_accounts(limit=500)
         if not candidates:
             raise NoAccountAvailableError("No active accounts are available")
         if prewarmed_only:
@@ -1857,10 +1888,22 @@ class PoolMonitor:
 
         deficit = self.target_pool_size - current_count - in_flight
 
-        # 每次都计算中位数（用于监控和日志）
+        # 计算中位数：有缓存则复用，避免每 5 秒全量查 DB
         import statistics
-        used_balances = await self.repo.get_used_account_balances()
-        median_balance = float(statistics.median(used_balances)) if used_balances else 0.0
+        now_mono = _time.monotonic()
+        if (
+            not hasattr(self, "_median_cache")
+            or now_mono - self._median_cache_at > 30.0
+            or deficit > 0
+        ):
+            used_balances = await self.repo.get_used_account_balances()
+            median_balance = float(statistics.median(used_balances)) if used_balances else 0.0
+            self._median_cache = median_balance
+            self._median_cache_at = now_mono
+            self._median_used_count = len(used_balances)
+        else:
+            median_balance = self._median_cache
+            used_balances = []  # 仅用于日志
 
         proxy_region = self.proxy_rotator.current_region if self.proxy_rotator.enabled else "n/a"
         logger.info(
@@ -1868,7 +1911,7 @@ class PoolMonitor:
             current_count,
             in_flight,
             deficit,
-            len(used_balances),
+            len(used_balances) or getattr(self, "_median_used_count", 0),
             int(median_balance),
             proxy_region,
         )

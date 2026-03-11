@@ -335,7 +335,7 @@ class GatewayConfig:
             cooldown_seconds=_env_int("COOLDOWN_SECONDS", 120),
             target_pool_size=_env_int("TARGET_POOL_SIZE", 8),
             min_pool_size=_env_int("MIN_POOL_SIZE", 5),
-            max_pool_size=_env_int("MAX_POOL_SIZE", 8),
+            max_pool_size=_env_int("MAX_POOL_SIZE", 18),
             pool_fill_concurrency=_env_int("POOL_FILL_CONCURRENCY", 10),
             pool_monitor_interval_seconds=_env_int("POOL_MONITOR_INTERVAL_SECONDS", 5),
             pool_connect_timeout_seconds=_env_int("POOL_CONNECT_TIMEOUT_SECONDS", 40),
@@ -1501,15 +1501,17 @@ async def generate_chunks(
                     incoming_chat_code = chunk.get("chatCode") or chat_code
                     incoming_chat_id = chunk.get("chatId") or chat_id
                     if incoming_chat_code and incoming_chat_id:
-                        chat_code = incoming_chat_code
-                        chat_id = incoming_chat_id
-                        await runtime.sessions.update_session_chat(
-                            session_id=session_id,
-                            model=model,
-                            account_id=account_id,
-                            chat_code=chat_code,
-                            chat_id=chat_id,
-                        )
+                        # 只在 chat_code/chat_id 变化时才写 DB
+                        if incoming_chat_code != chat_code or incoming_chat_id != chat_id:
+                            chat_code = incoming_chat_code
+                            chat_id = incoming_chat_id
+                            await runtime.sessions.update_session_chat(
+                                session_id=session_id,
+                                model=model,
+                                account_id=account_id,
+                                chat_code=chat_code,
+                                chat_id=chat_id,
+                            )
                 completion_tokens = await helpers.__tokenize(chunk["text"])
                 if max_tokens and completion_tokens >= max_tokens:
                     await client.cancel_message(chunk)
@@ -1824,15 +1826,16 @@ async def non_streaming_response(
                     incoming_chat_code = chunk.get("chatCode") or chat_code
                     incoming_chat_id = chunk.get("chatId") or chat_id
                     if incoming_chat_code and incoming_chat_id:
-                        chat_code = incoming_chat_code
-                        chat_id = incoming_chat_id
-                        await runtime.sessions.update_session_chat(
-                            session_id=session_id,
-                            model=model,
-                            account_id=account_id,
-                            chat_code=chat_code,
-                            chat_id=chat_id,
-                        )
+                        if incoming_chat_code != chat_code or incoming_chat_id != chat_id:
+                            chat_code = incoming_chat_code
+                            chat_id = incoming_chat_id
+                            await runtime.sessions.update_session_chat(
+                                session_id=session_id,
+                                model=model,
+                                account_id=account_id,
+                                chat_code=chat_code,
+                                chat_id=chat_id,
+                            )
                 if max_tokens and await helpers.__tokenize(chunk["text"]) >= max_tokens:
                     await client.cancel_message(chunk)
                     finish_reason = "length"
