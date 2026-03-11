@@ -556,7 +556,7 @@ async def _finalize_account_use(
     persistent_session: bool = False,
     success: bool = False,
     error_decision: Optional[AccountErrorDecision] = None,
-    evict_client: bool = True,
+    evict_client: Optional[bool] = None,
     release_lease: bool = True,
 ) -> None:
     if success:
@@ -584,7 +584,9 @@ async def _finalize_account_use(
                 cooldown_seconds=runtime.config.cooldown_seconds,
             )
 
-    if evict_client:
+    # 自动决定：成功→保留 client 继续复用，失败→销毁
+    should_evict = evict_client if evict_client is not None else (not success)
+    if should_evict:
         await runtime.pool.invalidate_client(account_id)
     if lease and release_lease:
         await lease.release()
@@ -1585,7 +1587,7 @@ async def generate_chunks(
                 persistent_session=persistent_session,
                 success=False,
                 error_decision=error_decision,
-                evict_client=True,
+
                 release_lease=True,
             )
             # 旧账号已清理完毕，防止 cleanup_task 再次清理
@@ -1738,7 +1740,7 @@ async def streaming_response(
             persistent_session=persistent_session,
             success=shared_state["succeeded"],
             error_decision=shared_state["error_decision"],
-            evict_client=True,  # 强制销毁
+            # evict 自动由 success 决定
         )
 
     return StreamingResponse(
@@ -1898,7 +1900,7 @@ async def non_streaming_response(
             persistent_session=persistent_session,
             success=succeeded,
             error_decision=error_decision,
-            evict_client=True,
+
         )
 
 
@@ -2054,7 +2056,7 @@ async def _chat_completions_impl(
                 session_id=session_id,
                 persistent_session=persistent_session,
                 success=False,
-                evict_client=True,
+
             )
             if not is_last:
                 logger.warning(
@@ -2085,7 +2087,7 @@ async def _chat_completions_impl(
                 persistent_session=persistent_session,
                 success=False,
                 error_decision=error_decision,
-                evict_client=True,
+
             )
             if not is_last:
                 logger.warning(
@@ -2129,7 +2131,7 @@ async def _chat_completions_impl(
                     session_id=session_id,
                     persistent_session=persistent_session,
                     success=False,
-                    evict_client=True,
+    
                 )
                 raise
             except Exception as exc:
@@ -2140,7 +2142,7 @@ async def _chat_completions_impl(
                     session_id=session_id,
                     persistent_session=persistent_session,
                     success=False,
-                    evict_client=True,
+    
                 )
                 _openai_http_error(
                     400,
@@ -2253,7 +2255,7 @@ async def create_images(
             session_id="ephemeral",
             persistent_session=False,
             success=False,
-            evict_client=True,
+
         )
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
@@ -2307,7 +2309,7 @@ async def create_images(
             persistent_session=False,
             success=succeeded,
             error_decision=error_decision,
-            evict_client=True,
+
         )
 
 
@@ -2403,7 +2405,7 @@ async def edit_images(
             session_id="ephemeral",
             persistent_session=False,
             success=False,
-            evict_client=True,
+
         )
         _openai_http_error(402, "insufficient_credits", "Premium model requires active subscription")
 
@@ -2491,7 +2493,7 @@ async def edit_images(
             persistent_session=False,
             success=succeeded,
             error_decision=error_decision,
-            evict_client=True,
+
         )
 
 
