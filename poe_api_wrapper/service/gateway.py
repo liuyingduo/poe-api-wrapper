@@ -1073,22 +1073,20 @@ class AccountSelector:
         self.inflight_penalty = inflight_penalty
         self.recent_error_penalty = recent_error_penalty
 
-    def _filter_prewarmed_accounts(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not self.pool:
-            return candidates
-        cached_ids = self.pool.cached_account_ids()
-        if not cached_ids:
-            return []
-        return [account for account in candidates if str(account["_id"]) in cached_ids]
-
     async def _top_pool(self, *, prewarmed_only: bool = False) -> list[dict[str, Any]]:
-        candidates = await self.repo.list_candidate_accounts(limit=500)
-        if not candidates:
-            raise NoAccountAvailableError("No active accounts are available")
-        if prewarmed_only:
-            candidates = self._filter_prewarmed_accounts(candidates)
-            if not candidates:
-                raise CapacityLimitError("No prewarmed accounts are currently available")
+        if not self.pool:
+            raise NoAccountAvailableError("No account pool is configured")
+
+        cached_ids = self.pool.cached_account_ids_in_order()
+        logger.info(
+            "Using prewarmed pool candidates only (prewarmed_only={}), cached_clients={}",
+            prewarmed_only,
+            len(cached_ids),
+        )
+        if not cached_ids:
+            raise CapacityLimitError("No prewarmed accounts are currently available")
+
+        candidates = [{"_id": account_id} for account_id in cached_ids]
         top_limit = min(self.top_n, len(candidates))
         return candidates[:top_limit]
 

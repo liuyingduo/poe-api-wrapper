@@ -188,18 +188,45 @@ QUERY_NAME_ALIASES = {
   "ExploreBotsIndexPageQuery": "exploreBotsIndexPageQuery",
 }
 
+
+def _to_lower_camel(name: str) -> str:
+  if not name:
+    return name
+  return name[0].lower() + name[1:]
+
+
+def _build_query_hashes() -> dict[str, str]:
+  hashes: dict[str, str] = {}
+  for key, value in QUERIES.items():
+    hashes[key] = value
+    hashes[_to_lower_camel(key)] = value
+  return hashes
+
+
+QUERY_HASHES = _build_query_hashes()
+
 def resolve_query_name(query_name: str) -> str:
-    return QUERY_NAME_ALIASES.get(query_name, query_name)
+    normalized = QUERY_NAME_ALIASES.get(query_name, query_name)
+    lowered = _to_lower_camel(normalized)
+    if lowered in QUERY_HASHES:
+      return lowered
+    return normalized
 
 def generate_payload(query_name, variables) -> str:
     if query_name == "recv":
         return generate_recv_payload(variables)
+    original_query_name = query_name
     query_name = resolve_query_name(query_name)
+    query_hash = QUERY_HASHES.get(query_name)
+    if query_hash is None:
+        query_hash = QUERY_HASHES.get(original_query_name)
+    if query_hash is None:
+        raise KeyError(query_name)
     payload = {
         "queryName": query_name,
         "variables": variables,
         "extensions": {
-            "hash": QUERIES[query_name]
+            "hash": query_hash
         }
     }
     return orjson.dumps(payload).decode("utf-8")
