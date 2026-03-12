@@ -2461,6 +2461,8 @@ async def edit_images(
         client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
         response = await image_handler(base_model, prompt, tokens_limit)
 
+        logger.info(f"Edit image generation response: {edit_attachment}")
+
         urls: list[str] = []
         for _ in range(n):
             image_generation = await generate_image(

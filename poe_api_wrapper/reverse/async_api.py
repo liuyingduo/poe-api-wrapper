@@ -429,10 +429,77 @@ class AsyncPoeApi:
                 headers[key] = value
         return headers
 
+    def _build_receive_headers(self, payload_text: str) -> dict:
+        keep_keys = (
+            "Accept",
+            "Accept-Language",
+            "Origin",
+            "Referer",
+            "User-Agent",
+            "Poe-Formkey",
+            "Poe-Revision",
+        )
+        headers = {"Content-Type": "application/json"}
+        for key in keep_keys:
+            value = self.client.headers.get(key)
+            if value:
+                headers[key] = value
+        if self.formkey:
+            base_string = payload_text + self.formkey + "4LxgHM6KpFqokX0Ox"
+            headers["poe-tag-id"] = hashlib.md5(base_string.encode()).hexdigest()
+        return headers
+
+    async def _emit_upload_action_log(self, file_name: str, file_content_type: str, file_size: int) -> None:
+        file_size_kb = max(1, (file_size + 1023) // 1024)
+        payload = [
+            {
+                "category": "poe/action_log",
+                "data": {
+                    "action_type": 50,
+                    "action_metadata": {
+                        "file_size_in_kB": int(file_size_kb),
+                        "file_format": file_content_type or "application/octet-stream",
+                    },
+                },
+            }
+        ]
+        payload_text = orjson.dumps(payload).decode("utf-8")
+        headers = self._build_receive_headers(payload_text)
+        response = await self.client.post(
+            f"{self.BASE_URL}/api/receive_POST",
+            data=payload_text,
+            headers=headers,
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            preview = response.text[:200].replace("\n", " ")
+            logger.warning(
+                "receive_POST non-200 before upload name={} status={} body_preview={}",
+                file_name,
+                response.status_code,
+                preview,
+            )
+
     async def finish_upload(self, file_form: list) -> list:
         file_hash_jwts = []
         upload_headers = self._build_finish_upload_headers()
         for file in file_form:
+            file_name = str(file[0]) if len(file) > 0 else "unknown"
+            file_content_type = str(file[2]) if len(file) > 2 else "application/octet-stream"
+            file_bytes = file[1] if len(file) > 1 and isinstance(file[1], (bytes, bytearray)) else b""
+            file_size = len(file_bytes)
+            file_sha256 = hashlib.sha256(file_bytes).hexdigest() if file_bytes else "n/a"
+            logger.info(
+                "finish_upload_precheck name={} content_type={} size={} sha256={}",
+                file_name,
+                file_content_type,
+                file_size,
+                file_sha256,
+            )
+            try:
+                await self._emit_upload_action_log(file_name, file_content_type, file_size)
+            except Exception as exc:
+                logger.warning("receive_POST failed before upload name={} error={}", file_name, exc)
             response = await self.client.post(
                 f"{self.BASE_URL}/api/finish_upload_POST",
                 files={"file": file},
@@ -441,12 +508,25 @@ class AsyncPoeApi:
             )
             if response.status_code != 200:
                 preview = response.text[:300].replace("\n", " ")
+                logger.warning(
+                    "finish_upload_http_error name={} status={} response_content_type={} body_preview={}",
+                    file_name,
+                    response.status_code,
+                    response.headers.get("content-type", ""),
+                    preview,
+                )
                 raise RuntimeError(
                     f"finish_upload_POST failed. status_code:{response.status_code}, body_preview:{preview!r}"
                 )
             file_hash_jwt = self._extract_file_hash_jwt(response.text)
             if not file_hash_jwt:
                 preview = response.text[:300].replace("\n", " ")
+                logger.warning(
+                    "finish_upload_parse_error name={} response_content_type={} body_preview={}",
+                    file_name,
+                    response.headers.get("content-type", ""),
+                    preview,
+                )
                 raise RuntimeError(
                     f"Failed to parse fileHashJwt from finish_upload_POST response. body_preview:{preview!r}"
                 )
