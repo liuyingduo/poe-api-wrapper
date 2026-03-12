@@ -91,13 +91,9 @@ class PoeApi:
         self.client = Client(headers=self.HEADERS.copy(), timeout=None, http2=True)
         if headers:
             self.client.headers.update(headers)
-        self.client.cookies.update({
-                                'p-b': self.tokens['p-b'],
-                                })
+        self.client.cookies.set('p-b', self.tokens['p-b'], domain='poe.com', path='/')
         if 'p-lat' in self.tokens and self.tokens['p-lat']:
-            self.client.cookies.update({
-                'p-lat': self.tokens['p-lat']
-            })
+            self.client.cookies.set('p-lat', self.tokens['p-lat'], domain='poe.com', path='/')
         
         cloudflare_cookies = {}
         if '__cf_bm' in tokens and tokens['__cf_bm']:
@@ -105,7 +101,8 @@ class PoeApi:
         if 'cf_clearance' in tokens and tokens['cf_clearance']:
             cloudflare_cookies['cf_clearance'] = tokens['cf_clearance']
         if cloudflare_cookies:
-            self.client.cookies.update(cloudflare_cookies)
+            for cookie_name, cookie_value in cloudflare_cookies.items():
+                self.client.cookies.set(cookie_name, cookie_value, domain='poe.com', path='/')
         
         if 'formkey' in tokens:
             self.formkey = tokens['formkey']
@@ -547,6 +544,15 @@ class PoeApi:
         ]
         payload_text = orjson.dumps(payload).decode("utf-8")
         headers = self._build_receive_headers(payload_text)
+        cookie_snapshot = [
+            {
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self.client.cookies.jar
+        ]
+        logger.info("receive_POST cookies={}", cookie_snapshot)
         response = self.client.post(
             f"{self.BASE_URL}/api/receive_POST",
             data=payload_text,

@@ -138,13 +138,13 @@ class AsyncPoeApi:
 
         if self._extra_headers:
             client.headers.update(self._extra_headers)
-        client.cookies.update({'p-b': self.tokens['p-b']})
+        client.cookies.set('p-b', self.tokens['p-b'], domain='poe.com', path='/')
         if self.tokens.get('p-lat'):
-            client.cookies.update({'p-lat': self.tokens['p-lat']})
+            client.cookies.set('p-lat', self.tokens['p-lat'], domain='poe.com', path='/')
         if self.tokens.get('__cf_bm'):
-            client.cookies.update({'__cf_bm': self.tokens['__cf_bm']})
+            client.cookies.set('__cf_bm', self.tokens['__cf_bm'], domain='poe.com', path='/')
         if self.tokens.get('cf_clearance'):
-            client.cookies.update({'cf_clearance': self.tokens['cf_clearance']})
+            client.cookies.set('cf_clearance', self.tokens['cf_clearance'], domain='poe.com', path='/')
         if self.formkey:
             client.headers.update({'Poe-Formkey': self.formkey})
         if self.tokens.get('poe-revision'):
@@ -606,13 +606,23 @@ class AsyncPoeApi:
             }
         ]
         logger.info(
-            "Emitting upload action log before receive_POST name={} content_type={} size_kB={}",
+            "Emitting upload action log before receive_POST name={} content_type={} size_kB={} payload={}",
             file_name,
             file_content_type,
             file_size_kb,
+            payload
         )
         payload_text = orjson.dumps(payload).decode("utf-8")
         headers = self._build_receive_headers(payload_text)
+        cookie_snapshot = [
+            {
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self.client.cookies.jar
+        ]
+        logger.info("receive_POST cookies={}", cookie_snapshot)
         response = await self.client.post(
             f"{self.BASE_URL}/api/receive_POST",
             data=payload_text,
