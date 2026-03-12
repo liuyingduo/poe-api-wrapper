@@ -417,7 +417,22 @@ class AsyncPoeApi:
         keep_keys = (
             "Accept",
             "Accept-Language",
+            "Cache-Control",
             "Origin",
+            "Pragma",
+            "Priority",
+            "Sec-Ch-Ua",
+            "Sec-Ch-Ua-Arch",
+            "Sec-Ch-Ua-Bitness",
+            "Sec-Ch-Ua-Full-Version",
+            "Sec-Ch-Ua-Full-Version-List",
+            "Sec-Ch-Ua-Mobile",
+            "Sec-Ch-Ua-Model",
+            "Sec-Ch-Ua-Platform",
+            "Sec-Ch-Ua-Platform-Version",
+            "Sec-Fetch-Dest",
+            "Sec-Fetch-Mode",
+            "Sec-Fetch-Site",
             "Referer",
             "User-Agent",
             "Poe-Formkey",
@@ -427,6 +442,22 @@ class AsyncPoeApi:
             value = self.client.headers.get(key)
             if value:
                 headers[key] = value
+
+        defaults = {
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Priority": "u=1, i",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Ch-Ua-Arch": '"x86"',
+            "Sec-Ch-Ua-Bitness": '"64"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Model": '""',
+            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+        }
+        for key, value in defaults.items():
+            headers.setdefault(key, value)
         return headers
 
     def _build_receive_headers(self, payload_text: str) -> dict:
@@ -449,7 +480,67 @@ class AsyncPoeApi:
             headers["poe-tag-id"] = hashlib.md5(base_string.encode()).hexdigest()
         return headers
 
+    def _build_upload_filetype_probe_headers(self) -> dict:
+        keep_keys = (
+            "Accept",
+            "Accept-Language",
+            "Cache-Control",
+            "Pragma",
+            "Priority",
+            "Referer",
+            "User-Agent",
+            "Sec-Ch-Ua",
+            "Sec-Ch-Ua-Arch",
+            "Sec-Ch-Ua-Bitness",
+            "Sec-Ch-Ua-Full-Version",
+            "Sec-Ch-Ua-Full-Version-List",
+            "Sec-Ch-Ua-Mobile",
+            "Sec-Ch-Ua-Model",
+            "Sec-Ch-Ua-Platform",
+            "Sec-Ch-Ua-Platform-Version",
+            "Sec-Fetch-Site",
+        )
+        headers = {}
+        for key in keep_keys:
+            value = self.client.headers.get(key)
+            if value:
+                headers[key] = value
+
+        defaults = {
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Priority": "u=1, i",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Ch-Ua-Arch": '"x86"',
+            "Sec-Ch-Ua-Bitness": '"64"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Model": '""',
+            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+        }
+        for key, value in defaults.items():
+            headers.setdefault(key, value)
+        return headers
+
+    async def _emit_upload_filetype_probe(self, file_name: str) -> None:
+        headers = self._build_upload_filetype_probe_headers()
+        response = await self.client.get(
+            f"{self.BASE_URL}/filetype_Files.png",
+            headers=headers,
+            follow_redirects=True,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "filetype_Files probe non-200 before receive_POST name={} status={} content_type={}",
+                file_name,
+                response.status_code,
+                response.headers.get("content-type", ""),
+            )
+
     async def _emit_upload_action_log(self, file_name: str, file_content_type: str, file_size: int) -> None:
+        await self._emit_upload_filetype_probe(file_name)
         file_size_kb = max(1, (file_size + 1023) // 1024)
         payload = [
             {

@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
 )
 DEFAULT_NEW_ACCOUNT_POINT_BALANCE = 3000
 
@@ -69,9 +69,15 @@ _BROWSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Priority": "u=0, i",
-    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
+    "Sec-Ch-Ua-Arch": '"x86"',
+    "Sec-Ch-Ua-Bitness": '"64"',
+    "Sec-Ch-Ua-Full-Version": '"145.0.3800.97"',
+    "Sec-Ch-Ua-Full-Version-List": '"Not:A-Brand";v="99.0.0.0", "Microsoft Edge";v="145.0.3800.97", "Chromium";v="145.0.7632.160"',
     "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Model": '""',
     "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -89,8 +95,14 @@ _CURL_CFFI_BROWSE_HEADERS = {
         "User-Agent",
         "Priority",
         "Sec-Ch-Ua",
+        "Sec-Ch-Ua-Arch",
+        "Sec-Ch-Ua-Bitness",
+        "Sec-Ch-Ua-Full-Version",
+        "Sec-Ch-Ua-Full-Version-List",
         "Sec-Ch-Ua-Mobile",
+        "Sec-Ch-Ua-Model",
         "Sec-Ch-Ua-Platform",
+        "Sec-Ch-Ua-Platform-Version",
         "Sec-Fetch-Dest",
         "Sec-Fetch-Mode",
         "Sec-Fetch-Site",

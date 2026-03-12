@@ -6,12 +6,18 @@ from typing import Any, Optional
 
 BASE_URL = 'https://poe.com'
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 Edg/115.0.1901.203",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.5",
-    "Sec-Ch-Ua": '"Microsoft Edge";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
+    "Sec-Ch-Ua-Arch": '"x86"',
+    "Sec-Ch-Ua-Bitness": '"64"',
+    "Sec-Ch-Ua-Full-Version": '"145.0.3800.97"',
+    "Sec-Ch-Ua-Full-Version-List": '"Not:A-Brand";v="99.0.0.0", "Microsoft Edge";v="145.0.3800.97", "Chromium";v="145.0.7632.160"',
     "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Model": '""',
     "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
     "Upgrade-Insecure-Requests": "1",
     "Origin": "https://poe.com",
     "Referer": "https://poe.com/",
