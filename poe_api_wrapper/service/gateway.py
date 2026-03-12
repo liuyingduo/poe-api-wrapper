@@ -660,6 +660,64 @@ class AccountRepository:
             )
         await self._run(_op)
 
+    @staticmethod
+    def _normalize_bot_handle(handle: str) -> str:
+        return str(handle or "").strip().lower().replace(" ", "")
+
+    async def get_cached_bot_id(self, handle: str) -> Optional[int]:
+        normalized = self._normalize_bot_handle(handle)
+        if not normalized:
+            return None
+
+        cache_key = f"poe_bot_id:{normalized}"
+
+        def _op() -> Optional[int]:
+            doc = self.metadata.find_one({"_id": cache_key})
+            if not doc:
+                return None
+            raw_bot_id = doc.get("bot_id", doc.get("value"))
+            try:
+                bot_id = int(raw_bot_id)
+            except (TypeError, ValueError):
+                return None
+            return bot_id if bot_id > 0 else None
+
+        return await self._run(_op)
+
+    async def cache_bot_id(self, handle: str, bot_id: int, *, canonical_handle: Optional[str] = None) -> None:
+        normalized = self._normalize_bot_handle(handle)
+        if not normalized:
+            return
+        try:
+            normalized_bot_id = int(bot_id)
+        except (TypeError, ValueError):
+            return
+        if normalized_bot_id <= 0:
+            return
+
+        handles = {normalized}
+        canonical = self._normalize_bot_handle(canonical_handle or "")
+        if canonical:
+            handles.add(canonical)
+        now = utc_now()
+
+        def _op() -> None:
+            for normalized_handle in handles:
+                self.metadata.find_one_and_update(
+                    {"_id": f"poe_bot_id:{normalized_handle}"},
+                    {
+                        "$set": {
+                            "bot_id": normalized_bot_id,
+                            "value": normalized_bot_id,
+                            "handle": normalized_handle,
+                            "updated_at": now,
+                        }
+                    },
+                    upsert=True,
+                )
+
+        await self._run(_op)
+
     async def get_used_account_balances(self) -> list[int]:
         """返回所有 ever_connected=True 的 active 账号余额，用于计算中位数。"""
         def _op():

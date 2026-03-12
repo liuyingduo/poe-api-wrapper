@@ -1280,6 +1280,38 @@ def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
     return aspect_ratio
 
 
+def _normalize_bot_handle(handle: str) -> str:
+    return str(handle or "").strip().lower().replace(" ", "")
+
+
+async def _ensure_bot_id_for_upload(runtime: GatewayRuntime, client, bot_handle: str) -> Optional[int]:
+    normalized = _normalize_bot_handle(bot_handle)
+    if not normalized:
+        return None
+
+    cached = await runtime.repo.get_cached_bot_id(normalized)
+    if cached and cached > 0:
+        return int(cached)
+
+    bot_info = await client.get_botInfo(bot_handle)
+    raw_bot_id = bot_info.get("botId")
+    try:
+        bot_id = int(raw_bot_id)
+    except (TypeError, ValueError):
+        return None
+    if bot_id <= 0:
+        return None
+
+    canonical_handle = bot_info.get("handle") or bot_handle
+    await runtime.repo.cache_bot_id(normalized, bot_id, canonical_handle=canonical_handle)
+    logger.info(
+        "Resolved and cached botId for upload handle={} botId={}",
+        canonical_handle,
+        bot_id,
+    )
+    return bot_id
+
+
 async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[str], List[str]]:
     if not attachments:
         return [], []
@@ -1368,11 +1400,13 @@ def _is_audio_generation_model(model: str) -> bool:
 
 
 async def generate_image(
+    runtime: GatewayRuntime,
     client,
     response: dict,
     aspect_ratio: str,
     image: list = None,
     parameters: Optional[dict[str, Any]] = None,
+    bot_id: Optional[int] = None,
 ) -> str:
     image = image or []
     message = (response.get("message") or "").strip()
@@ -1380,10 +1414,19 @@ async def generate_image(
     if normalized_aspect and not re.search(r"(^|\s)--aspect(\s+|$)", message, flags=re.IGNORECASE):
         message = f"{message} {normalized_aspect}".strip()
     try:
+        resolved_bot_id = bot_id
+        if image and (resolved_bot_id is None or int(resolved_bot_id) <= 0):
+            try:
+                resolved_bot_id = await _ensure_bot_id_for_upload(runtime, client, response["bot"])
+            except Exception as exc:
+                logger.warning("Failed to resolve botId before receive_POST bot={} error={}", response.get("bot"), exc)
+                resolved_bot_id = None
+
         async for chunk in client.send_message(
             bot=response["bot"],
             message=message,
             file_path=image,
+            botId=resolved_bot_id,
             parameters=parameters,
         ):
             pass
@@ -1478,6 +1521,7 @@ async def generate_chunks(
     account_id: str,
     lease: AccountLease,
     chat_parameters: Optional[dict[str, Any]],
+    upload_bot_id: Optional[int],
     shared_state: dict[str, Any],  # 用于与 BackgroundTask 共享执行结果
 ) -> AsyncGenerator[bytes, None]:
     completion_timestamp = await helpers.__generate_timestamp()
@@ -1493,6 +1537,7 @@ async def generate_chunks(
                 bot=response["bot"],
                 message=response["message"],
                 file_path=attachment_paths,
+                botId=upload_bot_id,
                 chatCode=chat_code,
                 chatId=chat_id,
                 parameters=chat_parameters,
@@ -1645,6 +1690,11 @@ async def generate_chunks(
                         bot=retry_bot,
                         message=response["message"],
                         file_path=attachment_paths,
+                        botId=(
+                            await _ensure_bot_id_for_upload(runtime, new_client, retry_bot)
+                            if attachment_paths
+                            else None
+                        ),
                         chatCode=None,
                         chatId=None,
                         parameters=chat_parameters,
@@ -1733,6 +1783,7 @@ async def streaming_response(
     account_id: str,
     lease: AccountLease,
     chat_parameters: Optional[dict[str, Any]],
+    upload_bot_id: Optional[int],
 ) -> StreamingResponse:
 
     # 用于在生成器和后台任务间共享执行结果（含重试后的账号信息）
@@ -1781,6 +1832,7 @@ async def streaming_response(
             account_id=account_id,
             lease=lease,
             chat_parameters=chat_parameters,
+            upload_bot_id=upload_bot_id,
             shared_state=shared_state,  # 传入共享状态
         ),
         status_code=200,
@@ -1808,6 +1860,7 @@ async def non_streaming_response(
     account_id: str,
     lease: AccountLease,
     chat_parameters: Optional[dict[str, Any]],
+    upload_bot_id: Optional[int],
 ) -> JSONResponse:
     succeeded = False
     error_decision: Optional[AccountErrorDecision] = None
@@ -1818,6 +1871,7 @@ async def non_streaming_response(
                 bot=response["bot"],
                 message=response["message"],
                 file_path=attachment_paths,
+                botId=upload_bot_id,
                 chatCode=chat_code,
                 chatId=chat_id,
                 parameters=chat_parameters,
@@ -2169,6 +2223,20 @@ async def _chat_completions_impl(
                     f"Failed to process attachments: {exc}",
                 )
 
+        upload_bot_id: Optional[int] = None
+        if attachment_paths:
+            try:
+                upload_bot_id = await _ensure_bot_id_for_upload(runtime, client, response["bot"])
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve upload botId model={} bot={} account_id={} error={}",
+                    model,
+                    response.get("bot"),
+                    mask_secret(account_id),
+                    exc,
+                )
+                upload_bot_id = None
+
         if streaming:
             return await streaming_response(
                 runtime=runtime,
@@ -2189,6 +2257,7 @@ async def _chat_completions_impl(
                 account_id=account_id,
                 lease=lease,
                 chat_parameters=chat_parameters,
+                upload_bot_id=upload_bot_id,
             )
 
         try:
@@ -2210,6 +2279,7 @@ async def _chat_completions_impl(
                 account_id=account_id,
                 lease=lease,
                 chat_parameters=chat_parameters,
+                upload_bot_id=upload_bot_id,
             )
         except HTTPException as exc:
             # non_streaming_response 已在 finally 中完成了账号清理
@@ -2286,7 +2356,7 @@ async def create_images(
 
         urls: list[str] = []
         for _ in range(n):
-            image_generation = await generate_image(client, response, aspect_ratio, parameters=image_parameters)
+            image_generation = await generate_image(runtime, client, response, aspect_ratio, parameters=image_parameters)
             logger.info("Raw image generation response for model={}: {!r}", model, image_generation)
             extracted = [url for url in image_generation.split() if url.startswith("https://")]
             if not extracted:
@@ -2466,6 +2536,7 @@ async def edit_images(
         urls: list[str] = []
         for _ in range(n):
             image_generation = await generate_image(
+                runtime,
                 client,
                 response,
                 aspect_ratio,

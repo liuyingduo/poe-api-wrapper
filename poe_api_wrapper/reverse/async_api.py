@@ -115,6 +115,7 @@ class AsyncPoeApi:
         self.loop: asyncio.AbstractEventLoop = None
         self._ws_heartbeat_task: Optional[asyncio.Task] = None
         self._extra_headers = headers or {}
+        self._bot_id_cache: dict[str, int] = {}
 
         self.client = self._build_http_client()
         if 'formkey' in tokens:
@@ -524,6 +525,41 @@ class AsyncPoeApi:
             headers.setdefault(key, value)
         return headers
 
+    @staticmethod
+    def _normalize_bot_handle(handle: str) -> str:
+        return str(handle or "").strip().lower().replace(" ", "")
+
+    async def _resolve_bot_id_for_upload(self, bot_candidates: list[str]) -> Optional[int]:
+        normalized_candidates = [self._normalize_bot_handle(item) for item in bot_candidates if item]
+        for normalized in normalized_candidates:
+            cached = self._bot_id_cache.get(normalized)
+            if isinstance(cached, int) and cached > 0:
+                return cached
+
+        for candidate in bot_candidates:
+            if not candidate:
+                continue
+            try:
+                bot_info = await self.get_botInfo(candidate)
+            except Exception as exc:
+                logger.debug("Failed to resolve botId for upload candidate={} error={}", candidate, exc)
+                continue
+            try:
+                bot_id = int(bot_info.get("botId"))
+            except (TypeError, ValueError):
+                continue
+            if bot_id <= 0:
+                continue
+
+            canonical_handle = self._normalize_bot_handle(bot_info.get("handle") or candidate)
+            if canonical_handle:
+                self._bot_id_cache[canonical_handle] = bot_id
+            normalized_candidate = self._normalize_bot_handle(candidate)
+            if normalized_candidate:
+                self._bot_id_cache[normalized_candidate] = bot_id
+            return bot_id
+        return None
+
     async def _emit_upload_filetype_probe(self, file_name: str) -> None:
         headers = self._build_upload_filetype_probe_headers()
         response = await self.client.get(
@@ -539,21 +575,42 @@ class AsyncPoeApi:
                 response.headers.get("content-type", ""),
             )
 
-    async def _emit_upload_action_log(self, file_name: str, file_content_type: str, file_size: int) -> None:
+    async def _emit_upload_action_log(
+        self,
+        file_name: str,
+        file_content_type: str,
+        file_size: int,
+        bot_id: Optional[int] = None,
+    ) -> None:
         await self._emit_upload_filetype_probe(file_name)
         file_size_kb = max(1, (file_size + 1023) // 1024)
+        action_metadata = {
+            "file_size_in_kB": int(file_size_kb),
+            "file_format": file_content_type or "application/octet-stream",
+        }
+        try:
+            normalized_bot_id = int(bot_id) if bot_id is not None else None
+        except (TypeError, ValueError):
+            normalized_bot_id = None
+        action_data = {
+            "action_type": 50,
+            "action_metadata": action_metadata,
+        }
+        if normalized_bot_id and normalized_bot_id > 0:
+            action_data["bot_id"] = normalized_bot_id
+
         payload = [
             {
                 "category": "poe/action_log",
-                "data": {
-                    "action_type": 50,
-                    "action_metadata": {
-                        "file_size_in_kB": int(file_size_kb),
-                        "file_format": file_content_type or "application/octet-stream",
-                    },
-                },
+                "data": action_data,
             }
         ]
+        logger.info(
+            "Emitting upload action log before receive_POST name={} content_type={} size_kB={}",
+            file_name,
+            file_content_type,
+            file_size_kb,
+        )
         payload_text = orjson.dumps(payload).decode("utf-8")
         headers = self._build_receive_headers(payload_text)
         response = await self.client.post(
@@ -571,7 +628,7 @@ class AsyncPoeApi:
                 preview,
             )
 
-    async def finish_upload(self, file_form: list) -> list:
+    async def finish_upload(self, file_form: list, bot_id: Optional[int] = None) -> list:
         file_hash_jwts = []
         upload_headers = self._build_finish_upload_headers()
         for file in file_form:
@@ -588,7 +645,7 @@ class AsyncPoeApi:
                 file_sha256,
             )
             try:
-                await self._emit_upload_action_log(file_name, file_content_type, file_size)
+                await self._emit_upload_action_log(file_name, file_content_type, file_size, bot_id=bot_id)
             except Exception as exc:
                 logger.warning("receive_POST failed before upload name={} error={}", file_name, exc)
             response = await self.client.post(
@@ -1612,6 +1669,7 @@ class AsyncPoeApi:
         chatCode: str = None,
         msgPrice: int = 20,
         file_path: Optional[list] = None,
+        botId: Optional[int] = None,
         parameters: Optional[dict[str, Any] | str] = None,
         suggest_replies: bool = False,
         timeout: int = 5,
@@ -1649,7 +1707,14 @@ class AsyncPoeApi:
                 raise RuntimeError("File size too large. Please try again with a smaller file.")
             for i in range(len(file_form)):
                 attachments.append(f'file{i}')
-            file_hash_jwts = await self.finish_upload(file_form)
+            resolved_bot_id: Optional[int]
+            try:
+                resolved_bot_id = int(botId) if botId is not None else None
+            except (TypeError, ValueError):
+                resolved_bot_id = None
+            if not resolved_bot_id or resolved_bot_id <= 0:
+                resolved_bot_id = await self._resolve_bot_id_for_upload(bot_candidates)
+            file_hash_jwts = await self.finish_upload(file_form, bot_id=resolved_bot_id)
         
         msgPrice = None
         serialized_parameters: Optional[str] = None
