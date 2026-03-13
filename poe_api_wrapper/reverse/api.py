@@ -570,7 +570,6 @@ class PoeApi:
 
     def finish_upload(self, file_form: list, bot_id: Optional[int] = None) -> list:
         file_hash_jwts = []
-        upload_headers = self._build_finish_upload_headers()
         for file in file_form:
             file_name = str(file[0]) if len(file) > 0 else "unknown"
             file_content_type = str(file[2]) if len(file) > 2 else "application/octet-stream"
@@ -584,25 +583,54 @@ class PoeApi:
                 file_size,
                 file_sha256,
             )
-            try:
-                self._emit_upload_action_log(file_name, file_content_type, file_size, bot_id=bot_id)
-            except Exception as exc:
-                logger.warning("receive_POST failed before upload name={} error={}", file_name, exc)
-            response = self.client.post(
-                f"{self.BASE_URL}/api/finish_upload_POST",
-                files={"file": file},
-                headers=upload_headers,
-                follow_redirects=True,
-            )
-            if response.status_code != 200:
+            retried_with_refresh = False
+            while True:
+                try:
+                    self._emit_upload_action_log(file_name, file_content_type, file_size, bot_id=bot_id)
+                except Exception as exc:
+                    logger.warning("receive_POST failed before upload name={} error={}", file_name, exc)
+
+                upload_headers = self._build_finish_upload_headers()
+                response = self.client.post(
+                    f"{self.BASE_URL}/api/finish_upload_POST",
+                    files={"file": file},
+                    headers=upload_headers,
+                    follow_redirects=True,
+                )
+                if response.status_code == 200:
+                    break
+
                 preview = response.text[:300].replace("\n", " ")
+                response_content_type = response.headers.get("content-type", "")
                 logger.warning(
                     "finish_upload_http_error name={} status={} response_content_type={} body_preview={}",
                     file_name,
                     response.status_code,
-                    response.headers.get("content-type", ""),
+                    response_content_type,
                     preview,
                 )
+
+                should_retry_with_refresh = (
+                    (not retried_with_refresh)
+                    and (
+                        response.status_code in (400, 401, 403)
+                        or self._should_force_bundle_refresh(
+                            status_code=response.status_code,
+                            response_text=response.text,
+                            content_type=response_content_type,
+                        )
+                    )
+                )
+                if should_retry_with_refresh:
+                    retried_with_refresh = True
+                    logger.warning(
+                        "finish_upload detected possible stale formkey/revision/session; forcing bundle refresh and retry once name={} status={}",
+                        file_name,
+                        response.status_code,
+                    )
+                    self.load_bundle(force_refresh=True)
+                    continue
+
                 raise RuntimeError(
                     f"finish_upload_POST failed. status_code:{response.status_code}, body_preview:{preview!r}"
                 )

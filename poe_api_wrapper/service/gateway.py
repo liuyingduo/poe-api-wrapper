@@ -1236,7 +1236,7 @@ class PoeClientPool:
     def _build_headers(self, creds: dict[str, Any]) -> dict[str, str]:
         return {
             "User-Agent": creds.get("user_agent", DEFAULT_USER_AGENT),
-            "Referer": "https://poe.com/login",
+            "Referer": "https://poe.com/",
             "Origin": "https://poe.com",
         }
 
