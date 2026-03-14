@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 try:
@@ -1809,6 +1809,7 @@ class PoolMonitor:
         connect_timeout_seconds: int = 20,
         ttl_check_interval_seconds: int = 30,
         proxy_rotator: Optional[ProxyRotator] = None,
+        waiting_count_provider: Optional[Callable[[], int]] = None,
     ):
         self.repo = repo
         self.pool = pool
@@ -1825,6 +1826,7 @@ class PoolMonitor:
         self.monitor_interval_seconds = max(1, monitor_interval_seconds)
         self.connect_timeout_seconds = max(5, connect_timeout_seconds)
         self.ttl_check_interval_seconds = max(10, ttl_check_interval_seconds)
+        self.waiting_count_provider = waiting_count_provider
 
         self._stopped = asyncio.Event()
         self._monitor_task: Optional[asyncio.Task] = None
@@ -1958,6 +1960,26 @@ class PoolMonitor:
         async with self._connecting_lock:
             in_flight = len(self._connecting)
 
+        waiting_count = 0
+        if self.waiting_count_provider:
+            try:
+                waiting_count = max(0, int(self.waiting_count_provider() or 0))
+            except Exception as exc:
+                logger.debug("PoolMonitor: waiting_count_provider failed: {}", exc)
+
+        # 动态调整：等待队列越大，目标池越大（受 max_pool_size 限制）
+        if waiting_count > 0:
+            required_size = current_count + in_flight + waiting_count
+            old_size = self.target_pool_size
+            self.target_pool_size = min(self.max_pool_size, max(self.target_pool_size, required_size))
+            if self.target_pool_size != old_size:
+                logger.info(
+                    "PoolMonitor: queue pressure waiting={}, target_pool_size {} -> {}",
+                    waiting_count,
+                    old_size,
+                    self.target_pool_size,
+                )
+
         # 动态调整：池子数量过低时增加 target_pool_size
         if current_count < 3:
             old_size = self.target_pool_size
@@ -1991,9 +2013,10 @@ class PoolMonitor:
 
         proxy_region = self.proxy_rotator.current_region if self.proxy_rotator.enabled else "n/a"
         logger.info(
-            "PoolMonitor: check | pool={} connecting={} deficit={} used_accounts={} median_balance={} proxy_region={}",
+            "PoolMonitor: check | pool={} connecting={} waiting={} deficit={} used_accounts={} median_balance={} proxy_region={}",
             current_count,
             in_flight,
+            waiting_count,
             deficit,
             len(used_balances) or getattr(self, "_median_used_count", 0),
             int(median_balance),

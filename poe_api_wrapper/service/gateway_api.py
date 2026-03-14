@@ -359,6 +359,21 @@ class GatewayRuntime:
     refresher: AccountHealthRefresher
     pool_monitor: PoolMonitor
     sessions: SessionManager
+    acquire_wait_counter: "AcquireWaitCounter"
+
+
+class AcquireWaitCounter:
+    def __init__(self) -> None:
+        self._waiting = 0
+
+    def enter(self) -> None:
+        self._waiting += 1
+
+    def leave(self) -> None:
+        self._waiting = max(0, self._waiting - 1)
+
+    def value(self) -> int:
+        return self._waiting
 
 
 def _load_models_from_disk() -> dict[str, Any]:
@@ -609,14 +624,18 @@ async def _finalize_account_use(
 
 
 async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
+    runtime.acquire_wait_counter.enter()
     wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
-    while True:
-        try:
-            return await runtime.selector.select_account(prewarmed_only=True)
-        except NoAccountAvailableError:
-            raise
-        except CapacityLimitError:
-            await asyncio.sleep(wait_sec)
+    try:
+        while True:
+            try:
+                return await runtime.selector.select_account(prewarmed_only=True)
+            except NoAccountAvailableError:
+                raise
+            except CapacityLimitError:
+                await asyncio.sleep(wait_sec)
+    finally:
+        runtime.acquire_wait_counter.leave()
 
 
 @app.on_event("startup")
@@ -660,6 +679,7 @@ async def startup_event() -> None:
         daily_reset_hour=config.daily_reset_hour,
         daily_reset_point_balance=config.daily_reset_point_balance,
     )
+    acquire_wait_counter = AcquireWaitCounter()
     pool_monitor = PoolMonitor(
         repo=repo,
         pool=pool,
@@ -670,6 +690,7 @@ async def startup_event() -> None:
         monitor_interval_seconds=config.pool_monitor_interval_seconds,
         connect_timeout_seconds=config.pool_connect_timeout_seconds,
         ttl_check_interval_seconds=config.pool_ttl_check_interval_seconds,
+        waiting_count_provider=acquire_wait_counter.value,
     )
     sessions = SessionManager(repo=repo)
 
@@ -682,6 +703,7 @@ async def startup_event() -> None:
         refresher=refresher,
         pool_monitor=pool_monitor,
         sessions=sessions,
+        acquire_wait_counter=acquire_wait_counter,
     )
     app.state.runtime = runtime
 
