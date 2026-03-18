@@ -81,12 +81,9 @@ from .types import (
 
 DIR = Path(__file__).resolve().parent
 MODELS_PATH = DIR / "models.json"
+_OVERRIDES_PATH = DIR / "model_overrides.json"
 DEFAULT_MODEL_TOKENS = 128000
-DEFAULT_MODEL_ENDPOINTS = [
-    "/v1/chat/completions",
-    "/v1/images/generations",
-    "/v1/images/edits",
-]
+# 不再硬编码 endpoints——错误完全交由 Poe 上游决定，gateway 接受一切请求
 
 # Poe 上游以累积全文（而非增量 delta）返回 chunk 的 baseModel 列表（小写匹配）。
 # gateway 层会自动做差值处理，将其转换为标准逐块流。
@@ -219,13 +216,6 @@ def _split_csv(raw: str) -> list[str]:
 
 def _model_tokens(meta: dict[str, Any]) -> int:
     return int(meta.get("tokens", DEFAULT_MODEL_TOKENS) or DEFAULT_MODEL_TOKENS)
-
-
-def _model_endpoints(meta: dict[str, Any]) -> list[str]:
-    endpoints = meta.get("endpoints")
-    if isinstance(endpoints, list) and endpoints:
-        return endpoints
-    return DEFAULT_MODEL_ENDPOINTS
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -377,6 +367,7 @@ class AcquireWaitCounter:
 
 
 def _load_models_from_disk() -> dict[str, Any]:
+    """从 models.json 加载静态模型表（fallback 用）。"""
     with MODELS_PATH.open("rb") as f:
         loaded = orjson.loads(f.read())
     if not isinstance(loaded, dict):
@@ -384,7 +375,114 @@ def _load_models_from_disk() -> dict[str, Any]:
     return loaded
 
 
+def _load_overrides() -> dict[str, Any]:
+    """从 model_overrides.json 加载覆盖配置（仅包含需要手动指定的条目）。"""
+    if not _OVERRIDES_PATH.exists():
+        return {}
+    try:
+        raw = _OVERRIDES_PATH.read_bytes()
+        data = orjson.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to load model_overrides.json: {}", exc)
+        return {}
+
+
+def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    将 CreateBotIndexPageQuery 返回的 botsAllowedForUserCreation 列表
+    转换为 app.state.models 格式。
+
+    每个 bot 条目形如:
+      {"model": "GPT-4o", "isImageGen": false, "isVideoGen": false, ...}
+
+    最终格式（无 endpoints——由 Poe 上游决定是否支持该请求）:
+      "GPT-4o": {"baseModel": "GPT-4o", "tokens": 128000,
+                  "premium_model": false, "object": "model", "owned_by": "poe"}
+    同时为每个 model 额外注册一个全小写 alias，方便客户端直接传小写名。
+    """
+    overrides = _load_overrides()
+    result: dict[str, Any] = {}
+
+    for bot in bots_data:
+        handle = str(bot.get("model") or "").strip()
+        if not handle:
+            continue
+
+        entry: dict[str, Any] = {
+            "baseModel": handle,
+            "tokens": DEFAULT_MODEL_TOKENS,
+            "premium_model": False,
+            "object": "model",
+            "owned_by": "poe",
+        }
+
+        # 用 overrides 覆盖（tokens、premium_model 等）
+        override = overrides.get(handle) or overrides.get(handle.lower())
+        if isinstance(override, dict):
+            for k, v in override.items():
+                entry[k] = v
+            # 确保 baseModel 不被覆盖掉
+            entry["baseModel"] = handle
+
+        result[handle] = entry
+        # 全小写 alias
+        lower = handle.lower()
+        if lower != handle:
+            result[lower] = dict(entry)
+
+    logger.info(
+        "_build_models_from_poe_bots: built {} model entries ({} bots from Poe)",
+        len(result),
+        len(bots_data),
+    )
+    return result
+
+
+async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
+    """
+    借用 pool 中的一个已预热 client，调用 CreateBotIndexPageQuery
+    动态拉取 Poe 官方模型列表。
+    失败时 fallback 到 models.json 静态表。
+    """
+    try:
+        account_doc, lease = await runtime.selector.select_account(prewarmed_only=True)
+        account_id = str(account_doc["_id"])
+        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
+        try:
+            response = await client.send_request(
+                "gql_POST",
+                "CreateBotIndexPageQuery",
+                {"messageId": None},
+            )
+            bots_data = response["data"]["viewer"]["botsAllowedForUserCreation"]
+            models = _build_models_from_poe_bots(bots_data)
+            if models:
+                return models
+            logger.warning("_fetch_models_from_poe: empty bot list returned, falling back to disk")
+        finally:
+            await lease.release()
+    except Exception as exc:
+        logger.warning("_fetch_models_from_poe failed ({}), falling back to models.json", exc)
+
+    return _load_models_from_disk()
+
+
+async def _reload_models_dynamic(runtime: "GatewayRuntime") -> dict[str, Any]:
+    """动态拉取模型并更新 app.state.models，返回结果摘要。"""
+    models = await _fetch_models_from_poe(runtime)
+    app.state.models = models
+    loaded_at = int(utc_now().timestamp())
+    return {
+        "status": "ok",
+        "models_count": len(models),
+        "loaded_at": loaded_at,
+        "source": "poe_live",
+    }
+
+
 def _reload_models_in_state() -> dict[str, Any]:
+    """同步从 models.json 重载（用于 fallback / 不依赖 runtime 的场合）。"""
     models = _load_models_from_disk()
     app.state.models = models
     stat = MODELS_PATH.stat()
@@ -396,9 +494,11 @@ def _reload_models_in_state() -> dict[str, Any]:
         "models_path": str(MODELS_PATH),
         "file_mtime": int(stat.st_mtime),
         "file_size_bytes": int(stat.st_size),
+        "source": "disk",
     }
 
 
+# 启动时先用静态表兜底，startup_event 完成后会替换为动态拉取结果
 app.state.models = _load_models_from_disk()
 
 
@@ -724,6 +824,34 @@ async def startup_event() -> None:
             _reload_cumulative_bots()
 
     asyncio.create_task(_cumulative_bots_reload_loop(), name="cumulative-bots-reload")
+
+    # 动态从 Poe 拉取模型列表，替换启动时的静态兜底
+    try:
+        dynamic_result = await _reload_models_dynamic(runtime)
+        logger.info(
+            "Dynamic model list loaded from Poe: {} entries",
+            dynamic_result["models_count"],
+        )
+    except Exception as exc:
+        logger.warning("Failed to load models dynamically on startup ({}); using static models.json", exc)
+
+    # 每 6 小时自动从 Poe 刷新一次模型列表
+    async def _models_auto_refresh_loop() -> None:
+        while True:
+            await asyncio.sleep(6 * 3600)
+            try:
+                rt = getattr(app.state, "runtime", None)
+                if not rt:
+                    continue
+                result = await _reload_models_dynamic(rt)
+                logger.info(
+                    "Auto-refreshed model list from Poe: {} entries",
+                    result["models_count"],
+                )
+            except Exception as exc:
+                logger.warning("Auto model refresh failed: {}", exc)
+
+    asyncio.create_task(_models_auto_refresh_loop(), name="models-auto-refresh")
     logger.info("Gateway startup complete")
 
 
@@ -977,18 +1105,25 @@ async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
 
 
 @app.post("/admin/models/reload", response_model=None, dependencies=[Depends(require_admin_auth)])
-async def admin_reload_models() -> JSONResponse:
-    try:
-        result = _reload_models_in_state()
-    except Exception as exc:
-        logger.exception("Failed to reload models from {}: {}", MODELS_PATH, exc)
-        _openai_http_error(500, "provider_error", f"Failed to reload models: {exc}")
+async def admin_reload_models(source: str = Query(default="poe", description="poe=动态拉取（默认）；disk=从 models.json 重载")) -> JSONResponse:
+    rt = getattr(app.state, "runtime", None)
+    if source == "disk" or rt is None:
+        try:
+            result = _reload_models_in_state()
+        except Exception as exc:
+            logger.exception("Failed to reload models from disk: {}", exc)
+            _openai_http_error(500, "provider_error", f"Failed to reload models from disk: {exc}")
+    else:
+        try:
+            result = await _reload_models_dynamic(rt)
+        except Exception as exc:
+            logger.exception("Failed to reload models from Poe: {}", exc)
+            _openai_http_error(500, "provider_error", f"Failed to reload models from Poe: {exc}")
 
     logger.info(
-        "admin_reload_models succeeded: models_count={} file_mtime={} path={}",
+        "admin_reload_models succeeded: models_count={} source={}",
         result["models_count"],
-        result["file_mtime"],
-        result["models_path"],
+        result.get("source", "unknown"),
     )
     return JSONResponse(result)
 
@@ -1014,7 +1149,6 @@ async def list_models(
                 "created": await helpers.__generate_timestamp(),
                 "owned_by": meta["owned_by"],
                 "tokens": _model_tokens(meta),
-                "endpoints": _model_endpoints(meta),
             }
         )
 
@@ -1025,7 +1159,6 @@ async def list_models(
             "created": await helpers.__generate_timestamp(),
             "owned_by": values["owned_by"],
             "tokens": _model_tokens(values),
-            "endpoints": _model_endpoints(values),
         }
         for model_name, values in app.state.models.items()
     ]

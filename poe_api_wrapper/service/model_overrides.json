@@ -1,0 +1,18 @@
+{
+    "_comment": "此文件仅存放需要手动覆盖的模型配置项，其余模型由启动时从 Poe 动态拉取。",
+    "_comment2": "可覆盖字段：tokens（上下文窗口大小）、premium_model（是否需要订阅账号）。",
+    "_comment3": "key 与 Poe 返回的 model handle 大小写一致，或全小写均可。",
+
+    "GPT-4-5": {
+        "tokens": 128000,
+        "premium_model": true
+    },
+    "Claude-Opus-4-5": {
+        "tokens": 200000,
+        "premium_model": true
+    },
+    "Gemini-2.5-Pro": {
+        "tokens": 1000000,
+        "premium_model": true
+    }
+}
