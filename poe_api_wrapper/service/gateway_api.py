@@ -84,6 +84,8 @@ MODELS_PATH = DIR / "models.json"
 _OVERRIDES_PATH = DIR / "model_overrides.json"
 DEFAULT_MODEL_TOKENS = 128000
 # 不再硬编码 endpoints——错误完全交由 Poe 上游决定，gateway 接受一切请求
+_MODEL_DISCOVERY_CATEGORY = "Official"
+_MODEL_DISCOVERY_PAGE_SIZE = 25
 
 # Poe 上游以累积全文（而非增量 delta）返回 chunk 的 baseModel 列表（小写匹配）。
 # gateway 层会自动做差值处理，将其转换为标准逐块流。
@@ -388,26 +390,35 @@ def _load_overrides() -> dict[str, Any]:
         return {}
 
 
+def _register_model_alias(result: dict[str, Any], alias: str, entry: dict[str, Any]) -> None:
+    alias = str(alias or "").strip()
+    if not alias:
+        return
+    result.setdefault(alias, dict(entry))
+    lower = alias.lower()
+    if lower != alias:
+        result.setdefault(lower, dict(entry))
+
+
 def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, Any]:
     """
-    将 CreateBotIndexPageQuery 返回的 botsAllowedForUserCreation 列表
+    将 ExploreBotsListPaginationQuery 返回的官方 bot 节点列表
     转换为 app.state.models 格式。
 
-    每个 bot 条目形如:
-      {"model": "GPT-4o", "isImageGen": false, "isVideoGen": false, ...}
-
-    最终格式（无 endpoints——由 Poe 上游决定是否支持该请求）:
-      "GPT-4o": {"baseModel": "GPT-4o", "tokens": 128000,
-                  "premium_model": false, "object": "model", "owned_by": "poe"}
-    同时为每个 model 额外注册一个全小写 alias，方便客户端直接传小写名。
+    设计原则：
+    - `baseModel` 一律使用官方 `handle`，保证真正发给 Poe 的是稳定句柄；
+    - 同时给 `displayName` / `model` / 小写形式注册别名，兼容用户传参；
+    - 不暴露 `endpoints`，由 Poe 上游自行决定请求是否支持。
     """
     overrides = _load_overrides()
     result: dict[str, Any] = {}
 
     for bot in bots_data:
-        handle = str(bot.get("model") or "").strip()
+        handle = str(bot.get("handle") or bot.get("model") or "").strip()
         if not handle:
             continue
+        display_name = str(bot.get("displayName") or "").strip()
+        model_name = str(bot.get("model") or "").strip()
 
         entry: dict[str, Any] = {
             "baseModel": handle,
@@ -418,21 +429,26 @@ def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, An
         }
 
         # 用 overrides 覆盖（tokens、premium_model 等）
-        override = overrides.get(handle) or overrides.get(handle.lower())
+        override = (
+            overrides.get(handle)
+            or overrides.get(handle.lower())
+            or overrides.get(display_name)
+            or overrides.get(display_name.lower())
+            or overrides.get(model_name)
+            or overrides.get(model_name.lower())
+        )
         if isinstance(override, dict):
             for k, v in override.items():
                 entry[k] = v
-            # 确保 baseModel 不被覆盖掉
+            # 确保 baseModel 始终走官方 handle
             entry["baseModel"] = handle
 
-        result[handle] = entry
-        # 全小写 alias
-        lower = handle.lower()
-        if lower != handle:
-            result[lower] = dict(entry)
+        _register_model_alias(result, handle, entry)
+        _register_model_alias(result, display_name, entry)
+        _register_model_alias(result, model_name, entry)
 
     logger.info(
-        "_build_models_from_poe_bots: built {} model entries ({} bots from Poe)",
+        "_build_models_from_poe_bots: built {} model entries ({} official bots from Poe Explore)",
         len(result),
         len(bots_data),
     )
@@ -471,8 +487,8 @@ async def _list_model_fetch_candidates(runtime: "GatewayRuntime", *, limit: int 
 
 async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
     """
-    启动/重载时直接使用可用账号临时创建 client，调用 CreateBotIndexPageQuery
-    动态拉取 Poe 官方模型列表。
+    启动/重载时直接使用可用账号临时创建 client，调用 ExploreBotsListPaginationQuery
+    动态拉取 Poe `Official` 分类模型列表。
 
     注意：这里不依赖预热池，因为服务刚启动时 pool 可能还是空的。
     若拉取失败，直接抛错，由调用方决定是否中止启动或返回 500。
@@ -488,21 +504,68 @@ async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
         try:
             creds = await runtime.repo.get_account_credentials(account_doc)
             client = await runtime.pool._create_client_with_fallback(account_id, creds)
-            response = await client.send_request(
-                "gql_POST",
-                "CreateBotIndexPageQuery",
-                {"messageId": None},
-            )
-            bots_data = response["data"]["viewer"]["botsAllowedForUserCreation"]
+            bots_data: list[dict[str, Any]] = []
+            cursor: Optional[str] = None
+            seen_handles: set[str] = set()
+            seen_cursors: set[str] = set()
+
+            while True:
+                variables: dict[str, Any] = {
+                    "categoryName": _MODEL_DISCOVERY_CATEGORY,
+                    "count": _MODEL_DISCOVERY_PAGE_SIZE,
+                }
+                if cursor is not None:
+                    variables["cursor"] = cursor
+
+                response = await client.send_request(
+                    "gql_POST",
+                    "ExploreBotsListPaginationQuery",
+                    variables,
+                )
+                connection = (response.get("data") or {}).get("exploreBotsConnection") or {}
+                edges = connection.get("edges") or []
+                if not isinstance(edges, list) or not edges:
+                    break
+
+                next_cursor: Optional[str] = None
+                page_added = 0
+                for edge in edges:
+                    if not isinstance(edge, dict):
+                        continue
+                    node = edge.get("node") or {}
+                    if not isinstance(node, dict):
+                        continue
+                    handle = str(node.get("handle") or "").strip()
+                    if not handle or handle in seen_handles:
+                        continue
+                    seen_handles.add(handle)
+                    bots_data.append(node)
+                    page_added += 1
+                    raw_cursor = edge.get("cursor")
+                    if raw_cursor is not None:
+                        next_cursor = str(raw_cursor)
+
+                logger.info(
+                    "ExploreBotsListPaginationQuery fetched {} official bots (cursor={} account={})",
+                    page_added,
+                    cursor or "<start>",
+                    mask_secret(account_id),
+                )
+
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+
             models = _build_models_from_poe_bots(bots_data)
             if models:
                 logger.info(
-                    "Fetched live model list from Poe using account {}: {} entries",
+                    "Fetched live model list from Poe Explore using account {}: {} entries",
                     mask_secret(account_id),
                     len(models),
                 )
                 return models
-            raise RuntimeError("Poe returned an empty model list")
+            raise RuntimeError("Poe Explore returned an empty official model list")
         except Exception as exc:
             last_error = exc
             logger.warning(
