@@ -439,17 +439,55 @@ def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, An
     return result
 
 
+async def _list_model_fetch_candidates(runtime: "GatewayRuntime", *, limit: int = 10) -> list[dict[str, Any]]:
+    """列出可用于启动时拉取模型列表的账号候选，不依赖预热池。"""
+    recent = await runtime.repo.list_recent_active_accounts(minutes=24 * 30, limit=limit)
+    if recent:
+        return recent
+
+    now = utc_now()
+
+    def _op() -> list[dict[str, Any]]:
+        query = {
+            "status": "active",
+            "$or": [
+                {"cooldown_until": None},
+                {"cooldown_until": {"$lte": now}},
+                {"cooldown_until": {"$exists": False}},
+            ],
+        }
+        return list(runtime.repo.accounts.find(query).limit(limit))
+
+    docs = await runtime.repo._run(_op)
+    docs.sort(
+        key=lambda doc: (
+            bool(doc.get("subscription_active", False)),
+            int(doc.get("message_point_balance", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return docs
+
+
 async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
     """
-    借用 pool 中的一个已预热 client，调用 CreateBotIndexPageQuery
+    启动/重载时直接使用可用账号临时创建 client，调用 CreateBotIndexPageQuery
     动态拉取 Poe 官方模型列表。
-    失败时 fallback 到 models.json 静态表。
+
+    注意：这里不依赖预热池，因为服务刚启动时 pool 可能还是空的。
+    若拉取失败，直接抛错，由调用方决定是否中止启动或返回 500。
     """
-    try:
-        account_doc, lease = await runtime.selector.select_account(prewarmed_only=True)
-        account_id = str(account_doc["_id"])
-        client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
+    candidates = await _list_model_fetch_candidates(runtime)
+    if not candidates:
+        raise RuntimeError("No active accounts are available to fetch models from Poe")
+
+    last_error: Optional[BaseException] = None
+    for account_doc in candidates:
+        account_id = str(account_doc.get("_id"))
+        client = None
         try:
+            creds = await runtime.repo.get_account_credentials(account_doc)
+            client = await runtime.pool._create_client_with_fallback(account_id, creds)
             response = await client.send_request(
                 "gql_POST",
                 "CreateBotIndexPageQuery",
@@ -458,14 +496,25 @@ async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
             bots_data = response["data"]["viewer"]["botsAllowedForUserCreation"]
             models = _build_models_from_poe_bots(bots_data)
             if models:
+                logger.info(
+                    "Fetched live model list from Poe using account {}: {} entries",
+                    mask_secret(account_id),
+                    len(models),
+                )
                 return models
-            logger.warning("_fetch_models_from_poe: empty bot list returned, falling back to disk")
+            raise RuntimeError("Poe returned an empty model list")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "_fetch_models_from_poe candidate failed account={} error={}",
+                mask_secret(account_id),
+                exc,
+            )
         finally:
-            await lease.release()
-    except Exception as exc:
-        logger.warning("_fetch_models_from_poe failed ({}), falling back to models.json", exc)
+            if client is not None:
+                await runtime.pool._close_client(client, account_id=account_id)
 
-    return _load_models_from_disk()
+    raise RuntimeError(f"Failed to fetch models from Poe using all candidate accounts: {last_error}")
 
 
 async def _reload_models_dynamic(runtime: "GatewayRuntime") -> dict[str, Any]:
@@ -810,6 +859,18 @@ async def startup_event() -> None:
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
 
+    # 启动阶段必须先成功从 Poe 拉取模型列表；失败则不允许继续启动服务。
+    try:
+        dynamic_result = await _reload_models_dynamic(runtime)
+    except Exception as exc:
+        logger.exception("Failed to load models from Poe during startup: {}", exc)
+        raise RuntimeError(f"Failed to fetch model list from Poe during startup: {exc}") from exc
+
+    logger.info(
+        "Dynamic model list loaded from Poe: {} entries",
+        dynamic_result["models_count"],
+    )
+
 
 
     refresher.start()
@@ -824,16 +885,6 @@ async def startup_event() -> None:
             _reload_cumulative_bots()
 
     asyncio.create_task(_cumulative_bots_reload_loop(), name="cumulative-bots-reload")
-
-    # 动态从 Poe 拉取模型列表，替换启动时的静态兜底
-    try:
-        dynamic_result = await _reload_models_dynamic(runtime)
-        logger.info(
-            "Dynamic model list loaded from Poe: {} entries",
-            dynamic_result["models_count"],
-        )
-    except Exception as exc:
-        logger.warning("Failed to load models dynamically on startup ({}); using static models.json", exc)
 
     # 每 6 小时自动从 Poe 刷新一次模型列表
     async def _models_auto_refresh_loop() -> None:
