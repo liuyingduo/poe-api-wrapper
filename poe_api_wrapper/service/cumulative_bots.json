@@ -11,5 +11,6 @@
     "qwen3.5-plus",
     "grok-4-fast-reasoning",
     "grok-4.1-fast-non-reasoning",
-    "grok-4.1-fast-reasoning"
+    "grok-4.1-fast-reasoning",
+    "minimax-m2.7"
 ]
