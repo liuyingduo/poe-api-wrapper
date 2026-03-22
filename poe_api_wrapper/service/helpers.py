@@ -1,4 +1,4 @@
-import random, string, threading, time
+import asyncio, random, string, threading, time
 from heapq import nlargest
 from loguru import logger
 from functools import lru_cache
@@ -164,7 +164,7 @@ async def __generate_timestamp():
     return int(time.time())
 
 async def __tokenize(text):
-    return _tokenize_sync(text)
+    return await asyncio.to_thread(_tokenize_sync, text)
 
 async def __stringify_messages(messages):
     return '\n'.join(f"<{message['role'].capitalize()}>{message['content']}</{message['role'].capitalize()}>" for message in messages)

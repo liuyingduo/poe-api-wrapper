@@ -1826,12 +1826,6 @@ async def generate_chunks(
                                 chat_code=chat_code,
                                 chat_id=chat_id,
                             )
-                completion_tokens = await helpers.__tokenize(chunk["text"])
-                if max_tokens and completion_tokens >= max_tokens:
-                    await client.cancel_message(chunk)
-                    finish_reason = "length"
-                    break
-
                 if is_cumulative:
                     full_text = chunk["text"] or ""
                     delta = full_text[len(prev_cumulative_text):]
@@ -1841,6 +1835,12 @@ async def generate_chunks(
 
                 if not delta:
                     continue
+
+                completion_tokens += await helpers.__tokenize(delta)
+                if max_tokens and completion_tokens >= max_tokens:
+                    await client.cancel_message(chunk)
+                    finish_reason = "length"
+                    break
 
                 content = await create_completion_data(
                     completion_id=completion_id,
@@ -1968,12 +1968,6 @@ async def generate_chunks(
                         chatId=None,
                         parameters=chat_parameters,
                     ):
-                        completion_tokens = await helpers.__tokenize(chunk["text"])
-                        if max_tokens and completion_tokens >= max_tokens:
-                            await new_client.cancel_message(chunk)
-                            finish_reason = "length"
-                            break
-
                         if is_cumulative:
                             full_text = chunk["text"] or ""
                             delta = full_text[len(prev_cumulative_text):]
@@ -1983,6 +1977,12 @@ async def generate_chunks(
 
                         if not delta:
                             continue
+
+                        completion_tokens += await helpers.__tokenize(delta)
+                        if max_tokens and completion_tokens >= max_tokens:
+                            await new_client.cancel_message(chunk)
+                            finish_reason = "length"
+                            break
 
                         retry_content = await create_completion_data(
                             completion_id=completion_id,
