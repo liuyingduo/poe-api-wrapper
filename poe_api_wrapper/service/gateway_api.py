@@ -95,8 +95,9 @@ _MAX_CHAT_ATTEMPTS = 2
 # 重试时的模型降级映射（前缀 → 降级目标 baseModel）
 _RETRY_DOWNGRADE_RULES: list[tuple[str, str]] = [
     ("gpt", "GPT-5-nano"),
-    ("claude", "Claude-Haiku-4.5"),
+    ("claude", "Claude-Haiku-3"),
     ("gemini", "Gemini-3.1-Flash-Lite"),
+    ("grok", "Grok-4-Fast-Non-Reasoning"),
 ]
 
 
