@@ -1494,14 +1494,10 @@ def _resolve_image_generation_config(
             image_size_text = str(image_size_value).strip()
             if image_size_text:
                 resolved_parameters["image_size"] = image_size_text
-        else:
-            supported_image_sizes = sorted(set(str(k) for k in image_sizes.keys()) | set(str(v) for v in image_sizes.values()))
-            _openai_http_error(
-                400,
-                "invalid_request_error",
-                f"Invalid image_size for model {model}. Supported values: {supported_image_sizes}",
-            )
-            raise AssertionError("unreachable")
+    elif normalized_image_size:
+        image_size_text = (image_size or "").strip()
+        if image_size_text:
+            resolved_parameters["image_size"] = image_size_text
 
     candidate_aspect = (aspect_ratio or "").strip()
     if not candidate_aspect:
@@ -1527,22 +1523,14 @@ def _resolve_image_generation_config(
     if resolved_ratio is None:
         resolved_ratio = _normalize_aspect_value(candidate_aspect)
 
+    key = _aspect_parameter_key(model, model_meta, resolved_parameters)
     if resolved_ratio is not None:
-        key = _aspect_parameter_key(model, model_meta, resolved_parameters)
         resolved_parameters[key] = resolved_ratio
         return "", resolved_parameters or None
 
-    supported_sizes = ["auto", "default", "1024x1024"]
-    if isinstance(model_sizes, dict):
-        supported_sizes.extend(str(k) for k in model_sizes.keys())
-    if isinstance(image_sizes, dict):
-        supported_sizes.extend(str(k) for k in image_sizes.keys())
-    _openai_http_error(
-        400,
-        "invalid_request_error",
-        f"Invalid aspect ratio or size for model {model}. Supported values: {sorted(set(supported_sizes))}",
-    )
-    raise AssertionError("unreachable")
+    if candidate_aspect:
+        resolved_parameters[key] = candidate_aspect
+    return "", resolved_parameters or None
 
 
 def _resolve_image_aspect(model: str, size: Optional[str]) -> str:
