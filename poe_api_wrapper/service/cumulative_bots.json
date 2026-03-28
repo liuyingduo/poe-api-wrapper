@@ -13,5 +13,6 @@
     "grok-4.1-fast-non-reasoning",
     "grok-4.1-fast-reasoning",
     "minimax-m2.7",
-    "Grok-4.20-Multi-Agent"
+    "Grok-4.20-Multi-Agent",
+    "GPT-OSS-120B"
 ]
