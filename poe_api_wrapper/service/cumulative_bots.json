@@ -15,5 +15,6 @@
     "minimax-m2.7",
     "Grok-4.20-Multi-Agent",
     "GPT-OSS-120B",
-    "gpt-4o"
+    "gpt-4o",
+    "GPT-4o"
 ]
