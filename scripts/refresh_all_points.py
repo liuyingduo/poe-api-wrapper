@@ -60,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refresh account points through gateway admin API.")
     parser.add_argument(
         "--base-url",
-        default=os.getenv("GATEWAY_BASE_URL", "http://207.180.218.216:8003"),
+        default=os.getenv("GATEWAY_BASE_URL", "http://207.180.218.216:8004"),
         help="Gateway base URL (default: %(default)s or GATEWAY_BASE_URL).",
     )
     parser.add_argument(

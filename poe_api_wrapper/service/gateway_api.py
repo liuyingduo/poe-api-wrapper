@@ -338,7 +338,7 @@ class GatewayConfig:
             auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
-            daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 3000),
+            daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 300),
         )
 
 

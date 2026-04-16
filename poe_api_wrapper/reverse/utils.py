@@ -143,6 +143,46 @@ def bot_map(bot):
     return bot.lower().replace(' ', '')
 
 
+def get_message_author(message: dict[str, Any]) -> Optional[str]:
+    author = message.get("author")
+    if author:
+        return author
+    if message.get("authorUser") is not None:
+        return "human"
+    bot = message.get("bot") or {}
+    if bot:
+        return (
+            bot.get("nickname")
+            or bot.get("handle")
+            or bot.get("displayName")
+            or message.get("authorNickname")
+        )
+    return message.get("authorNickname")
+
+
+def is_human_message(message: dict[str, Any]) -> bool:
+    author = message.get("author")
+    if author == "human":
+        return True
+    return message.get("authorUser") is not None
+
+
+def is_bot_message(message: dict[str, Any]) -> bool:
+    if is_human_message(message):
+        return False
+    if message.get("bot") is not None:
+        return True
+    author = message.get("author")
+    return isinstance(author, str) and author not in ("", "human")
+
+
+def normalize_ws_message(message: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(message)
+    normalized["author"] = get_message_author(normalized)
+    normalized.setdefault("followupActions", [])
+    return normalized
+
+
 def is_nano_banana_model(bot: Optional[str]) -> bool:
     normalized = str(bot or "").strip().lower()
     return "nano-banana-2" in normalized

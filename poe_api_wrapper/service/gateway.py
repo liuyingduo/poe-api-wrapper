@@ -52,7 +52,7 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
 )
-DEFAULT_NEW_ACCOUNT_POINT_BALANCE = 3000
+DEFAULT_NEW_ACCOUNT_POINT_BALANCE = 300
 
 
 def utc_now() -> datetime:
@@ -1024,7 +1024,7 @@ class AccountRepository:
     async def daily_reset_point_balance(
         self,
         *,
-        point_balance: int = 3000,
+        point_balance: int = 300,
         reset_statuses: Optional[list[str]] = None,
     ) -> int:
         now = utc_now()
@@ -1443,7 +1443,7 @@ class AccountHealthRefresher:
         *,
         daily_reset_timezone: str = "America/Los_Angeles",
         daily_reset_hour: int = 0,
-        daily_reset_point_balance: int = 3000,
+        daily_reset_point_balance: int = 300,
     ):
         self.repo = repo
         self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"

@@ -32,6 +32,9 @@ from .utils import (
                     BOTS_LIST, 
                     REVERSE_BOTS_LIST, 
                     bot_map, 
+                    is_bot_message,
+                    is_human_message,
+                    normalize_ws_message,
                     ensure_model_parameters,
                     is_nano_banana_model,
                     generate_nonce, 
@@ -925,8 +928,11 @@ class PoeApi:
                 if not data:
                     continue
                 
-                if subscriptionName == "messageAdded" and data["messageAdded"]["author"] == "human":
-                    continue
+                if subscriptionName == "messageAdded":
+                    message = normalize_ws_message(data["messageAdded"])
+                    if is_human_message(message):
+                        continue
+                    data["messageAdded"] = message
                         
                 chat_id: int = int(payload.get("unique_id")[(len(subscriptionName) + 1):])
                 
@@ -1272,7 +1278,7 @@ class PoeApi:
 
             if ws_data["subscription"] == "messageAdded" or title:
                 if ws_data["subscription"] == "messageAdded":
-                    response = ws_data["data"]["messageAdded"]
+                    response = normalize_ws_message(ws_data["data"]["messageAdded"])
                 
                 response["chatCode"] = chatCode
                 response["chatId"] = chatId
@@ -1291,9 +1297,9 @@ class PoeApi:
                     yield response
                     break
                 
-                if (response["author"] == "pacarana" and response["text"].strip() == last_text.strip()):
+                if is_bot_message(response) and response["text"].strip() == last_text.strip():
                     response["response"] = ""
-                elif response["author"] == "pacarana" and (last_text == "" or bot != "web-search"):
+                elif is_bot_message(response) and (last_text == "" or bot != "web-search"):
                     response["response"] = f'{response["text"]}\n'
                 else:
                     if stateChange == False:
@@ -1535,7 +1541,7 @@ class PoeApi:
 
             if ws_data["subscription"] == "messageAdded" or title:
                 if ws_data["subscription"] == "messageAdded":
-                    response = ws_data["data"]["messageAdded"]
+                    response = normalize_ws_message(ws_data["data"]["messageAdded"])
                 
                 response["chatCode"] = chatCode
                 response["chatId"] = chatId
@@ -1554,9 +1560,9 @@ class PoeApi:
                     yield response
                     break
                 
-                if (response["author"] == "pacarana" and response["text"].strip() == last_text.strip()):
+                if is_bot_message(response) and response["text"].strip() == last_text.strip():
                     response["response"] = ""
-                elif response["author"] == "pacarana" and (last_text == "" or bot != "web-search"):
+                elif is_bot_message(response) and (last_text == "" or bot != "web-search"):
                     response["response"] = f'{response["text"]}\n'
                 else:
                     if stateChange == False:
