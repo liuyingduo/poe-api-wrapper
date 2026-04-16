@@ -152,9 +152,9 @@ def get_message_author(message: dict[str, Any]) -> Optional[str]:
     bot = message.get("bot") or {}
     if bot:
         return (
-            bot.get("nickname")
+            bot.get("displayName")
             or bot.get("handle")
-            or bot.get("displayName")
+            or bot.get("nickname")
             or message.get("authorNickname")
         )
     return message.get("authorNickname")

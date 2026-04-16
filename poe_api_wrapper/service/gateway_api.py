@@ -1789,6 +1789,21 @@ async def generate_chunks(
     finish_reason = "stop"
     is_cumulative = response["bot"].lower() in get_cumulative_bots()
     prev_cumulative_text = ""
+
+    def _resolve_stream_delta(chunk: dict[str, Any], cumulative_mode: bool, previous_text: str) -> tuple[str, bool, str]:
+        full_text = chunk.get("text") or ""
+        response_text = chunk.get("response") or ""
+
+        if cumulative_mode:
+            if full_text.startswith(previous_text):
+                return full_text[len(previous_text):], cumulative_mode, full_text
+            return response_text, cumulative_mode, full_text or previous_text
+
+        if previous_text and full_text.startswith(previous_text):
+            return full_text[len(previous_text):], True, full_text
+
+        return response_text, cumulative_mode, full_text or previous_text
+
     try:
         if not raw_tool_calls:
             async for chunk in client.send_message(
@@ -1815,12 +1830,11 @@ async def generate_chunks(
                                 chat_code=chat_code,
                                 chat_id=chat_id,
                             )
-                if is_cumulative:
-                    full_text = chunk["text"] or ""
-                    delta = full_text[len(prev_cumulative_text):]
-                    prev_cumulative_text = full_text
-                else:
-                    delta = chunk["response"]
+                delta, is_cumulative, prev_cumulative_text = _resolve_stream_delta(
+                    chunk,
+                    is_cumulative,
+                    prev_cumulative_text,
+                )
 
                 if not delta:
                     continue
@@ -1957,12 +1971,11 @@ async def generate_chunks(
                         chatId=None,
                         parameters=chat_parameters,
                     ):
-                        if is_cumulative:
-                            full_text = chunk["text"] or ""
-                            delta = full_text[len(prev_cumulative_text):]
-                            prev_cumulative_text = full_text
-                        else:
-                            delta = chunk["response"]
+                        delta, is_cumulative, prev_cumulative_text = _resolve_stream_delta(
+                            chunk,
+                            is_cumulative,
+                            prev_cumulative_text,
+                        )
 
                         if not delta:
                             continue
