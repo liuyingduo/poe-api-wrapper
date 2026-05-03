@@ -1,10 +1,12 @@
 import httpx
 import openai
+from pathlib import Path
 
 API_KEY = "svc_app_zaiwen"
 BASE_URL = "http://207.180.218.216:8004/v1/"
-RUN_EXAMPLE = "nano_banana_reference_probe"
+RUN_EXAMPLE = "file_analysis"
 IMAGE_URL = "https://ossnew.zaiwen.top/images/9e71ceb8f21a0279dda1f26c7ac1b957d6493e00552ee6e3048d1b1bcbce44cb_part_1.jpeg"
+FILE_ANALYSIS_URL = "https://oss.zaiwen.top/hbeed69d299094f89.txt"
 
 http_client = httpx.Client(
     trust_env=False,
@@ -52,19 +54,56 @@ def run_chat_stream() -> None:
 
 
 def run_vision_input() -> None:
-    response = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model="GPT-4o",
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "What's in this image?"},
+                    {"type": "text", "text": "What's in this image?exaple for 500 word"},
                     {"type": "image_url", "image_url": {"url": IMAGE_URL}},
                 ],
             }
         ],
+        stream=True,
     )
-    print(response.choices[0].message.content)
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            print(chunk.choices[0].delta.content, end="")
+    print()
+
+
+def run_file_analysis() -> None:
+    stream = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "请分析这个 Python 文件的实现。\n\n"
+                            "请用中文输出，包含这几部分：\n"
+                            "1. 这个文件的核心职责\n"
+                            "2. 主要函数和执行流程\n"
+                            "3. 代码里的潜在问题或可改进点\n"
+                            "4. 如果我要继续维护它，最该先关注什么"
+                        ),
+                    },
+                    {
+                        "type": "file",
+                        "file": {"url": FILE_ANALYSIS_URL},
+                    },
+                ],
+            }
+        ],
+        stream=True,
+    )
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            print(chunk.choices[0].delta.content, end="")
+    print()
 
 
 def run_nano_banana_image() -> None:
@@ -197,6 +236,8 @@ if __name__ == "__main__":
         run_chat_stream()
     elif RUN_EXAMPLE == "vision_input":
         run_vision_input()
+    elif RUN_EXAMPLE == "file_analysis":
+        run_file_analysis()
     elif RUN_EXAMPLE == "nano_banana_image":
         run_nano_banana_image()
     elif RUN_EXAMPLE == "grok_image":

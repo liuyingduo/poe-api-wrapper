@@ -308,7 +308,6 @@ class GatewayConfig:
     pool_ttl_check_interval_seconds: int
     client_max_age_seconds: int
     acquire_wait_poll_seconds: float
-    auto_fetch_poe_revision: bool
     daily_reset_timezone: str
     daily_reset_hour: int
     daily_reset_point_balance: int
@@ -316,7 +315,7 @@ class GatewayConfig:
     @classmethod
     def from_env(cls) -> "GatewayConfig":
         return cls(
-            default_poe_revision=os.getenv("POE_REVISION", "").strip(),
+            default_poe_revision="",
             mongodb_uri=_require_env("MONGODB_URI"),
             mongodb_db=_require_env("MONGODB_DB"),
             fernet_key=_require_env("FERNET_KEY"),
@@ -335,7 +334,6 @@ class GatewayConfig:
             pool_ttl_check_interval_seconds=_env_int("POOL_TTL_CHECK_INTERVAL_SECONDS", 30),
             client_max_age_seconds=_env_int("CLIENT_MAX_AGE_SECONDS", 600),
             acquire_wait_poll_seconds=max(0.01, _env_int("ACQUIRE_WAIT_POLL_SECONDS_MS", 100) / 1000.0),
-            auto_fetch_poe_revision=_env_bool("AUTO_FETCH_POE_REVISION", True),
             daily_reset_timezone=os.getenv("DAILY_RESET_TIMEZONE", "America/Los_Angeles").strip(),
             daily_reset_hour=_env_int("DAILY_RESET_HOUR", 0),
             daily_reset_point_balance=_env_int("DAILY_RESET_POINT_BALANCE", 300),
@@ -855,18 +853,13 @@ async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str,
 async def startup_event() -> None:
     config = GatewayConfig.from_env()
 
-    # 若未在环境变量中配置 POE_REVISION，则自动从 poe.com/login 页面抓取
-    if not config.default_poe_revision and config.auto_fetch_poe_revision:
-        fetched = await fetch_poe_revision()
-        if fetched:
-            config.default_poe_revision = fetched
-            logger.info("自动获取 poe-revision: {}", fetched)
-        else:
-            logger.error("未能自动获取 poe-revision，服务启动中止。请检查网络或手动配置 POE_REVISION 环境变量。")
-            raise RuntimeError("Failed to fetch poe-revision from poe.com. Service startup aborted.")
-    elif not config.default_poe_revision and not config.auto_fetch_poe_revision:
-        logger.error("POE_REVISION 未配置，且 AUTO_FETCH_POE_REVISION=false，服务启动中止。")
-        raise RuntimeError("POE_REVISION is not set and auto-fetch is disabled. Service startup aborted.")
+    fetched = await fetch_poe_revision()
+    if fetched:
+        config.default_poe_revision = fetched
+        logger.info("自动获取 poe-revision: {}", fetched)
+    else:
+        logger.error("未能自动获取 poe-revision，服务启动中止。请检查网络、代理或 Cloudflare clearance 配置。")
+        raise RuntimeError("Failed to fetch poe-revision from poe.com. Service startup aborted.")
 
     crypto = CredentialCrypto(config.fernet_key)
     repo = AccountRepository(config.mongodb_uri, config.mongodb_db, crypto)
@@ -888,6 +881,7 @@ async def startup_event() -> None:
     )
     refresher = AccountHealthRefresher(
         repo=repo,
+        default_poe_revision=config.default_poe_revision,
         daily_reset_timezone=config.daily_reset_timezone,
         daily_reset_hour=config.daily_reset_hour,
         daily_reset_point_balance=config.daily_reset_point_balance,
@@ -1088,7 +1082,6 @@ async def admin_upsert_account(data: AccountUpsertData) -> JSONResponse:
         poe_cf_bm=data.poe_cf_bm,
         p_lat=data.p_lat,
         formkey=data.formkey,
-        poe_revision=data.poe_revision,
         user_agent=data.user_agent,
     )
     account_id = str(account.get("id", "")).strip()

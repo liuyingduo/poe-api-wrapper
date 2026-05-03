@@ -24,7 +24,6 @@ MONGODB_DB=poe_gateway
 FERNET_KEY=<fernet-key>
 ADMIN_API_KEY=<admin-key>
 SERVICE_API_KEYS_BOOTSTRAP=<service-key-1>,<service-key-2>
-POE_REVISION=b759a4647fa291beba4792e9139bc4c014399434
 DAILY_RESET_TIMEZONE=America/Los_Angeles
 DAILY_RESET_HOUR=0
 DAILY_RESET_POINT_BALANCE=300
@@ -42,7 +41,8 @@ PREWARM_MAX_ACCOUNTS=3000
 # Startup behavior controls
 PREWARM_ON_STARTUP=true
 PREWARM_ACCOUNT_TIMEOUT_SECONDS=20
-AUTO_FETCH_POE_REVISION=true
+POE_FETCH_PROXY=http://127.0.0.1:7897
+POE_FETCH_IMPERSONATE=chrome131
 ```
 
 ### What are `ADMIN_API_KEY` and `SERVICE_API_KEYS_BOOTSTRAP`?
@@ -67,7 +67,7 @@ Notes:
 
 - `ADMIN_API_KEY` should never be used by external business callers.
 - Keep admin and service keys strictly separated.
-- `POE_REVISION` is gateway-level default; account-level `poe_revision` (if provided on upsert) takes precedence.
+- Poe revision is fetched automatically during startup. If fetching fails, configure `POE_FETCH_PROXY` and optionally `POE_FETCH_CF_CLEARANCE`.
 
 Generate a fernet key:
 

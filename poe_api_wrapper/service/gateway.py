@@ -85,32 +85,6 @@ _BROWSE_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# For curl_cffi impersonation, avoid forcing a potentially inconsistent
-# UA/sec-ch header set. Let curl_cffi craft browser-consistent fingerprints.
-_CURL_CFFI_BROWSE_HEADERS = {
-    k: v
-    for k, v in _BROWSE_HEADERS.items()
-    if k
-    not in {
-        "User-Agent",
-        "Priority",
-        "Sec-Ch-Ua",
-        "Sec-Ch-Ua-Arch",
-        "Sec-Ch-Ua-Bitness",
-        "Sec-Ch-Ua-Full-Version",
-        "Sec-Ch-Ua-Full-Version-List",
-        "Sec-Ch-Ua-Mobile",
-        "Sec-Ch-Ua-Model",
-        "Sec-Ch-Ua-Platform",
-        "Sec-Ch-Ua-Platform-Version",
-        "Sec-Fetch-Dest",
-        "Sec-Fetch-Mode",
-        "Sec-Fetch-Site",
-        "Sec-Fetch-User",
-        "Upgrade-Insecure-Requests",
-    }
-}
-
 
 async def fetch_poe_revision(
     *,
@@ -162,7 +136,7 @@ async def fetch_poe_revision(
             session_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
 
         with cffi_requests.Session(**session_kwargs) as session:
-            home = session.get("https://poe.com/", headers=_CURL_CFFI_BROWSE_HEADERS, allow_redirects=False)
+            home = session.get("https://poe.com/", headers=_BROWSE_HEADERS, allow_redirects=False)
             p_b = session.cookies.get("p-b", "") or home.cookies.get("p-b", "")
             cf_bm = session.cookies.get("__cf_bm", "") or home.cookies.get("__cf_bm", "")
             cf_clearance = _resolve_cf_clearance() or session.cookies.get("cf_clearance", "")
@@ -185,7 +159,7 @@ async def fetch_poe_revision(
 
             login = session.get(
                 "https://poe.com/login?redirect_url=%2F",
-                headers=_CURL_CFFI_BROWSE_HEADERS,
+                headers=_BROWSE_HEADERS,
                 allow_redirects=False,
             )
             logger.debug(
@@ -410,7 +384,6 @@ class AccountRepository:
         poe_cf_bm: Optional[str] = None,
         p_lat: Optional[str] = None,
         formkey: Optional[str] = None,
-        poe_revision: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> dict[str, Any]:
         now = utc_now()
@@ -422,7 +395,6 @@ class AccountRepository:
             "poe_cf_bm": poe_cf_bm,
             "p_lat": p_lat,
             "formkey": formkey,
-            "poe_revision": poe_revision,
             "user_agent": user_agent or DEFAULT_USER_AGENT,
         }
         encrypted_credentials = self.crypto.encrypt(credentials)
@@ -1228,7 +1200,7 @@ class PoeClientPool:
             tokens["p-lat"] = creds["p_lat"]
         if creds.get("formkey"):
             tokens["formkey"] = creds["formkey"]
-        poe_revision = (creds.get("poe_revision") or self.default_poe_revision or "").strip()
+        poe_revision = self.default_poe_revision
         if poe_revision:
             tokens["poe-revision"] = poe_revision
         return tokens
@@ -1441,11 +1413,13 @@ class AccountHealthRefresher:
         self,
         repo: AccountRepository,
         *,
+        default_poe_revision: str,
         daily_reset_timezone: str = "America/Los_Angeles",
         daily_reset_hour: int = 0,
         daily_reset_point_balance: int = 300,
     ):
         self.repo = repo
+        self.default_poe_revision = default_poe_revision.strip()
         self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"
         self.daily_reset_hour = max(0, min(int(daily_reset_hour), 23))
         self.daily_reset_point_balance = max(0, int(daily_reset_point_balance))
@@ -1552,8 +1526,8 @@ class AccountHealthRefresher:
                         tokens["p-lat"] = creds["p_lat"]
                     if creds.get("formkey"):
                         tokens["formkey"] = creds["formkey"]
-                    if creds.get("poe_revision"):
-                        tokens["poe-revision"] = creds["poe_revision"]
+                    if self.default_poe_revision:
+                        tokens["poe-revision"] = self.default_poe_revision
                     client = await AsyncPoeApi(tokens=tokens).create()
                     try:
                         settings = await client.get_settings()

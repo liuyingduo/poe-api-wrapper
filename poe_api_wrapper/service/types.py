@@ -56,7 +56,6 @@ class AccountUpsertData(BaseModel):
     poe_cf_bm: Optional[str] = None
     p_lat: Optional[str] = None
     formkey: Optional[str] = None
-    poe_revision: Optional[str] = None
     user_agent: Optional[str] = None
 
 

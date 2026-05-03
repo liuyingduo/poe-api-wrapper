@@ -50,8 +50,6 @@ if os.environ.get("POE_CF_BM"):
     tokens["__cf_bm"] = os.environ["POE_CF_BM"]
 if os.environ.get("POE_P_LAT"):
     tokens["p-lat"] = os.environ["POE_P_LAT"]
-if os.environ.get("POE_REVISION"):
-    tokens["poe-revision"] = os.environ["POE_REVISION"]
 
 headers = {
     # Keep this aligned with the browser where cookies were generated.
