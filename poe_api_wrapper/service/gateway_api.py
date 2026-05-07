@@ -5,6 +5,7 @@ import math
 import mimetypes
 import os
 import re
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from httpx import AsyncClient
 from loguru import logger
 
 from . import helpers
+from .terminal_logging import install_terminal_log_tee
 from .gateway import (
     AccountHealthRefresher,
     AccountLease,
@@ -99,6 +101,32 @@ _RETRY_DOWNGRADE_RULES: list[tuple[str, str]] = [
     ("gemini", "Gemini-3.1-Flash-Lite"),
     ("grok", "Grok-4-Fast-Non-Reasoning"),
 ]
+
+
+def _is_service_entrypoint() -> bool:
+    argv0 = str(Path(sys.argv[0])).lower()
+    return (
+        "uvicorn" in argv0
+        or argv0.endswith("main.py")
+        or argv0.endswith("gateway_api.py")
+    )
+
+
+_TERMINAL_LOG_ANNOUNCED = False
+
+
+def _install_terminal_log_tee() -> Path | None:
+    global _TERMINAL_LOG_ANNOUNCED
+
+    log_path = install_terminal_log_tee()
+    if log_path is not None and not _TERMINAL_LOG_ANNOUNCED:
+        logger.info("Terminal output is mirrored to {}", log_path)
+        _TERMINAL_LOG_ANNOUNCED = True
+    return log_path
+
+
+if _is_service_entrypoint():
+    _install_terminal_log_tee()
 
 
 def _downgrade_bot_for_retry(bot: str) -> str:
@@ -2959,10 +2987,12 @@ async def unsupported_v1_path(
 
 
 if __name__ == "__main__":
+    _install_terminal_log_tee()
     uvicorn.run("poe_api_wrapper.service.gateway_api:app", host="127.0.0.1", port=8000, workers=1)
 
 
 def start_server(tokens: Optional[list] = None, address: str = "127.0.0.1", port: str = "8000"):
+    _install_terminal_log_tee()
     if tokens is not None:
         logger.warning(
             "The `tokens` argument is ignored in Mongo gateway mode. "
