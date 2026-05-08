@@ -31,18 +31,10 @@ except ImportError:
 
     orjson = _OrjsonCompat()
 from cryptography.fernet import Fernet
-import httpx
+from curl_cffi import requests as cffi_requests
 from loguru import logger
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
-
-try:
-    from curl_cffi import requests as cffi_requests
-
-    HAS_CURL_CFFI = True
-except Exception:
-    cffi_requests = None
-    HAS_CURL_CFFI = False
 
 if TYPE_CHECKING:
     from poe_api_wrapper.reverse import AsyncPoeApi
@@ -120,14 +112,7 @@ async def fetch_poe_revision(
                 return m.group(1)
         return None
 
-    def _extract_cookie_from_headers(set_cookie_values: list[str], name: str) -> str:
-        prefix = f"{name}="
-        for sc in set_cookie_values:
-            if sc.startswith(prefix):
-                return sc.split(";", 1)[0].split("=", 1)[1]
-        return ""
-
-    def _fetch_once_with_curl_cffi(*, timeout_sec: float, proxy_url: str) -> Optional[str]:
+    def _fetch_once(*, timeout_sec: float, proxy_url: str) -> Optional[str]:
         session_kwargs: dict[str, Any] = {
             "impersonate": os.getenv("POE_FETCH_IMPERSONATE", "chrome").strip() or "chrome",
             "timeout": timeout_sec,
@@ -172,89 +157,18 @@ async def fetch_poe_revision(
     proxy_url = _resolve_proxy()
     for attempt in range(1, retries + 2):
         try:
-            if HAS_CURL_CFFI:
-                revision = await asyncio.to_thread(
-                    _fetch_once_with_curl_cffi,
-                    timeout_sec=timeout,
-                    proxy_url=proxy_url,
-                )
-                if revision:
-                    return revision
-                logger.warning(
-                    "fetch_poe_revision: revision not found via curl_cffi (attempt {}/{})",
-                    attempt,
-                    retries + 1,
-                )
-            else:
-                client_kwargs: dict[str, Any] = {
-                    "timeout": timeout,
-                    "follow_redirects": False,
-                }
-                if proxy_url:
-                    client_kwargs["proxy"] = proxy_url
-
-                async with httpx.AsyncClient(**client_kwargs) as client:
-                    home_resp = await client.get("https://poe.com/", headers=_BROWSE_HEADERS)
-                    set_cookies = home_resp.headers.get_list("set-cookie")
-                    p_b = (
-                        client.cookies.get("p-b")
-                        or home_resp.cookies.get("p-b")
-                        or _extract_cookie_from_headers(set_cookies, "p-b")
-                    )
-                    cf_bm = (
-                        client.cookies.get("__cf_bm")
-                        or home_resp.cookies.get("__cf_bm")
-                        or _extract_cookie_from_headers(set_cookies, "__cf_bm")
-                    )
-                    cf_clearance = (
-                        _resolve_cf_clearance()
-                        or client.cookies.get("cf_clearance")
-                        or home_resp.cookies.get("cf_clearance")
-                        or _extract_cookie_from_headers(set_cookies, "cf_clearance")
-                    )
-
-                    logger.debug(
-                        "fetch_poe_revision(httpx): home status={} p_b={} cf_bm={} (attempt {}/{})",
-                        home_resp.status_code,
-                        bool(p_b),
-                        bool(cf_bm),
-                        attempt,
-                        retries + 1,
-                    )
-
-                    revision = _extract_revision("", home_resp.headers.get("link", ""))
-                    if revision:
-                        return revision
-
-                    login_cookies: dict[str, str] = {}
-                    if p_b:
-                        login_cookies["p-b"] = p_b
-                    if cf_bm:
-                        login_cookies["__cf_bm"] = cf_bm
-                    if cf_clearance:
-                        login_cookies["cf_clearance"] = cf_clearance
-
-                    login_resp = await client.get(
-                        "https://poe.com/login?redirect_url=%2F",
-                        headers=_BROWSE_HEADERS,
-                        cookies=login_cookies if login_cookies else None,
-                    )
-                    logger.debug(
-                        "fetch_poe_revision(httpx): login status={} content_type={} (attempt {}/{})",
-                        login_resp.status_code,
-                        login_resp.headers.get("content-type", ""),
-                        attempt,
-                        retries + 1,
-                    )
-                    revision = _extract_revision(login_resp.text, login_resp.headers.get("link", ""))
-                    if revision:
-                        return revision
-                    logger.warning(
-                        "fetch_poe_revision: revision not found via httpx (login_status={}, attempt {}/{})",
-                        login_resp.status_code,
-                        attempt,
-                        retries + 1,
-                    )
+            revision = await asyncio.to_thread(
+                _fetch_once,
+                timeout_sec=timeout,
+                proxy_url=proxy_url,
+            )
+            if revision:
+                return revision
+            logger.warning(
+                "fetch_poe_revision: revision not found via curl_cffi (attempt {}/{})",
+                attempt,
+                retries + 1,
+            )
         except Exception as exc:
             logger.warning(
                 "fetch_poe_revision: request failed (attempt {}/{}): {}",
