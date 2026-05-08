@@ -1616,7 +1616,7 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
 
     remote_to_local: dict[str, str] = {}
     try:
-        async with AsyncClient(http2=True, timeout=None, follow_redirects=True) as fetcher:
+        async with AsyncClient(http2=True, timeout=None, follow_redirects=True, trust_env=False) as fetcher:
             for remote_url in remote_urls:
                 request_url = _quote_remote_attachment_url(remote_url)
                 try:
