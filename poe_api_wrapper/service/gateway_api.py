@@ -1610,16 +1610,23 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     try:
         async with AsyncClient(http2=True, timeout=None, follow_redirects=True) as fetcher:
             for remote_url in remote_urls:
-                resp = await fetcher.get(
-                    remote_url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
-                        ),
-                        "Accept": "*/*",
-                    },
-                )
+                try:
+                    resp = await fetcher.get(
+                        remote_url,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+                            ),
+                            "Accept": "*/*",
+                        },
+                    )
+                except Exception as exc:
+                    detail = str(exc).strip()
+                    error_text = type(exc).__name__
+                    if detail:
+                        error_text = f"{error_text}: {detail}"
+                    raise RuntimeError(f"Failed to download attachment: {remote_url} ({error_text})") from exc
                 if resp.status_code >= 400:
                     _openai_http_error(
                         400,
@@ -2509,10 +2516,14 @@ async def _chat_completions_impl(
                     success=False,
     
                 )
+                detail = str(exc).strip()
+                error_text = type(exc).__name__
+                if detail:
+                    error_text = f"{error_text}: {detail}"
                 _openai_http_error(
                     400,
                     "invalid_request_error",
-                    f"Failed to process attachments: {exc}",
+                    f"Failed to process attachments: {error_text}",
                 )
 
         upload_bot_id: Optional[int] = None
