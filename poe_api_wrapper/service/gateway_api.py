@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 from starlette.background import BackgroundTask
 
 try:
@@ -1373,6 +1373,14 @@ def _guess_suffix_from_url(url: str) -> str:
     return suffix if suffix else ""
 
 
+def _quote_remote_attachment_url(url: str) -> str:
+    parsed = urlsplit(url)
+    path = quote(parsed.path, safe="/%:@!$&'()*+,;=")
+    query = quote(parsed.query, safe="=&?/%:@!$'()*+,;")
+    fragment = quote(parsed.fragment, safe="=&?/%:@!$'()*+,;")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, fragment))
+
+
 def _guess_suffix_from_content_type(content_type: str) -> str:
     if not content_type:
         return ""
@@ -1610,9 +1618,10 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
     try:
         async with AsyncClient(http2=True, timeout=None, follow_redirects=True) as fetcher:
             for remote_url in remote_urls:
+                request_url = _quote_remote_attachment_url(remote_url)
                 try:
                     resp = await fetcher.get(
-                        remote_url,
+                        request_url,
                         headers={
                             "User-Agent": (
                                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1626,12 +1635,14 @@ async def _materialize_remote_attachments(attachments: List[str]) -> tuple[List[
                     error_text = type(exc).__name__
                     if detail:
                         error_text = f"{error_text}: {detail}"
-                    raise RuntimeError(f"Failed to download attachment: {remote_url} ({error_text})") from exc
+                    raise RuntimeError(
+                        f"Failed to download attachment: {remote_url} via {request_url} ({error_text})"
+                    ) from exc
                 if resp.status_code >= 400:
                     _openai_http_error(
                         400,
                         "invalid_request_error",
-                        f"Failed to download attachment: {remote_url} (HTTP {resp.status_code})",
+                        f"Failed to download attachment: {remote_url} via {request_url} (HTTP {resp.status_code})",
                     )
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
