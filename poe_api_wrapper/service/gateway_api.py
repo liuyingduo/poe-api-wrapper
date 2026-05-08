@@ -315,6 +315,12 @@ def _merge_system_messages_to_index_zero(messages: list[dict[str, Any]]) -> list
     return [first_system, *non_system_messages]
 
 
+def _prepend_user_message_before_initial_assistant(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if messages and str(messages[0].get("role") or "").strip() == "assistant":
+        return [{"role": "user", "content": "hello"}, *messages]
+    return messages
+
+
 @dataclass
 class GatewayConfig:
     default_poe_revision: str
@@ -2358,6 +2364,7 @@ async def _chat_completions_impl(
 ) -> Union[StreamingResponse, JSONResponse]:
     runtime = _runtime()
     messages = _merge_system_messages_to_index_zero(data.messages)
+    messages = _prepend_user_message_before_initial_assistant(messages)
     model = data.model
     streaming = bool(data.stream)
     max_tokens = data.max_completion_tokens or data.max_tokens
