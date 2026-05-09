@@ -1579,8 +1579,10 @@ class ProxyRotator:
     def __init__(
         self,
         *,
-        fail_threshold: int = 5,
+        fail_threshold: Optional[int] = None,
     ):
+        if fail_threshold is None:
+            fail_threshold = int(os.getenv("PROXY_ROTATE_FAIL_THRESHOLD", "2"))
         self._fail_threshold = max(1, fail_threshold)
         self._consecutive_failures = 0
         self._region_index = 0

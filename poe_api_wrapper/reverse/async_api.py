@@ -63,6 +63,18 @@ _formkey_executor = ThreadPoolExecutor(
 )
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid {}={!r}; using default {}", name, raw, default)
+        return default
+    return max(0.1, value)
+
+
 class AsyncPoeApi:
     BASE_URL = BASE_URL
     HEADERS = HEADERS
@@ -101,6 +113,12 @@ class AsyncPoeApi:
         self.max_ws_reconnects: int = 0
         self._ws_reconnect_count: int = 0
         self._on_reconnect_exhausted: Optional[callable] = None
+        self.ws_connect_wait_seconds: float = _env_float("POE_WS_CONNECT_WAIT_SECONDS", 30.0)
+        self.ws_ping_timeout_seconds: float = _env_float("POE_WS_PING_TIMEOUT_SECONDS", 20.0)
+        self.ws_ping_interval_seconds: float = max(
+            _env_float("POE_WS_PING_INTERVAL_SECONDS", 30.0),
+            self.ws_ping_timeout_seconds + 1.0,
+        )
         self.ws_max_lifetime_min_seconds: int = 20 * 60
         self.ws_max_lifetime_max_seconds: int = 30 * 60
         self.ws_max_lifetime_seconds: int = self._pick_ws_max_lifetime_seconds()
@@ -134,7 +152,12 @@ class AsyncPoeApi:
     def _build_http_client(self) -> AsyncClient:
         kwargs = {
             "headers": self.HEADERS.copy(),
-            "timeout": _HttpxTimeout(connect=15.0, read=20.0, write=15.0, pool=10.0),
+            "timeout": _HttpxTimeout(
+                connect=_env_float("POE_HTTP_CONNECT_TIMEOUT_SECONDS", 25.0),
+                read=_env_float("POE_HTTP_READ_TIMEOUT_SECONDS", 35.0),
+                write=_env_float("POE_HTTP_WRITE_TIMEOUT_SECONDS", 25.0),
+                pool=_env_float("POE_HTTP_POOL_TIMEOUT_SECONDS", 15.0),
+            ),
             "http2": True,
         }
         client = AsyncClient(**kwargs)
@@ -835,8 +858,8 @@ class AsyncPoeApi:
         if self.ws and not self.ws.sock:
             kwargs = {
                 "sslopt": {"cert_reqs": ssl.CERT_NONE},
-                "ping_interval": 20,
-                "ping_timeout": 10,
+                "ping_interval": self.ws_ping_interval_seconds,
+                "ping_timeout": self.ws_ping_timeout_seconds,
             }
             try:
                 self.ws.run_forever(**kwargs)
@@ -855,7 +878,7 @@ class AsyncPoeApi:
 
         if self.ws_connecting:
             waited = 0.0
-            while self.ws_connecting and not self.ws_connected and waited < 15.0:
+            while self.ws_connecting and not self.ws_connected and waited < self.ws_connect_wait_seconds:
                 await asyncio.sleep(0.05)
                 waited += 0.05
             if self.ws_connected:
@@ -920,7 +943,7 @@ class AsyncPoeApi:
             t.start()
 
             waited = 0.0
-            while not self.ws_connected and waited < 15.0:
+            while not self.ws_connected and waited < self.ws_connect_wait_seconds:
                 await asyncio.sleep(0.05)
                 waited += 0.05
             if not self.ws_connected:

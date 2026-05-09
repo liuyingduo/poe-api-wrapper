@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import sys
 from typing import Optional
@@ -15,6 +16,18 @@ except ImportError:
     execjs = None
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid {}={!r}; using default {}", name, raw, default)
+        return default
+    return max(0.1, value)
+
+
 def extract_homepage_version(document: str) -> Optional[str]:
     build_id_match = re.search(r'"buildId"\s*:\s*"([^"]+)"', document)
     if build_id_match:
@@ -28,7 +41,7 @@ def extract_homepage_version(document: str) -> Optional[str]:
 
 
 class _BundleBase:
-    SCRIPT_FETCH_TIMEOUT_SECONDS = 12.0
+    SCRIPT_FETCH_TIMEOUT_SECONDS = _env_float("POE_FORMKEY_SCRIPT_TIMEOUT_SECONDS", 25.0)
     form_key_pattern = r"window\.([a-zA-Z0-9_]+)=function\(\)\{return window"
     seeded_call_pattern = r'window\.([a-zA-Z0-9_]+)\(\s*["\']([^"\']{16,})["\']\s*\)'
     window_secret_pattern = r'let useFormkeyDecode=[\s\S]*?(window\.[\w]+="[^"]+")'
