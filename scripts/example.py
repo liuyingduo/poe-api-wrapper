@@ -3,7 +3,7 @@ import openai
 from pathlib import Path
 
 API_KEY = "svc_app_zaiwen"
-BASE_URL = "http://207.180.218.216:8004/v1/"
+BASE_URL = "http://192.3.31.234:8003/v1/"
 RUN_EXAMPLE = "file_analysis"
 IMAGE_URL = "https://ossnew.zaiwen.top/images/9e71ceb8f21a0279dda1f26c7ac1b957d6493e00552ee6e3048d1b1bcbce44cb_part_1.jpeg"
 FILE_ANALYSIS_URL = "https://oss.zaiwen.top/hbeed69d299094f89.txt"

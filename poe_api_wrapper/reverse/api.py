@@ -356,12 +356,9 @@ class PoeApi:
 
     def _build_finish_upload_headers(self) -> dict:
         keep_keys = (
-            "Accept",
-            "Accept-Language",
-            "Cache-Control",
-            "Origin",
-            "Pragma",
-            "Priority",
+            "Poe-Formkey",
+            "Referer",
+            "User-Agent",
             "Sec-Ch-Ua",
             "Sec-Ch-Ua-Arch",
             "Sec-Ch-Ua-Bitness",
@@ -371,12 +368,6 @@ class PoeApi:
             "Sec-Ch-Ua-Model",
             "Sec-Ch-Ua-Platform",
             "Sec-Ch-Ua-Platform-Version",
-            "Sec-Fetch-Dest",
-            "Sec-Fetch-Mode",
-            "Sec-Fetch-Site",
-            "Referer",
-            "User-Agent",
-            "Poe-Formkey",
         )
         headers = {}
         for key in keep_keys:
@@ -385,16 +376,13 @@ class PoeApi:
                 headers[key] = value
 
         defaults = {
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Priority": "u=1, i",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": self.HEADERS["User-Agent"],
+            "Sec-Ch-Ua": self.HEADERS["Sec-Ch-Ua"],
             "Sec-Ch-Ua-Arch": '"x86"',
             "Sec-Ch-Ua-Bitness": '"64"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Model": '""',
+            "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
         }
         for key, value in defaults.items():

@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
 )
 DEFAULT_NEW_ACCOUNT_POINT_BALANCE = 300
 
@@ -61,11 +61,11 @@ _BROWSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Priority": "u=0, i",
-    "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
+    "Sec-Ch-Ua": '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
     "Sec-Ch-Ua-Arch": '"x86"',
     "Sec-Ch-Ua-Bitness": '"64"',
-    "Sec-Ch-Ua-Full-Version": '"145.0.3800.97"',
-    "Sec-Ch-Ua-Full-Version-List": '"Not:A-Brand";v="99.0.0.0", "Microsoft Edge";v="145.0.3800.97", "Chromium";v="145.0.7632.160"',
+    "Sec-Ch-Ua-Full-Version": '"148.0.3967.70"',
+    "Sec-Ch-Ua-Full-Version-List": '"Chromium";v="148.0.7778.168", "Microsoft Edge";v="148.0.3967.70", "Not/A)Brand";v="99.0.0.0"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Model": '""',
     "Sec-Ch-Ua-Platform": '"Windows"',
