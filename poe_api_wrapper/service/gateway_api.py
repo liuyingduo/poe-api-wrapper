@@ -687,14 +687,23 @@ def _is_depleted_error(error_text: str) -> bool:
     return any(
         token in lower
         for token in (
-            "insufficient",
             "balance",
             "reached_limit",
             "402",
             "daily limit",
+            "积分",
+        )
+    )
+
+
+def _is_request_insufficient_points_error(error_text: str) -> bool:
+    lower = error_text.lower()
+    return any(
+        token in lower
+        for token in (
             "error_insufficient_fund",
             "need more points",
-            "积分",
+            "needs more points",
         )
     )
 
@@ -739,6 +748,22 @@ async def _account_error_payload(
 ) -> AccountErrorDecision:
     error_text = _exception_summary(exc)
     metadata = {"session_id": session_id, "account_id": account_id}
+    if _is_request_insufficient_points_error(error_text):
+        message = "This request needs more Poe points than the selected account can spend."
+        logger.warning(
+            "provider_error_classified status=402 type=request_insufficient_points account_id={} session_id={} "
+            "evicted_client=false detail={}",
+            mask_secret(account_id),
+            session_id,
+            error_text,
+        )
+        return AccountErrorDecision(
+            payload=build_openai_error(402, "insufficient_credits", message, metadata),
+            status_code=402,
+            kind="request_insufficient_points",
+            error_text=error_text,
+        )
+
     if _is_depleted_error(error_text):
         if persistent_session:
             message = "Bound account has no remaining points. Create a new session_id and retry."
@@ -853,8 +878,11 @@ async def _finalize_account_use(
                 cooldown_seconds=runtime.config.cooldown_seconds,
             )
 
-    # 自动决定：成功→保留 client 继续复用，失败→销毁
-    should_evict = evict_client if evict_client is not None else (not success)
+    # 自动决定：成功→保留 client 继续复用；请求点数不足不是账号终态错误，也保留 client。
+    keep_client_error_kinds = {"request_insufficient_points"}
+    should_evict = evict_client if evict_client is not None else (
+        not success and (not error_decision or error_decision.kind not in keep_client_error_kinds)
+    )
     if should_evict:
         await runtime.pool.invalidate_client(account_id)
 

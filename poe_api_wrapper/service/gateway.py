@@ -666,6 +666,19 @@ class AccountRepository:
 
         return await self._run(_op)
 
+    async def get_active_account_balances(self) -> list[int]:
+        """返回数据库中所有 active 账号余额，用于池内账号淘汰中位数。"""
+        def _op():
+            docs = list(
+                self.accounts.find(
+                    {"status": "active"},
+                    {"message_point_balance": 1},
+                )
+            )
+            return [int(doc.get("message_point_balance", 0) or 0) for doc in docs]
+
+        return await self._run(_op)
+
     async def mark_account_ever_connected(self, account_id: str) -> None:
         """标记账号已成功建立过连接。"""
         await self._run(
@@ -1896,6 +1909,49 @@ class PoolMonitor:
                     old_size,
                     self.target_pool_size,
                 )
+
+        low_balance_accounts = await self._pool_accounts_below_median()
+        if not low_balance_accounts:
+            return
+
+        logger.info(
+            "PoolMonitor median: evicting {} account(s) below current median balance",
+            len(low_balance_accounts),
+        )
+        for account_id, balance, median_balance in low_balance_accounts:
+            try:
+                await self.pool.invalidate_client(account_id)
+                logger.info(
+                    "PoolMonitor median: evicted account {} balance={} median_balance={}",
+                    mask_secret(account_id),
+                    balance,
+                    int(median_balance),
+                )
+            except Exception as exc:
+                logger.debug("Median-balance evict failed for {}: {}", mask_secret(account_id), exc)
+
+    async def _pool_accounts_below_median(self) -> list[tuple[str, int, float]]:
+        account_ids = self.pool.cached_account_ids()
+        if not account_ids:
+            return []
+
+        import statistics
+
+        active_balances = await self.repo.get_active_account_balances()
+        if not active_balances:
+            return []
+
+        median_balance = float(statistics.median(active_balances))
+        account_docs = await self.repo.get_accounts_by_ids(list(account_ids))
+        low_balance_accounts: list[tuple[str, int, float]] = []
+        for doc in account_docs:
+            account_id = str(doc.get("_id", "")).strip()
+            if not account_id:
+                continue
+            balance = int(doc.get("message_point_balance", 0) or 0)
+            if balance < median_balance:
+                low_balance_accounts.append((account_id, balance, median_balance))
+        return low_balance_accounts
 
     async def _fill_pool(self) -> None:
         # 首次执行时从 DB 加载游标位置
