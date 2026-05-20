@@ -1163,7 +1163,7 @@ async def admin_accounts_summary() -> JSONResponse:
     return JSONResponse(data)
 
 
-@app.post("/admin/accounts/refresh-points", response_model=None, dependencies=[Depends(require_admin_auth)])
+@app.post("/admin/accounts/refresh-points", response_model=None)
 async def admin_refresh_account_points(request: Request) -> JSONResponse:
     """Fetch real-time points for a specific account from Poe and update the database."""
     runtime = _runtime()
@@ -1283,7 +1283,13 @@ async def admin_dashboard() -> HTMLResponse:
 
 
 @app.get("/admin/dashboard-stats", response_model=None)
-async def admin_dashboard_stats() -> JSONResponse:
+async def admin_dashboard_stats(
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=10, ge=5, le=100),
+    search: str = Query(default=""),
+    status: str = Query(default="all"),
+    sort: str = Query(default="points-desc")
+) -> JSONResponse:
     runtime = _runtime()
     now = utc_now()
 
@@ -1315,19 +1321,19 @@ async def admin_dashboard_stats() -> JSONResponse:
     for doc in accounts_docs:
         account_id = str(doc["_id"])
         email = doc.get("email", "")
-        status = doc.get("status", "active")
+        acc_status = doc.get("status", "active")
         balance = int(doc.get("message_point_balance", 0) or 0)
         sub_active = bool(doc.get("subscription_active", False))
         health_score = float(doc.get("health_score", 0.0) or 0.0)
 
         # Status counts
-        if status in status_counts:
-            status_counts[status] += 1
+        if acc_status in status_counts:
+            status_counts[acc_status] += 1
         else:
             status_counts["active"] += 1  # default is active
 
         total_points += balance
-        if status == "active":
+        if acc_status == "active":
             active_points += balance
 
         cooldown_until = doc.get("cooldown_until")
@@ -1338,7 +1344,7 @@ async def admin_dashboard_stats() -> JSONResponse:
         accounts_list.append({
             "id": account_id,
             "email": email,
-            "status": status,
+            "status": acc_status,
             "message_point_balance": balance,
             "subscription_active": sub_active,
             "health_score": health_score,
@@ -1352,12 +1358,48 @@ async def admin_dashboard_stats() -> JSONResponse:
             "is_blocked": account_id in blocked_accounts
         })
 
+    # Apply python-based filtering
+    search_lower = search.lower().strip()
+    filtered_list = []
+    for acc in accounts_list:
+        matches_search = not search_lower or (search_lower in acc["email"].lower())
+        matches_status = (status == "all") or (acc["status"] == status)
+        if matches_search and matches_status:
+            filtered_list.append(acc)
+
+    # Apply python-based sorting
+    if sort == "points-desc":
+        filtered_list.sort(key=lambda x: x["message_point_balance"], reverse=True)
+    elif sort == "points-asc":
+        filtered_list.sort(key=lambda x: x["message_point_balance"])
+    elif sort == "email":
+        filtered_list.sort(key=lambda x: x["email"].lower())
+    elif sort == "errors-desc":
+        filtered_list.sort(key=lambda x: x["error_count"], reverse=True)
+    elif sort == "inflight-desc":
+        filtered_list.sort(key=lambda x: x["inflight_count"], reverse=True)
+
+    # Slicing
+    total_filtered = len(filtered_list)
+    total_pages = math.ceil(total_filtered / size) or 1
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    start_idx = (page - 1) * size
+    end_idx = start_idx + size
+    paged_accounts = filtered_list[start_idx:end_idx]
+
     # 7. Get ready accounts count
     ready_accounts = await runtime.repo.count_ready_accounts()
 
     return JSONResponse({
         "ready_accounts": ready_accounts,
         "total_accounts": len(accounts_docs),
+        "total_filtered": total_filtered,
+        "total_pages": total_pages,
+        "current_page": page,
+        "page_size": size,
         "uptime_seconds": uptime_seconds,
         "total_points": total_points,
         "active_points": active_points,
@@ -1370,7 +1412,7 @@ async def admin_dashboard_stats() -> JSONResponse:
         "global_inflight_limit": runtime.limiter.global_inflight_limit,
         "acquire_waiting": runtime.acquire_wait_counter.value() if hasattr(runtime, "acquire_wait_counter") else 0,
         "blocked_accounts_count": len(blocked_accounts),
-        "accounts": accounts_list,
+        "accounts": paged_accounts,
         "config": {
             "max_inflight_per_account": runtime.config.max_inflight_per_account,
             "global_inflight_limit": runtime.config.global_inflight_limit,

@@ -734,10 +734,6 @@
                     <option value="30000">自动刷新: 30 秒</option>
                     <option value="0">自动刷新: 关闭</option>
                 </select>
-                <button id="refresh-all-btn" class="btn btn-primary">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-                    刷新所有账号
-                </button>
             </div>
         </header>
 
@@ -867,6 +863,25 @@
                             </tr>
                         </tbody>
                     </table>
+                </div>
+                <!-- Pagination Controls -->
+                <div class="pagination-wrapper" style="display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-top: 1px solid var(--card-border); flex-wrap: wrap; gap: 1rem;">
+                    <div style="font-size: 0.875rem; color: var(--text-muted);">
+                        显示第 <span id="page-start-idx" style="font-weight: 600; color: var(--text-main);">0</span> 到 <span id="page-end-idx" style="font-weight: 600; color: var(--text-main);">0</span> 条，共 <span id="page-total-count" style="font-weight: 600; color: var(--text-main);">0</span> 条账号
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 0.75rem;">
+                        <select id="page-size-select" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">
+                            <option value="10" selected>10 条 / 页</option>
+                            <option value="25">25 条 / 页</option>
+                            <option value="50">50 条 / 页</option>
+                            <option value="100">100 条 / 页</option>
+                        </select>
+                        <div class="pagination-buttons" style="display: flex; gap: 0.5rem; align-items: center;">
+                            <button id="prev-page-btn" class="btn btn-secondary" style="padding: 0.375rem 0.75rem; font-size: 0.75rem; min-width: 60px;">上一页</button>
+                            <span id="page-info" style="font-size: 0.875rem; min-width: 80px; text-align: center; color: var(--text-main);">第 1 / 1 页</span>
+                            <button id="next-page-btn" class="btn btn-secondary" style="padding: 0.375rem 0.75rem; font-size: 0.75rem; min-width: 60px;">下一页</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1006,15 +1021,27 @@
         let expandedAccounts = new Set();
         let firstLoad = true;
 
+        // Pagination State
+        let currentPage = 1;
+        let pageSize = 10;
+
         // Dom Elements
         const tabButtons = document.querySelectorAll('.tab-btn');
         const tabContents = document.querySelectorAll('.tab-content');
         const autoRefreshSelect = document.getElementById('auto-refresh-select');
-        const refreshAllBtn = document.getElementById('refresh-all-btn');
         const searchInput = document.getElementById('search-input');
         const statusFilter = document.getElementById('status-filter');
         const sortSelect = document.getElementById('sort-select');
         const accountsTableBody = document.getElementById('accounts-table-body');
+        
+        // Pagination Elements
+        const prevPageBtn = document.getElementById('prev-page-btn');
+        const nextPageBtn = document.getElementById('next-page-btn');
+        const pageInfo = document.getElementById('page-info');
+        const pageSizeSelect = document.getElementById('page-size-select');
+        const pageStartIdx = document.getElementById('page-start-idx');
+        const pageEndIdx = document.getElementById('page-end-idx');
+        const pageTotalCount = document.getElementById('page-total-count');
         
         const gatewayStatus = document.getElementById('gateway-status');
         const readyAccountsCount = document.getElementById('ready-accounts-count');
@@ -1052,12 +1079,28 @@
         });
 
         // Search & Filter Events
-        searchInput.addEventListener('input', renderAccountsTable);
-        statusFilter.addEventListener('change', renderAccountsTable);
-        sortSelect.addEventListener('change', renderAccountsTable);
+        searchInput.addEventListener('input', () => { currentPage = 1; fetchDashboardStats(); });
+        statusFilter.addEventListener('change', () => { currentPage = 1; fetchDashboardStats(); });
+        sortSelect.addEventListener('change', () => { currentPage = 1; fetchDashboardStats(); });
+
+        // Pagination Events
+        prevPageBtn.addEventListener('click', () => {
+            if (currentPage > 1) {
+                currentPage--;
+                fetchDashboardStats();
+            }
+        });
+        nextPageBtn.addEventListener('click', () => {
+            currentPage++;
+            fetchDashboardStats();
+        });
+        pageSizeSelect.addEventListener('change', (e) => {
+            pageSize = parseInt(e.target.value);
+            currentPage = 1;
+            fetchDashboardStats();
+        });
 
         // Action Events
-        refreshAllBtn.addEventListener('click', refreshAllAccounts);
         clearLogBtn.addEventListener('click', () => {
             logTerminal.innerHTML = '<div class="log-line log-info">日志面板已手动清空。</div>';
         });
@@ -1108,7 +1151,12 @@
         // Fetch Dashboard Data
         async function fetchDashboardStats() {
             try {
-                const response = await fetch('/admin/dashboard-stats');
+                const searchVal = encodeURIComponent(searchInput.value.trim());
+                const statusVal = encodeURIComponent(statusFilter.value);
+                const sortVal = encodeURIComponent(sortSelect.value);
+                const url = `/admin/dashboard-stats?page=${currentPage}&size=${pageSize}&search=${searchVal}&status=${statusVal}&sort=${sortVal}`;
+
+                const response = await fetch(url);
                 if (response.status === 401) {
                     gatewayStatus.innerHTML = '<span class="dot dot-red"></span><span style="color: var(--danger); font-weight: 600;">未授权</span>';
                     return;
@@ -1163,7 +1211,9 @@
 
             // Accounts
             rawAccounts = data.accounts || [];
-            renderAccountsTable();
+            currentPage = data.current_page || 1;
+            pageSize = data.page_size || 10;
+            renderAccountsTable(data);
             
             // Build Charts
             updateCharts(data);
@@ -1171,36 +1221,37 @@
             firstLoad = false;
         }
 
-        // Render accounts table with filter and sort
-        function renderAccountsTable() {
-            const searchVal = searchInput.value.toLowerCase().trim();
-            const statusVal = statusFilter.value;
-            const sortVal = sortSelect.value;
+        // Render accounts table using paginated backend data
+        function renderAccountsTable(data) {
+            const pageAccounts = rawAccounts; // rawAccounts is data.accounts
+            const totalCount = data.total_filtered;
+            const totalPages = data.total_pages;
+            
+            // Slice for current page
+            const startIdx = (currentPage - 1) * pageSize;
+            const endIdx = startIdx + pageAccounts.length;
 
-            // Filtering
-            let filtered = rawAccounts.filter(acc => {
-                const matchesSearch = acc.email.toLowerCase().includes(searchVal);
-                const matchesStatus = (statusVal === 'all') || (acc.status === statusVal);
-                return matchesSearch && matchesStatus;
-            });
+            // Update Pagination UI
+            pageStartIdx.textContent = totalCount > 0 ? startIdx + 1 : 0;
+            pageEndIdx.textContent = endIdx;
+            pageTotalCount.textContent = totalCount;
+            pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页`;
+            
+            prevPageBtn.disabled = (currentPage === 1);
+            prevPageBtn.style.opacity = (currentPage === 1) ? '0.5' : '1';
+            prevPageBtn.style.cursor = (currentPage === 1) ? 'not-allowed' : 'pointer';
 
-            // Sorting
-            filtered.sort((a, b) => {
-                if (sortVal === 'points-desc') return b.message_point_balance - a.message_point_balance;
-                if (sortVal === 'points-asc') return a.message_point_balance - b.message_point_balance;
-                if (sortVal === 'email') return a.email.localeCompare(b.email);
-                if (sortVal === 'errors-desc') return b.error_count - a.error_count;
-                if (sortVal === 'inflight-desc') return b.inflight_count - a.inflight_count;
-                return 0;
-            });
+            nextPageBtn.disabled = (currentPage === totalPages);
+            nextPageBtn.style.opacity = (currentPage === totalPages) ? '0.5' : '1';
+            nextPageBtn.style.cursor = (currentPage === totalPages) ? 'not-allowed' : 'pointer';
 
-            if (filtered.length === 0) {
-                accountsTableBody.innerHTML = `<tr><td colspan="9" class="no-data">没有找到符合条件的账号</td></tr>`;
+            if (pageAccounts.length === 0) {
+                accountsTableBody.innerHTML = `<tr><td colspan="9" class="no-data" style="text-align: center; padding: 3rem; color: var(--text-muted);">没有找到符合条件的账号</td></tr>`;
                 return;
             }
 
             accountsTableBody.innerHTML = '';
-            filtered.forEach(acc => {
+            pageAccounts.forEach(acc => {
                 // Main Row
                 const row = document.createElement('tr');
                 row.className = 'account-row';
@@ -1466,38 +1517,6 @@
                 if (svgIcon) svgIcon.classList.remove('spin');
                 btn.disabled = false;
                 btn.style.opacity = '1';
-            }
-        }
-
-        // Action: Refresh all accounts
-        async function refreshAllAccounts() {
-            if (!confirm('确定要发起全局刷新所有账号点数吗？该操作是后台异步进行的。')) {
-                return;
-            }
-
-            refreshAllBtn.disabled = true;
-            const originalHtml = refreshAllBtn.innerHTML;
-            refreshAllBtn.innerHTML = `<svg width="14" height="14" class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg> 正在发起重刷新...`;
-
-            try {
-                const response = await fetch('/admin/accounts/refresh-all', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ concurrency: 5 })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`HTTP 状态码: ${response.status}`);
-                }
-
-                const result = await response.json();
-                alert(`后台全局刷新任务已成功下发！总数: ${result.total_scheduled}。正在进行异步拉取，可以在日志面板观察进度。`);
-                await fetchDashboardStats();
-            } catch (err) {
-                alert(`刷新失败: ${err.message}`);
-            } finally {
-                refreshAllBtn.disabled = false;
-                refreshAllBtn.innerHTML = originalHtml;
             }
         }
 
