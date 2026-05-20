@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -352,6 +352,55 @@ class AccountRepository:
             return self.accounts.find_one({"email": email})
 
         return await self._run(_op)
+
+    async def get_accounts_by_ids(self, account_ids: list[str]) -> list[dict[str, Any]]:
+        if not account_ids:
+            return []
+        def _op():
+            oids = [self._object_id(aid) for aid in account_ids if aid]
+            return list(self.accounts.find({"_id": {"$in": oids}}))
+
+        docs = await self._run(_op)
+        sanitized = []
+        for doc in docs:
+            if doc:
+                s = self._sanitize_account(doc)
+                s["_id"] = str(doc["_id"])
+                sanitized.append(s)
+        return sanitized
+
+    async def deduct_account_points(
+        self,
+        account_id: str,
+        points: int,
+        depleted_threshold: int = 20,
+    ) -> Optional[dict[str, Any]]:
+        def _op():
+            # 1. 扣减积分
+            updated = self.accounts.find_one_and_update(
+                {"_id": self._object_id(account_id)},
+                {"$inc": {"message_point_balance": -points}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated and updated.get("message_point_balance", 0) <= depleted_threshold:
+                # 2. 如果扣减后低于或等于阈值，置为 depleted 状态
+                updated = self.accounts.find_one_and_update(
+                    {"_id": self._object_id(account_id)},
+                    {
+                        "$set": {
+                            "status": "depleted",
+                            "status_reason": f"Points deducted locally ({updated.get('message_point_balance')} <= threshold {depleted_threshold})",
+                            "updated_at": utc_now(),
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER,
+                )
+            return updated
+
+        updated = await self._run(_op)
+        return self._sanitize_account(updated)
+
+
 
     async def get_accounts_summary(self) -> dict[str, Any]:
         """Return all accounts with key fields only, plus total / available counts."""
@@ -1042,9 +1091,18 @@ class AccountSelector:
         if not cached_ids:
             raise CapacityLimitError("No prewarmed accounts are currently available")
 
-        candidates = [{"_id": account_id} for account_id in cached_ids]
+        # Load full account docs from repository to get points and errors
+        account_docs = await self.repo.get_accounts_by_ids(cached_ids)
+        doc_map = {str(doc["_id"]): doc for doc in account_docs if doc}
+        candidates = []
+        for aid in cached_ids:
+            if aid in doc_map:
+                candidates.append(doc_map[aid])
+            else:
+                candidates.append({"_id": aid})
         top_limit = min(self.top_n, len(candidates))
         return candidates[:top_limit]
+
 
     async def _score_account(self, account: dict[str, Any]) -> float:
         account_id = str(account["_id"])

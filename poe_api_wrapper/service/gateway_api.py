@@ -454,12 +454,14 @@ def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, An
         display_name = str(bot.get("displayName") or "").strip()
         model_name = str(bot.get("model") or "").strip()
 
+        point_cost = bot.get("messagePointCost")
         entry: dict[str, Any] = {
             "baseModel": handle,
             "tokens": DEFAULT_MODEL_TOKENS,
             "premium_model": False,
             "object": "model",
             "owned_by": "poe",
+            "message_point_cost": point_cost,
         }
 
         # 用 overrides 覆盖（tokens、premium_model 等）
@@ -836,6 +838,7 @@ async def _finalize_account_use(
 ) -> None:
     if success:
         await runtime.repo.mark_account_success(account_id)
+        asyncio.create_task(_background_sync_account_points(runtime, account_id))
     elif error_decision:
         if error_decision.kind == "provider_timeout":
             await runtime.repo.record_account_error(
@@ -871,19 +874,92 @@ async def _finalize_account_use(
         await lease.release()
 
 
-async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
+def _get_min_points_needed_for_model(model: str) -> int:
+    meta = app.state.models.get(model)
+    if meta and isinstance(meta, dict):
+        cost = meta.get("message_point_cost")
+        if cost is not None:
+            try:
+                c = int(cost)
+                if c >= 0:
+                    return c
+            except (ValueError, TypeError):
+                pass
+    # Safe default minimum if missing or unparsed
+    return 15
+
+
+_last_points_sync: dict[str, float] = {}
+
+
+async def _background_sync_account_points(runtime: GatewayRuntime, account_id: str) -> None:
+    now = asyncio.get_event_loop().time()
+    last_sync = _last_points_sync.get(account_id, 0)
+    if now - last_sync < 5.0:
+        return
+    _last_points_sync[account_id] = now
+
+    try:
+        client = await runtime.pool.get_client_for_account({"_id": account_id}, create_if_missing=False)
+        if not client:
+            return
+        settings = await client.get_settings()
+        message_info = settings.get("messagePointInfo", {})
+        subscription = settings.get("subscription", {})
+        balance = int(message_info.get("subscriptionPointBalance", 0) or 0) + int(
+            message_info.get("addonPointBalance", 0) or 0
+        )
+        subscription_active = bool(subscription.get("isActive", False))
+        await runtime.repo.update_account_health(
+            account_id,
+            balance=balance,
+            subscription_active=subscription_active,
+            depleted_threshold=runtime.config.depleted_threshold,
+        )
+        logger.info("Background points sync succeeded for account {}: {}", mask_secret(account_id), balance)
+    except Exception as exc:
+        logger.warning("Background points sync failed for account {}: {}", mask_secret(account_id), exc)
+
+
+async def _acquire_prewarmed_account(runtime: GatewayRuntime, min_points: int = 15) -> tuple[dict[str, Any], AccountLease]:
     runtime.acquire_wait_counter.enter()
     wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
     try:
+        tried_account_ids = set()
         while True:
             try:
-                return await runtime.selector.select_account(prewarmed_only=True)
+                account_doc, lease = await runtime.selector.select_account(prewarmed_only=True)
+                account_id = str(account_doc["_id"])
+                balance = account_doc.get("message_point_balance")
+                if balance is None:
+                    full_doc = await runtime.repo.get_account_by_id(account_id)
+                    if full_doc:
+                        account_doc = full_doc
+                        balance = full_doc.get("message_point_balance")
+
+                if balance is not None and balance < min_points:
+                    logger.warning(
+                        "Account {} has insufficient points ({} < {} needed). Marking depleted and retrying selection.",
+                        mask_secret(account_id), balance, min_points
+                    )
+                    await runtime.repo.mark_account_depleted(account_id, f"Points {balance} < {min_points} needed")
+                    await runtime.pool.invalidate_client(account_id)
+                    await lease.release()
+
+                    tried_account_ids.add(account_id)
+                    warm_ids = runtime.pool.cached_account_ids_in_order()
+                    if all(wid in tried_account_ids for wid in warm_ids):
+                        raise NoAccountAvailableError("All cached accounts have insufficient points")
+                    continue
+
+                return account_doc, lease
             except NoAccountAvailableError:
                 raise
             except CapacityLimitError:
                 await asyncio.sleep(wait_sec)
     finally:
         runtime.acquire_wait_counter.leave()
+
 
 
 @app.on_event("startup")
@@ -2509,6 +2585,7 @@ async def _acquire_account_for_chat(
     persistent_session: bool,
     model: str,
 ) -> tuple[dict[str, Any], AccountLease, Optional[str], Optional[int]]:
+    min_points = _get_min_points_needed_for_model(model)
     if persistent_session:
         session = await runtime.sessions.get_session(session_id)
         if session:
@@ -2531,6 +2608,20 @@ async def _acquire_account_for_chat(
                     "Bound account is unavailable. Create a new session_id and retry.",
                     {"session_id": session_id},
                 )
+
+            # Check point balance for the bound account
+            balance = account_doc.get("message_point_balance")
+            if balance is not None and balance < min_points:
+                await runtime.repo.mark_account_depleted(account_id, f"Points {balance} < {min_points} needed for session")
+                await runtime.pool.invalidate_client(account_id)
+                await runtime.sessions.break_session(session_id, f"bound account points depleted ({balance} < {min_points})")
+                _openai_http_error(
+                    409,
+                    "invalid_request_error",
+                    f"Bound account has insufficient points ({balance} < {min_points}). Create a new session_id and retry.",
+                    {"session_id": session_id},
+                )
+
             wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
             while not runtime.pool.has_client(account_id):
                 await asyncio.sleep(wait_sec)
@@ -2541,9 +2632,9 @@ async def _acquire_account_for_chat(
             return account_doc, lease, session.get("chat_code"), session.get("chat_id")
 
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(runtime, min_points=min_points)
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(402, "insufficient_credits", f"No active accounts with enough points ({min_points}) available")
 
     account_id = str(account_doc["_id"])
     if persistent_session:
@@ -2555,6 +2646,7 @@ async def _acquire_account_for_chat(
             chat_id=None,
         )
     return account_doc, lease, None, None
+
 
 
 @app.api_route("/chat/completions", methods=["POST", "OPTIONS"], response_model=None)
@@ -2859,10 +2951,11 @@ async def create_images(
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
 
+    min_points = _get_min_points_needed_for_model(model)
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(runtime, min_points=min_points)
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(402, "insufficient_credits", f"No active accounts with enough points ({min_points}) available")
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
@@ -3009,10 +3102,11 @@ async def edit_images(
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
 
+    min_points = _get_min_points_needed_for_model(model)
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(runtime, min_points=min_points)
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(402, "insufficient_credits", f"No active accounts with enough points ({min_points}) available")
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
