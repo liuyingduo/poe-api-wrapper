@@ -123,7 +123,8 @@ async def fetch_poe_revision(
         with cffi_requests.Session(**session_kwargs) as session:
             home = session.get("https://poe.com/", headers=_BROWSE_HEADERS, allow_redirects=False)
             def _get_cookie(jar, name: str) -> str:
-                for c in jar:
+                real_jar = getattr(jar, "jar", jar)
+                for c in real_jar:
                     if c.name == name:
                         return c.value
                 return ""
