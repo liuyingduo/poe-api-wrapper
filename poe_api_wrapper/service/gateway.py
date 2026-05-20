@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
 try:
@@ -1771,6 +1771,7 @@ class PoolMonitor:
         ttl_check_interval_seconds: int = 30,
         proxy_rotator: Optional[ProxyRotator] = None,
         waiting_count_provider: Optional[Callable[[], int]] = None,
+        account_inflight_provider: Optional[Callable[[str], Awaitable[int]]] = None,
     ):
         self.repo = repo
         self.pool = pool
@@ -1788,6 +1789,7 @@ class PoolMonitor:
         self.connect_timeout_seconds = max(5, connect_timeout_seconds)
         self.ttl_check_interval_seconds = max(10, ttl_check_interval_seconds)
         self.waiting_count_provider = waiting_count_provider
+        self.account_inflight_provider = account_inflight_provider
 
         self._stopped = asyncio.Event()
         self._monitor_task: Optional[asyncio.Task] = None
@@ -1796,6 +1798,7 @@ class PoolMonitor:
         self._last_scanned_id: Optional[Any] = None
         self._cursor_loaded = False
         self._cursor_key = "pool_monitor_cursor"
+        self._active_balance_median: Optional[float] = None
         # 正在建连的账号 id 集合，避免重复
         self._connecting: set[str] = set()
         self._connecting_lock = asyncio.Lock()
@@ -1852,6 +1855,15 @@ class PoolMonitor:
             )
             os._exit(1)
 
+    async def _account_has_inflight(self, account_id: str) -> bool:
+        if not self.account_inflight_provider:
+            return False
+        try:
+            return int(await self.account_inflight_provider(account_id)) > 0
+        except Exception as exc:
+            logger.debug("PoolMonitor: inflight provider failed for {}: {}", mask_secret(account_id), exc)
+            return True
+
     async def _monitor_loop(self) -> None:
         while not self._stopped.is_set():
             try:
@@ -1878,9 +1890,28 @@ class PoolMonitor:
             if self._stopped.is_set():
                 break
             try:
+                await self._refresh_active_balance_median()
                 await self._evict_expired()
             except Exception as exc:
                 logger.warning("PoolMonitor TTL evict error: {}", exc)
+
+    def active_balance_median(self) -> Optional[float]:
+        return self._active_balance_median
+
+    async def _refresh_active_balance_median(self) -> Optional[float]:
+        import statistics
+
+        active_balances = await self.repo.get_active_account_balances()
+        if not active_balances:
+            self._active_balance_median = None
+            return None
+
+        self._active_balance_median = float(statistics.median(active_balances))
+        logger.info(
+            "PoolMonitor median: refreshed active account balance median={}",
+            int(self._active_balance_median),
+        )
+        return self._active_balance_median
 
     async def _evict_expired(self) -> None:
         expired_ids = [
@@ -1894,6 +1925,12 @@ class PoolMonitor:
         evicted_count = 0
         for account_id in expired_ids:
             try:
+                if await self._account_has_inflight(account_id):
+                    logger.info(
+                        "PoolMonitor TTL: skip evicting busy account {}",
+                        mask_secret(account_id),
+                    )
+                    continue
                 await self.pool.invalidate_client(account_id)
                 evicted_count += 1
             except Exception as exc:
@@ -1909,49 +1946,6 @@ class PoolMonitor:
                     old_size,
                     self.target_pool_size,
                 )
-
-        low_balance_accounts = await self._pool_accounts_below_median()
-        if not low_balance_accounts:
-            return
-
-        logger.info(
-            "PoolMonitor median: evicting {} account(s) below current median balance",
-            len(low_balance_accounts),
-        )
-        for account_id, balance, median_balance in low_balance_accounts:
-            try:
-                await self.pool.invalidate_client(account_id)
-                logger.info(
-                    "PoolMonitor median: evicted account {} balance={} median_balance={}",
-                    mask_secret(account_id),
-                    balance,
-                    int(median_balance),
-                )
-            except Exception as exc:
-                logger.debug("Median-balance evict failed for {}: {}", mask_secret(account_id), exc)
-
-    async def _pool_accounts_below_median(self) -> list[tuple[str, int, float]]:
-        account_ids = self.pool.cached_account_ids()
-        if not account_ids:
-            return []
-
-        import statistics
-
-        active_balances = await self.repo.get_active_account_balances()
-        if not active_balances:
-            return []
-
-        median_balance = float(statistics.median(active_balances))
-        account_docs = await self.repo.get_accounts_by_ids(list(account_ids))
-        low_balance_accounts: list[tuple[str, int, float]] = []
-        for doc in account_docs:
-            account_id = str(doc.get("_id", "")).strip()
-            if not account_id:
-                continue
-            balance = int(doc.get("message_point_balance", 0) or 0)
-            if balance < median_balance:
-                low_balance_accounts.append((account_id, balance, median_balance))
-        return low_balance_accounts
 
     async def _fill_pool(self) -> None:
         # 首次执行时从 DB 加载游标位置

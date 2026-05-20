@@ -860,9 +860,10 @@ async def _finalize_account_use(
     evict_client: Optional[bool] = None,
     release_lease: bool = True,
 ) -> None:
+    should_sync_points = False
     if success:
         await runtime.repo.mark_account_success(account_id)
-        asyncio.create_task(_background_sync_account_points(runtime, account_id))
+        should_sync_points = True
     elif error_decision:
         if error_decision.kind == "provider_timeout":
             await runtime.repo.record_account_error(
@@ -900,6 +901,9 @@ async def _finalize_account_use(
     if lease and release_lease:
         await lease.release()
 
+    if should_sync_points:
+        asyncio.create_task(_background_sync_account_points(runtime, account_id))
+
 
 _last_points_sync: dict[str, float] = {}
 
@@ -928,6 +932,24 @@ async def _background_sync_account_points(runtime: GatewayRuntime, account_id: s
             subscription_active=subscription_active,
             depleted_threshold=runtime.config.depleted_threshold,
         )
+        active_balance_median = runtime.pool_monitor.active_balance_median()
+        account_inflight = await runtime.limiter.inflight_for(account_id)
+        if active_balance_median is not None and balance < active_balance_median and account_inflight == 0:
+            await runtime.pool.invalidate_client(account_id)
+            logger.info(
+                "Background points sync evicted account {} from pool: balance={} median_balance={}",
+                mask_secret(account_id),
+                balance,
+                int(active_balance_median),
+            )
+        elif active_balance_median is not None and balance < active_balance_median:
+            logger.info(
+                "Background points sync kept busy account {} in pool: balance={} median_balance={} inflight={}",
+                mask_secret(account_id),
+                balance,
+                int(active_balance_median),
+                account_inflight,
+            )
         logger.info("Background points sync succeeded for account {}: {}", mask_secret(account_id), balance)
     except Exception as exc:
         logger.warning("Background points sync failed for account {}: {}", mask_secret(account_id), exc)
@@ -998,6 +1020,7 @@ async def startup_event() -> None:
         connect_timeout_seconds=config.pool_connect_timeout_seconds,
         ttl_check_interval_seconds=config.pool_ttl_check_interval_seconds,
         waiting_count_provider=acquire_wait_counter.value,
+        account_inflight_provider=limiter.inflight_for,
     )
     sessions = SessionManager(repo=repo)
 
