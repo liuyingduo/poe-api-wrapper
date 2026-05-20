@@ -44,6 +44,7 @@ from httpx import AsyncClient
 from loguru import logger
 
 from . import helpers
+from .dashboard_stats import build_point_balance_distribution
 from .terminal_logging import install_terminal_log_tee
 from .gateway import (
     AccountHealthRefresher,
@@ -1475,6 +1476,7 @@ async def admin_dashboard_stats(
 
     # Get connection pool accounts
     pool_accounts = [acc for acc in accounts_list if acc.get("in_pool")]
+    point_balance_distribution = build_point_balance_distribution(accounts_list)
 
     # 7. Get ready accounts count
     ready_accounts = await runtime.repo.count_ready_accounts()
@@ -1499,6 +1501,7 @@ async def admin_dashboard_stats(
         "acquire_waiting": runtime.acquire_wait_counter.value() if hasattr(runtime, "acquire_wait_counter") else 0,
         "blocked_accounts_count": len(blocked_accounts),
         "pool_accounts": pool_accounts,
+        "point_balance_distribution": point_balance_distribution,
         "accounts": paged_accounts,
         "config": {
             "max_inflight_per_account": runtime.config.max_inflight_per_account,

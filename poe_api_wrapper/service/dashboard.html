@@ -314,7 +314,7 @@
         /* Charts Section */
         .charts-row {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr) minmax(320px, 1.2fr);
             gap: 1.5rem;
         }
 
@@ -816,6 +816,14 @@
                         <canvas id="statusChart"></canvas>
                     </div>
                 </div>
+                <div class="chart-container glass-panel">
+                    <div class="chart-header">
+                        <span>剩余点数账号分布</span>
+                    </div>
+                    <div class="chart-wrapper">
+                        <canvas id="pointDistributionChart"></canvas>
+                    </div>
+                </div>
             </div>
 
             <!-- Accounts Table -->
@@ -1017,6 +1025,7 @@
         let logsInterval = null;
         let pointsChart = null;
         let statusChart = null;
+        let pointDistributionChart = null;
         let rawAccounts = [];
         let expandedAccounts = new Set();
         let firstLoad = true;
@@ -1444,7 +1453,7 @@
             const poolAccounts = (data.pool_accounts || (data.accounts || []).filter(a => a.in_pool))
                 .sort((a,b) => b.message_point_balance - a.message_point_balance);
 
-            const pointsLabels = poolAccounts.map(a => a.email.split('@')[0]);
+            const pointsLabels = poolAccounts.map(a => a.email);
             const pointsValues = poolAccounts.map(a => a.message_point_balance);
 
             if (!pointsChart) {
@@ -1484,6 +1493,60 @@
                 pointsChart.data.labels = pointsLabels;
                 pointsChart.data.datasets[0].data = pointsValues;
                 pointsChart.update();
+            }
+
+            // 3. Account count distribution by remaining points
+            const pointDistribution = data.point_balance_distribution || [];
+            const pointDistributionLabels = pointDistribution.map(item => item.label);
+            const pointDistributionValues = pointDistribution.map(item => item.account_count);
+            const pointDistributionTotals = pointDistribution.map(item => item.total_points);
+
+            if (!pointDistributionChart) {
+                const ctx = document.getElementById('pointDistributionChart').getContext('2d');
+                pointDistributionChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: pointDistributionLabels,
+                        datasets: [{
+                            label: '账号数量',
+                            data: pointDistributionValues,
+                            backgroundColor: 'rgba(16, 185, 129, 0.65)',
+                            borderColor: '#10b981',
+                            borderWidth: 1,
+                            borderRadius: 4
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                                ticks: { color: '#9ca3af', precision: 0 }
+                            },
+                            x: {
+                                grid: { display: false },
+                                ticks: { color: '#9ca3af' }
+                            }
+                        },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    afterLabel: (context) => {
+                                        const totalPoints = pointDistributionTotals[context.dataIndex] || 0;
+                                        return `累计点数: ${totalPoints.toLocaleString()}`;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            } else {
+                pointDistributionChart.data.labels = pointDistributionLabels;
+                pointDistributionChart.data.datasets[0].data = pointDistributionValues;
+                pointDistributionChart.update();
             }
         }
 
