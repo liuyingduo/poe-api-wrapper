@@ -700,7 +700,9 @@ def _is_depleted_error(error_text: str) -> bool:
 
 def _is_invalid_error(error_text: str) -> bool:
     lower = error_text.lower()
-    return any(token in lower for token in ("403", "forbidden", "unauthorized", "invalid", "challenge"))
+    # 避免误判网络或协议错误（如 Invalid input ConnectionInputs...）
+    invalid_tokens = ("invalid key", "invalid token", "invalid session", "invalid pbkey", "invalid cookie", "invalid credential")
+    return any(token in lower for token in ("403", "forbidden", "unauthorized", "challenge")) or any(t in lower for t in invalid_tokens)
 
 
 def _is_rate_limit_error(error_text: str) -> bool:
