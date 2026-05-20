@@ -2875,6 +2875,35 @@ async def chat_completions(
     return await _chat_completions_impl(request, data)
 
 
+async def _estimate_file_tokens(path: str) -> int:
+    if not path:
+        return 0
+    lower_path = path.lower()
+    binary_extensions = (
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".tiff",
+        ".pdf", ".zip", ".tar", ".gz", ".7z", ".rar",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flv", ".webm",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".exe", ".dll", ".so", ".dylib", ".bin"
+    )
+    if lower_path.endswith(binary_extensions):
+        return 0
+    try:
+        # Check for null byte in the first 1024 bytes to detect binary files
+        async with aiofiles.open(path, "rb") as f:
+            head = await f.read(1024)
+            if b"\x00" in head:
+                return 0
+        
+        # Read as text with utf-8, ignoring decoding errors
+        async with aiofiles.open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = await f.read()
+            return await helpers.__tokenize(content)
+    except Exception as e:
+        logger.warning("Failed to estimate tokens for file path={}: {}", path, e)
+        return 0
+
+
 async def _chat_completions_impl(
     request: Request,
     data: ChatData,
@@ -2915,140 +2944,87 @@ async def _chat_completions_impl(
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
-    input_token_count = count_chat_completion_message_tokens(messages)
-    estimated_input_points = estimate_input_points_from_tokens(
-        _pricing_for_model(model),
-        input_token_count,
-    )
-    _reject_request_if_points_exceed_limit(estimated_input_points, model=model)
-
-    session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
-    request.state.session_id = session_id
 
     # --- 消息预处理（与账号无关，只做一次）---
     text_messages, image_urls = await helpers.__split_content(messages)
-    msg_response = await message_handler(base_model, text_messages, tokens_limit)
-    prompt_tokens = await helpers.__tokenize("".join([str(message) for message in msg_response["message"]]))
 
-    if prompt_tokens > tokens_limit:
-        _openai_http_error(
-            413,
-            "request_too_large",
-            f"Your prompt exceeds the maximum context length of {tokens_limit} tokens",
-        )
-    if max_tokens and (max_tokens + prompt_tokens) > tokens_limit:
-        _openai_http_error(
-            413,
-            "request_too_large",
-            (
-                f"This model's maximum context length is {tokens_limit}. "
-                f"Request exceeds limit ({max_tokens} in max_tokens, {prompt_tokens} in prompt)"
-            ),
-        )
+    attachment_paths: List[str] = []
+    temp_files: List[str] = []
 
-    # --- 重试循环（账号相关）---
-    last_exc: Optional[HTTPException] = None
-    for attempt in range(_MAX_CHAT_ATTEMPTS):
-        is_last = attempt >= _MAX_CHAT_ATTEMPTS - 1
-
-        account_doc, lease, chat_code, chat_id = await _acquire_account_for_chat(
-            runtime,
-            session_id=session_id,
-            persistent_session=persistent_session,
-            model=model,
-            estimated_input_points=estimated_input_points,
-        )
-        account_id = str(account_doc["_id"])
-        request.state.account_id = account_id
-
-        # Premium model 检查
-        if premium_model and not bool(account_doc.get("subscription_active", False)):
-            await _finalize_account_use(
-                runtime,
-                account_id=account_id,
-                lease=lease,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                success=False,
-
-            )
-            if not is_last:
-                logger.warning(
-                    "chat_retry attempt={}/{} reason=no_subscription account_id={} model={}",
-                    attempt + 1, _MAX_CHAT_ATTEMPTS, mask_secret(account_id), model,
-                )
-                continue
-            _openai_http_error(
-                402,
-                "insufficient_credits",
-                "Premium model requires an active subscription on selected account",
-            )
-
+    # Pre-download remote attachments to count their tokens for point estimation and model validation
+    if not tools and image_urls:
         try:
-            client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
+            attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
         except Exception as exc:
-            error_decision = await _account_error_payload(
-                account_id=account_id,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                exc=exc,
-            )
-            await _finalize_account_use(
-                runtime,
-                account_id=account_id,
-                lease=lease,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                success=False,
-                error_decision=error_decision,
-
-            )
-            if not is_last:
-                logger.warning(
-                    "chat_retry attempt={}/{} status={} account_id={} model={}",
-                    attempt + 1, _MAX_CHAT_ATTEMPTS, error_decision.status_code, mask_secret(account_id), model,
-                )
-                continue
-            raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
-
-        # 重试时降级模型
-        if attempt > 0:
-            retry_bot = _downgrade_bot_for_retry(msg_response["bot"])
-            response = {**msg_response, "bot": retry_bot}
-            logger.warning(
-                "chat_retry downgrade bot={} -> {} model={}",
-                msg_response["bot"], retry_bot, model,
-            )
-        else:
-            response = msg_response
-
-        # Tool calls（依赖 client）
-        raw_tool_calls = None
-        if tools:
-            raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
-        if raw_tool_calls:
-            response = {"bot": "gpt4_o_mini", "message": ""}
-            prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
-
-        completion_id = await helpers.__generate_completion_id()
-
-        attachment_paths: List[str] = []
-        temp_files: List[str] = []
-        if not raw_tool_calls and image_urls:
-            try:
-                attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
-            except HTTPException:
-                await _finalize_account_use(
-                    runtime,
-                    account_id=account_id,
-                    lease=lease,
-                    session_id=session_id,
-                    persistent_session=persistent_session,
-                    success=False,
-    
-                )
+            _cleanup_temp_files(temp_files)
+            if isinstance(exc, HTTPException):
                 raise
-            except Exception as exc:
+            detail = str(exc).strip()
+            error_text = type(exc).__name__
+            if detail:
+                error_text = f"{error_text}: {detail}"
+            _openai_http_error(
+                400,
+                "invalid_request_error",
+                f"Failed to process attachments: {error_text}",
+            )
+
+    try:
+        # Calculate token count from text attachments if any
+        extra_tokens = 0
+        for path in attachment_paths:
+            extra_tokens += await _estimate_file_tokens(path)
+
+        input_token_count = count_chat_completion_message_tokens(messages) + extra_tokens
+        estimated_input_points = estimate_input_points_from_tokens(
+            _pricing_for_model(model),
+            input_token_count,
+        )
+
+        _reject_request_if_points_exceed_limit(estimated_input_points, model=model)
+
+        session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
+        request.state.session_id = session_id
+
+        msg_response = await message_handler(base_model, text_messages, tokens_limit)
+        prompt_tokens = await helpers.__tokenize("".join([str(message) for message in msg_response["message"]]))
+
+        # Add the extra tokens from text files to the prompt tokens validation too
+        total_prompt_tokens = prompt_tokens + extra_tokens
+
+        if total_prompt_tokens > tokens_limit:
+            _openai_http_error(
+                413,
+                "request_too_large",
+                f"Your prompt (including file attachments) exceeds the maximum context length of {tokens_limit} tokens",
+            )
+        if max_tokens and (max_tokens + total_prompt_tokens) > tokens_limit:
+            _openai_http_error(
+                413,
+                "request_too_large",
+                (
+                    f"This model's maximum context length is {tokens_limit}. "
+                    f"Request exceeds limit ({max_tokens} in max_tokens, {total_prompt_tokens} in prompt/attachments)"
+                ),
+            )
+
+        # --- 重试循环（账号相关）---
+        last_exc: Optional[HTTPException] = None
+        for attempt in range(_MAX_CHAT_ATTEMPTS):
+            is_last = attempt >= _MAX_CHAT_ATTEMPTS - 1
+
+            account_doc, lease, chat_code, chat_id = await _acquire_account_for_chat(
+                runtime,
+                session_id=session_id,
+                persistent_session=persistent_session,
+                model=model,
+                estimated_input_points=estimated_input_points,
+            )
+            account_id = str(account_doc["_id"])
+            request.state.account_id = account_id
+
+            # Premium model 检查
+            if premium_model and not bool(account_doc.get("subscription_active", False)):
                 await _finalize_account_use(
                     runtime,
                     account_id=account_id,
@@ -3056,88 +3032,178 @@ async def _chat_completions_impl(
                     session_id=session_id,
                     persistent_session=persistent_session,
                     success=False,
-    
                 )
-                detail = str(exc).strip()
-                error_text = type(exc).__name__
-                if detail:
-                    error_text = f"{error_text}: {detail}"
+                if not is_last:
+                    logger.warning(
+                        "chat_retry attempt={}/{} reason=no_subscription account_id={} model={}",
+                        attempt + 1, _MAX_CHAT_ATTEMPTS, mask_secret(account_id), model,
+                    )
+                    continue
                 _openai_http_error(
-                    400,
-                    "invalid_request_error",
-                    f"Failed to process attachments: {error_text}",
+                    402,
+                    "insufficient_credits",
+                    "Premium model requires an active subscription on selected account",
                 )
 
-        upload_bot_id: Optional[int] = None
-        if attachment_paths:
             try:
-                upload_bot_id = await _ensure_bot_id_for_upload(runtime, client, response["bot"])
+                client = await runtime.pool.get_client_for_account(account_doc, create_if_missing=False)
             except Exception as exc:
-                logger.warning(
-                    "Failed to resolve upload botId model={} bot={} account_id={} error={}",
-                    model,
-                    response.get("bot"),
-                    mask_secret(account_id),
-                    exc,
+                error_decision = await _account_error_payload(
+                    account_id=account_id,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    exc=exc,
                 )
-                upload_bot_id = None
-
-        if streaming:
-            return await streaming_response(
-                runtime=runtime,
-                client=client,
-                response=response,
-                model=model,
-                completion_id=completion_id,
-                prompt_tokens=prompt_tokens,
-                attachment_paths=attachment_paths,
-                temp_files=temp_files,
-                max_tokens=max_tokens,
-                include_usage=include_usage,
-                raw_tool_calls=raw_tool_calls,
-                chat_code=chat_code,
-                chat_id=chat_id,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                account_id=account_id,
-                lease=lease,
-                chat_parameters=chat_parameters,
-                upload_bot_id=upload_bot_id,
-            )
-
-        try:
-            return await non_streaming_response(
-                runtime=runtime,
-                client=client,
-                response=response,
-                model=model,
-                completion_id=completion_id,
-                prompt_tokens=prompt_tokens,
-                attachment_paths=attachment_paths,
-                temp_files=temp_files,
-                max_tokens=max_tokens,
-                raw_tool_calls=raw_tool_calls,
-                chat_code=chat_code,
-                chat_id=chat_id,
-                session_id=session_id,
-                persistent_session=persistent_session,
-                account_id=account_id,
-                lease=lease,
-                chat_parameters=chat_parameters,
-                upload_bot_id=upload_bot_id,
-            )
-        except HTTPException as exc:
-            # non_streaming_response 已在 finally 中完成了账号清理
-            last_exc = exc
-            if not is_last and exc.status_code in _RETRYABLE_STATUS_CODES:
-                logger.warning(
-                    "chat_retry attempt={}/{} status={} account_id={} model={}",
-                    attempt + 1, _MAX_CHAT_ATTEMPTS, exc.status_code, mask_secret(account_id), model,
+                await _finalize_account_use(
+                    runtime,
+                    account_id=account_id,
+                    lease=lease,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    success=False,
+                    error_decision=error_decision,
                 )
-                continue
-            raise
+                if not is_last:
+                    logger.warning(
+                        "chat_retry attempt={}/{} status={} account_id={} model={}",
+                        attempt + 1, _MAX_CHAT_ATTEMPTS, error_decision.status_code, mask_secret(account_id), model,
+                    )
+                    continue
+                raise HTTPException(status_code=error_decision.status_code, detail=error_decision.payload)
 
-    raise last_exc  # type: ignore[misc]
+            # 重试时降级模型
+            if attempt > 0:
+                retry_bot = _downgrade_bot_for_retry(msg_response["bot"])
+                response = {**msg_response, "bot": retry_bot}
+                logger.warning(
+                    "chat_retry downgrade bot={} -> {} model={}",
+                    msg_response["bot"], retry_bot, model,
+                )
+            else:
+                response = msg_response
+
+            # Tool calls（依赖 client）
+            raw_tool_calls = None
+            if tools:
+                raw_tool_calls = await call_tools(client, text_messages, tools, tool_choice)
+            if raw_tool_calls:
+                response = {"bot": "gpt4_o_mini", "message": ""}
+                prompt_tokens = await helpers.__tokenize("".join([str(message["content"]) for message in text_messages]))
+
+            completion_id = await helpers.__generate_completion_id()
+
+            # Ensure attachments are materialized on disk (in case they were deleted by a previous attempt's cleanup)
+            loop_attachment_paths = []
+            loop_temp_files = []
+            if not raw_tool_calls and image_urls:
+                any_missing = any(not os.path.exists(path) for path in attachment_paths)
+                if any_missing or not attachment_paths:
+                    try:
+                        attachment_paths, temp_files = await _materialize_remote_attachments(image_urls)
+                    except HTTPException:
+                        await _finalize_account_use(
+                            runtime,
+                            account_id=account_id,
+                            lease=lease,
+                            session_id=session_id,
+                            persistent_session=persistent_session,
+                            success=False,
+                        )
+                        raise
+                    except Exception as exc:
+                        await _finalize_account_use(
+                            runtime,
+                            account_id=account_id,
+                            lease=lease,
+                            session_id=session_id,
+                            persistent_session=persistent_session,
+                            success=False,
+                        )
+                        detail = str(exc).strip()
+                        error_text = type(exc).__name__
+                        if detail:
+                            error_text = f"{error_text}: {detail}"
+                        _openai_http_error(
+                            400,
+                            "invalid_request_error",
+                            f"Failed to process attachments: {error_text}",
+                        )
+                loop_attachment_paths = attachment_paths
+                loop_temp_files = temp_files
+
+            upload_bot_id: Optional[int] = None
+            if loop_attachment_paths:
+                try:
+                    upload_bot_id = await _ensure_bot_id_for_upload(runtime, client, response["bot"])
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to resolve upload botId model={} bot={} account_id={} error={}",
+                        model,
+                        response.get("bot"),
+                        mask_secret(account_id),
+                        exc,
+                    )
+                    upload_bot_id = None
+
+            if streaming:
+                return await streaming_response(
+                    runtime=runtime,
+                    client=client,
+                    response=response,
+                    model=model,
+                    completion_id=completion_id,
+                    prompt_tokens=prompt_tokens,
+                    attachment_paths=loop_attachment_paths,
+                    temp_files=temp_files,
+                    max_tokens=max_tokens,
+                    include_usage=include_usage,
+                    raw_tool_calls=raw_tool_calls,
+                    chat_code=chat_code,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    account_id=account_id,
+                    lease=lease,
+                    chat_parameters=chat_parameters,
+                    upload_bot_id=upload_bot_id,
+                )
+
+            try:
+                return await non_streaming_response(
+                    runtime=runtime,
+                    client=client,
+                    response=response,
+                    model=model,
+                    completion_id=completion_id,
+                    prompt_tokens=prompt_tokens,
+                    attachment_paths=loop_attachment_paths,
+                    temp_files=temp_files,
+                    max_tokens=max_tokens,
+                    raw_tool_calls=raw_tool_calls,
+                    chat_code=chat_code,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    persistent_session=persistent_session,
+                    account_id=account_id,
+                    lease=lease,
+                    chat_parameters=chat_parameters,
+                    upload_bot_id=upload_bot_id,
+                )
+            except HTTPException as exc:
+                # non_streaming_response 已在 finally 中完成了账号清理和文件删除
+                last_exc = exc
+                if not is_last and exc.status_code in _RETRYABLE_STATUS_CODES:
+                    logger.warning(
+                        "chat_retry attempt={}/{} status={} account_id={} model={}",
+                        attempt + 1, _MAX_CHAT_ATTEMPTS, exc.status_code, mask_secret(account_id), model,
+                    )
+                    continue
+                raise
+
+        raise last_exc  # type: ignore[misc]
+    except Exception:
+        _cleanup_temp_files(temp_files)
+        raise
 
 
 @app.api_route("/images/generations", methods=["POST", "OPTIONS"], response_model=None)

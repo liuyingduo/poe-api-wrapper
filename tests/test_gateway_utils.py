@@ -97,3 +97,24 @@ async def test_request_insufficient_points_triggers_points_sync(monkeypatch):
     assert lease.released is True
     assert pool.invalidated == []
     assert len(created_coroutines) == 1
+
+
+@pytest.mark.asyncio
+async def test_estimate_file_tokens(tmp_path):
+    # Test with text content
+    text_file = tmp_path / "test.txt"
+    text_file.write_text("Hello, this is a simple text file for testing.", encoding="utf-8")
+    tokens = await gateway_api._estimate_file_tokens(str(text_file))
+    assert tokens > 0
+
+    # Test with binary extension
+    png_file = tmp_path / "test.png"
+    png_file.write_bytes(b"\x00\x01\x02")
+    tokens = await gateway_api._estimate_file_tokens(str(png_file))
+    assert tokens == 0
+
+    # Test with null byte in the first 1024 bytes (non-standard extension)
+    bin_file = tmp_path / "test.dat"
+    bin_file.write_bytes(b"hello\x00world")
+    tokens = await gateway_api._estimate_file_tokens(str(bin_file))
+    assert tokens == 0
