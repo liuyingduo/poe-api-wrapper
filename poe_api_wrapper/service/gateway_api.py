@@ -961,11 +961,31 @@ async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str,
     try:
         while True:
             try:
-                return await runtime.selector.select_account(prewarmed_only=True)
+                account_doc, lease = await runtime.selector.select_account(prewarmed_only=True)
             except NoAccountAvailableError:
                 raise
             except CapacityLimitError:
                 await asyncio.sleep(wait_sec)
+                continue
+
+            account_id = str(account_doc["_id"])
+            active_balance_median = runtime.pool_monitor.active_balance_median()
+            if active_balance_median is None:
+                active_balance_median = await runtime.pool_monitor._refresh_active_balance_median()
+            balance = int(account_doc.get("message_point_balance", 0) or 0)
+            if active_balance_median is not None and balance < active_balance_median:
+                await lease.release()
+                await runtime.pool.invalidate_client(account_id)
+                logger.info(
+                    "Acquire skipped low-balance prewarmed account {}: balance={} median_balance={}",
+                    mask_secret(account_id),
+                    balance,
+                    int(active_balance_median),
+                )
+                await asyncio.sleep(wait_sec)
+                continue
+
+            return account_doc, lease
     finally:
         runtime.acquire_wait_counter.leave()
 

@@ -568,7 +568,6 @@ class AccountRepository:
                         "_id": 1,
                         "status": 1,
                         "message_point_balance": 1,
-                        "ever_connected": 1,
                         "cooldown_until": 1,
                     },
                 )
@@ -653,19 +652,6 @@ class AccountRepository:
 
         await self._run(_op)
 
-    async def get_used_account_balances(self) -> list[int]:
-        """返回所有 ever_connected=True 的 active 账号余额，用于计算中位数。"""
-        def _op():
-            docs = list(
-                self.accounts.find(
-                    {"ever_connected": True, "status": "active"},
-                    {"message_point_balance": 1},
-                )
-            )
-            return [int(doc.get("message_point_balance", 0) or 0) for doc in docs]
-
-        return await self._run(_op)
-
     async def get_active_account_balances(self) -> list[int]:
         """返回数据库中所有 active 账号余额，用于池内账号淘汰中位数。"""
         def _op():
@@ -678,14 +664,6 @@ class AccountRepository:
             return [int(doc.get("message_point_balance", 0) or 0) for doc in docs]
 
         return await self._run(_op)
-
-    async def mark_account_ever_connected(self, account_id: str) -> None:
-        """标记账号已成功建立过连接。"""
-        await self._run(
-            self.accounts.update_one,
-            {"_id": self._object_id(account_id)},
-            {"$set": {"ever_connected": True, "updated_at": utc_now()}},
-        )
 
     _candidate_cache: Optional[list[dict[str, Any]]] = None
     _candidate_cache_at: float = 0.0
@@ -992,22 +970,8 @@ class AccountRepository:
                         "health_score": health_score,
                         "last_refresh_at": now,
                         "updated_at": now,
-                        "ever_connected": False,  # 每日重置时重置"已使用"标记
                     }
                 },
-            )
-            return int(result.modified_count)
-
-        return await self._run(_op)
-
-    async def reset_all_ever_connected(self) -> int:
-        """重置所有账号的 ever_connected 标记为 False，用于服务启动时清理状态。"""
-        now = utc_now()
-
-        def _op() -> int:
-            result = self.accounts.update_many(
-                {},  # 所有账号
-                {"$set": {"ever_connected": False, "updated_at": now}},
             )
             return int(result.modified_count)
 
@@ -1745,10 +1709,8 @@ class PoolMonitor:
 
     补充规则：
     - 从 DB 按 _id 顺序扫描 active 账号
-    - 计算 ever_connected=True 账号的余额中位数
-    - 账号满足以下条件之一才建连：
-        1. ever_connected=False（从未连过）
-        2. ever_connected=True 且 balance >= 中位数
+    - 计算 active 账号的余额中位数
+    - 仅预热 balance >= 中位数的账号
     - 否则跳过，取下一个账号
     - 扫完一轮后从头再来（循环）
 
@@ -1992,31 +1954,17 @@ class PoolMonitor:
 
         deficit = self.target_pool_size - current_count - in_flight
 
-        # 计算中位数：有缓存则复用，避免每 5 秒全量查 DB
-        import statistics
-        now_mono = _time.monotonic()
-        if (
-            not hasattr(self, "_median_cache")
-            or now_mono - self._median_cache_at > 30.0
-            or deficit > 0
-        ):
-            used_balances = await self.repo.get_used_account_balances()
-            median_balance = float(statistics.median(used_balances)) if used_balances else 0.0
-            self._median_cache = median_balance
-            self._median_cache_at = now_mono
-            self._median_used_count = len(used_balances)
-        else:
-            median_balance = self._median_cache
-            used_balances = []  # 仅用于日志
+        median_balance = self.active_balance_median()
+        if median_balance is None:
+            median_balance = await self._refresh_active_balance_median() or 0.0
 
         proxy_region = self.proxy_rotator.current_region if self.proxy_rotator.enabled else "n/a"
         logger.info(
-            "PoolMonitor: check | pool={} connecting={} waiting={} deficit={} used_accounts={} median_balance={} proxy_region={}",
+            "PoolMonitor: check | pool={} connecting={} waiting={} deficit={} median_balance={} proxy_region={}",
             current_count,
             in_flight,
             waiting_count,
             deficit,
-            len(used_balances) or getattr(self, "_median_used_count", 0),
             int(median_balance),
             proxy_region,
         )
@@ -2072,10 +2020,8 @@ class PoolMonitor:
                 ):
                     continue
 
-                # 中位数过滤
-                ever_connected = bool(doc.get("ever_connected", False))
                 balance = int(doc.get("message_point_balance", 0) or 0)
-                if ever_connected and balance < median_balance:
+                if balance < median_balance:
                     continue
 
                 # 满足条件，启动建连任务
@@ -2137,7 +2083,6 @@ class PoolMonitor:
                 self.pool._register_reconnect_callback(account_id, client)
                 self.pool._clients[account_id] = client
                 self.pool._client_created_at[account_id] = _time.time()
-                await self.repo.mark_account_ever_connected(account_id)
                 self.proxy_rotator.record_success()
                 logger.info(
                     "PoolMonitor: connected account {} | pool_size={}",
