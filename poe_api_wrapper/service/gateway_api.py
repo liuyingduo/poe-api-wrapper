@@ -865,6 +865,8 @@ async def _finalize_account_use(
         await runtime.repo.mark_account_success(account_id)
         should_sync_points = True
     elif error_decision:
+        if error_decision.kind == "request_insufficient_points":
+            should_sync_points = True
         if error_decision.kind == "provider_timeout":
             await runtime.repo.record_account_error(
                 account_id,
