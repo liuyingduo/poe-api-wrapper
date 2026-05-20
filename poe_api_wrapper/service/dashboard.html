@@ -1,0 +1,1603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poe API Gateway 监控面板</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-color: #080c14;
+            --card-bg: rgba(17, 24, 39, 0.65);
+            --card-border: rgba(255, 255, 255, 0.05);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --accent: #3b82f6;
+            --accent-glow: rgba(59, 130, 246, 0.4);
+            --accent-gradient: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.2);
+            --warning: #f59e0b;
+            --warning-glow: rgba(245, 158, 11, 0.2);
+            --danger: #ef4444;
+            --danger-glow: rgba(239, 68, 68, 0.2);
+            --cooldown: #8b5cf6;
+            --cooldown-glow: rgba(139, 92, 246, 0.2);
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(59, 130, 246, 0.05) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(139, 92, 246, 0.05) 0%, transparent 40%);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            min-height: 100vh;
+            line-height: 1.5;
+            padding: 1.5rem;
+            overflow-x: hidden;
+        }
+
+        /* Scrollbar styles */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        /* Container */
+        .container {
+            max-width: 1440px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        /* Glassmorphism utility */
+        .glass-panel {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .header-title-section {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .logo-glow {
+            width: 12px;
+            height: 12px;
+            background: var(--success);
+            box-shadow: 0 0 12px 4px var(--success-glow);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.6; }
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.025em;
+        }
+
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .sys-badge {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.375rem 0.75rem;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .uptime-val {
+            color: var(--text-muted);
+        }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: none;
+        }
+
+        .btn-primary {
+            background: var(--accent-gradient);
+            color: white;
+            box-shadow: 0 4px 14px 0 var(--accent-glow);
+        }
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px 0 var(--accent-glow);
+        }
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-main);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.25);
+        }
+
+        select {
+            background: rgba(17, 24, 39, 0.8);
+            border: 1px solid var(--card-border);
+            color: var(--text-main);
+            padding: 0.5rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            outline: none;
+            cursor: pointer;
+        }
+
+        /* Navigation Tabs */
+        .nav-tabs {
+            display: flex;
+            gap: 0.5rem;
+            padding: 0.375rem;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            width: fit-content;
+        }
+
+        .tab-btn {
+            padding: 0.5rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border: none;
+            background: transparent;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-main);
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .tab-btn.active {
+            color: white;
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        }
+
+        /* Tab Content */
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        /* Grid Cards */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .metric-card {
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background: transparent;
+        }
+
+        .metric-card.accent::before { background: var(--accent-gradient); }
+        .metric-card.success::before { background: var(--success); }
+        .metric-card.warning::before { background: var(--warning); }
+        .metric-card.danger::before { background: var(--danger); }
+
+        .metric-title {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+        }
+
+        .metric-sub {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .sub-badge {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        /* Charts Section */
+        .charts-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+        }
+
+        @media (max-width: 1024px) {
+            .charts-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .chart-container {
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            min-height: 320px;
+        }
+
+        .chart-header {
+            font-size: 1rem;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            flex-grow: 1;
+            height: 100%;
+            width: 100%;
+        }
+
+        /* Accounts Section Controls */
+        .table-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+            padding: 1.25rem;
+        }
+
+        .search-wrapper {
+            display: flex;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 0.5rem 0.75rem;
+            width: 320px;
+            transition: border-color 0.2s ease;
+        }
+
+        .search-wrapper:focus-within {
+            border-color: var(--accent);
+        }
+
+        .search-input {
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            outline: none;
+            width: 100%;
+            font-size: 0.875rem;
+            margin-left: 0.5rem;
+        }
+
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .filters-group {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        /* Table CSS */
+        .table-panel {
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .table-wrapper {
+            overflow-x: auto;
+            width: 100%;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.875rem;
+        }
+
+        th {
+            background: rgba(255, 255, 255, 0.02);
+            color: var(--text-muted);
+            font-weight: 600;
+            padding: 1rem;
+            border-bottom: 1px solid var(--card-border);
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid var(--card-border);
+            color: var(--text-main);
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.015);
+        }
+
+        .account-row {
+            cursor: pointer;
+        }
+
+        /* Status Badge Styling */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.25rem 0.625rem;
+            border-radius: 12px;
+        }
+
+        .badge-active {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+
+        .badge-depleted {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        .badge-cooldown {
+            background: rgba(139, 92, 246, 0.15);
+            color: var(--cooldown);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+        }
+
+        .badge-invalid {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+        }
+
+        .badge-premium {
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.2) 0%, rgba(139, 92, 246, 0.2) 100%);
+            color: #fbbf24;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .badge-free {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .badge-pool {
+            background: rgba(59, 130, 246, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+        }
+
+        /* Detail expanded row */
+        .detail-row td {
+            background: rgba(0, 0, 0, 0.2) !important;
+            padding: 0;
+            border-bottom: 1px solid var(--card-border);
+        }
+
+        .detail-content {
+            padding: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            animation: slideDown 0.2s ease-out;
+        }
+
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+        }
+
+        .detail-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .detail-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        .detail-value {
+            font-size: 0.875rem;
+            font-family: var(--font-mono);
+            word-break: break-all;
+        }
+
+        .detail-error-box {
+            background: rgba(239, 68, 68, 0.06);
+            border: 1px solid rgba(239, 68, 68, 0.15);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            color: #fca5a5;
+            font-family: var(--font-mono);
+            font-size: 0.8125rem;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        /* Tooltip copy functionality */
+        .copy-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 0.25rem;
+            border-radius: 4px;
+            margin-left: 0.25rem;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .copy-btn:hover {
+            color: white;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        /* Spinner for refreshing */
+        .spin {
+            animation: rotation 1s infinite linear;
+        }
+
+        @keyframes rotation {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(350deg); }
+        }
+
+        /* Realtime Logs Terminal */
+        .terminal-panel {
+            display: flex;
+            flex-direction: column;
+            height: 60vh;
+            min-height: 480px;
+            overflow: hidden;
+        }
+
+        .terminal-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+            background: rgba(255, 255, 255, 0.01);
+        }
+
+        .terminal-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .terminal-body {
+            background: #040711;
+            flex-grow: 1;
+            padding: 1.25rem;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 0.8125rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.375rem;
+            color: #d1d5db;
+        }
+
+        .log-line {
+            white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.4;
+        }
+
+        .log-debug { color: #6b7280; }
+        .log-info { color: #34d399; }
+        .log-warn { color: #fbbf24; }
+        .log-error { color: #f87171; }
+
+        /* Configuration Tab Grid */
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 1.5rem;
+        }
+
+        @media (max-width: 640px) {
+            .config-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .config-card {
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+        }
+
+        .config-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            padding-bottom: 0.75rem;
+        }
+
+        .config-label {
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .config-desc {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.125rem;
+        }
+
+        .config-value {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--accent);
+            font-family: var(--font-mono);
+        }
+
+        /* Utility classes */
+        .flex-center {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .text-center {
+            text-align: center;
+        }
+
+        .no-data {
+            padding: 3rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .dot-green { background-color: var(--success); }
+        .dot-red { background-color: var(--danger); }
+        .dot-orange { background-color: var(--warning); }
+        .dot-purple { background-color: var(--cooldown); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="glass-panel">
+            <div class="header-title-section">
+                <div class="logo-glow"></div>
+                <div>
+                    <h1>Poe API Gateway 监控面板</h1>
+                    <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.125rem;">实时监控、额度管理与系统日志</p>
+                </div>
+            </div>
+            
+            <div class="header-controls">
+                <div class="sys-badge">
+                    <span>状态:</span>
+                    <span id="gateway-status" class="flex-center">
+                        <span class="dot dot-green"></span>
+                        <span style="color: var(--success); font-weight: 600;">运行中</span>
+                    </span>
+                </div>
+                <div class="sys-badge">
+                    <span>在线账号:</span>
+                    <span id="ready-accounts-count" style="font-weight: 600;">- / -</span>
+                </div>
+                <div class="sys-badge">
+                    <span>运行时长:</span>
+                    <span id="sys-uptime" class="uptime-val">获取中...</span>
+                </div>
+                <select id="auto-refresh-select">
+                    <option value="5000">自动刷新: 5 秒</option>
+                    <option value="10000" selected>自动刷新: 10 秒</option>
+                    <option value="30000">自动刷新: 30 秒</option>
+                    <option value="0">自动刷新: 关闭</option>
+                </select>
+                <button id="refresh-all-btn" class="btn btn-primary">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                    刷新所有账号
+                </button>
+            </div>
+        </header>
+
+        <!-- Navigation Tabs -->
+        <div class="nav-tabs">
+            <button class="tab-btn active" data-tab="tab-overview">概览与账号</button>
+            <button class="tab-btn" data-tab="tab-system">系统配置</button>
+            <button class="tab-btn" data-tab="tab-logs">实时日志</button>
+        </div>
+
+        <!-- TAB: Overview & Accounts -->
+        <div id="tab-overview" class="tab-content active">
+            <!-- Metrics Grid -->
+            <div class="metrics-grid">
+                <div class="metric-card glass-panel accent">
+                    <div class="metric-title">
+                        <span>总剩余额度 (积分)</span>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                    </div>
+                    <div class="metric-value" id="stat-total-points">0</div>
+                    <div class="metric-sub" id="stat-points-sub">
+                        <span>活动额度: <span class="sub-badge" id="stat-active-points">0</span></span>
+                    </div>
+                </div>
+
+                <div class="metric-card glass-panel success">
+                    <div class="metric-title">
+                        <span>账号状况分布</span>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    </div>
+                    <div class="metric-value" id="stat-total-accounts">0</div>
+                    <div class="metric-sub">
+                        <span class="flex-center"><span class="dot dot-green"></span> 活跃:<span id="count-active">0</span></span>
+                        <span class="flex-center"><span class="dot dot-red"></span> 耗尽:<span id="count-depleted">0</span></span>
+                        <span class="flex-center"><span class="dot dot-purple"></span> 冷却:<span id="count-cooldown">0</span></span>
+                        <span class="flex-center"><span class="dot dot-orange"></span> 失效:<span id="count-invalid">0</span></span>
+                    </div>
+                </div>
+
+                <div class="metric-card glass-panel warning">
+                    <div class="metric-title">
+                        <span>连接池负载 (Warm Clients)</span>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                    </div>
+                    <div class="metric-value" id="stat-pool-active">0 <span style="font-size: 1.1rem; color: var(--text-muted); font-weight: normal;">/ <span id="stat-pool-target">0</span></span></div>
+                    <div class="metric-sub">
+                        <span>并发建连中: <span class="sub-badge" id="stat-pool-connecting">0</span></span>
+                        <span>最大上限: <span class="sub-badge" id="stat-pool-max">0</span></span>
+                    </div>
+                </div>
+
+                <div class="metric-card glass-panel danger">
+                    <div class="metric-title">
+                        <span>实时请求与流控</span>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11.03a6.25 6.25 0 0 0-4-5A5.82 5.82 0 0 0 8.02 8a6.3 6.3 0 0 0-3 5.03"/><path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"/></svg>
+                    </div>
+                    <div class="metric-value" id="stat-global-inflight">0 <span style="font-size: 1.1rem; color: var(--text-muted); font-weight: normal;">/ <span id="stat-global-limit">0</span></span></div>
+                    <div class="metric-sub">
+                        <span>等待队列: <span class="sub-badge" id="stat-queue-waiting">0</span></span>
+                        <span>锁定账号: <span class="sub-badge" id="stat-blocked-accounts">0</span></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Charts Row -->
+            <div class="charts-row">
+                <div class="chart-container glass-panel">
+                    <div class="chart-header">
+                        <span>各活跃账号积分分布图</span>
+                    </div>
+                    <div class="chart-wrapper">
+                        <canvas id="pointsChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-container glass-panel">
+                    <div class="chart-header">
+                        <span>账号状态比例</span>
+                    </div>
+                    <div class="chart-wrapper">
+                        <canvas id="statusChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Accounts Table -->
+            <div class="table-panel glass-panel">
+                <div class="table-controls">
+                    <div class="search-wrapper">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                        <input type="text" id="search-input" class="search-input" placeholder="输入邮箱搜索账号...">
+                    </div>
+                    <div class="filters-group">
+                        <select id="status-filter">
+                            <option value="all">所有状态 (全部)</option>
+                            <option value="active">活跃 (Active)</option>
+                            <option value="depleted">耗尽 (Depleted)</option>
+                            <option value="cooldown">冷却中 (Cooldown)</option>
+                            <option value="invalid">校验失效 (Invalid)</option>
+                        </select>
+                        <select id="sort-select">
+                            <option value="points-desc">额度降序 (高 → 低)</option>
+                            <option value="points-asc">额度升序 (低 → 高)</option>
+                            <option value="email">按邮箱排序</option>
+                            <option value="errors-desc">错误次数降序</option>
+                            <option value="inflight-desc">并发请求降序</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="table-wrapper">
+                    <table id="accounts-table">
+                        <thead>
+                            <tr>
+                                <th>邮箱地址</th>
+                                <th>积分余额</th>
+                                <th>状态</th>
+                                <th>订阅类型</th>
+                                <th>并发/锁定</th>
+                                <th>错误次数</th>
+                                <th>预热池状态</th>
+                                <th>最后成功时间</th>
+                                <th style="text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="accounts-table-body">
+                            <tr>
+                                <td colspan="9" class="text-center" style="padding: 3rem; color: var(--text-muted);">数据加载中...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB: System Stats -->
+        <div id="tab-system" class="tab-content">
+            <div class="config-grid">
+                <div class="config-card glass-panel">
+                    <h3 style="font-size: 1.1rem; font-weight: 600; border-bottom: 1px solid var(--card-border); padding-bottom: 0.75rem;">流控与并发限制</h3>
+                    <div class="config-row" style="margin-top: 0.5rem;">
+                        <div>
+                            <div class="config-label">每个账号最大并发数</div>
+                            <div class="config-desc">单个 Poe 账号允许同时发起的并发请求限制</div>
+                        </div>
+                        <div class="config-value" id="cfg-max-inflight-account">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">全局最大并发数</div>
+                            <div class="config-desc">整个网关层所能承受的最大并发总量限制</div>
+                        </div>
+                        <div class="config-value" id="cfg-global-inflight-limit">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">额度耗尽阈值</div>
+                            <div class="config-desc">低于该额度积分时账号会被置为 depleted 状态</div>
+                        </div>
+                        <div class="config-value" id="cfg-depleted-threshold">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">失败冷却时间</div>
+                            <div class="config-desc">报错触发时强制冷却的周期时长（秒）</div>
+                        </div>
+                        <div class="config-value" id="cfg-cooldown-seconds">-</div>
+                    </div>
+                </div>
+
+                <div class="config-card glass-panel">
+                    <h3 style="font-size: 1.1rem; font-weight: 600; border-bottom: 1px solid var(--card-border); padding-bottom: 0.75rem;">连接池 & 周期同步</h3>
+                    <div class="config-row" style="margin-top: 0.5rem;">
+                        <div>
+                            <div class="config-label">同步时区与重置时间</div>
+                            <div class="config-desc">每日额度积分重置的时间点与对应时区</div>
+                        </div>
+                        <div class="config-value" id="cfg-reset-tz-time">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">重置额度积分</div>
+                            <div class="config-desc">每日重置时，默认分配的新账号点数</div>
+                        </div>
+                        <div class="config-value" id="cfg-reset-points">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">连接池大小范围 (Min / Target / Max)</div>
+                            <div class="config-desc">预热池中活跃客户端数量的控制范围</div>
+                        </div>
+                        <div class="config-value" id="cfg-pool-size">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">连接池生命周期 (TTL)</div>
+                            <div class="config-desc">每个 PoeClient 创建后的最大生存期（秒）</div>
+                        </div>
+                        <div class="config-value" id="cfg-client-max-age">-</div>
+                    </div>
+                </div>
+
+                <div class="config-card glass-panel" style="grid-column: 1 / -1;">
+                    <h3 style="font-size: 1.1rem; font-weight: 600; border-bottom: 1px solid var(--card-border); padding-bottom: 0.75rem;">环境与连接信息</h3>
+                    <div class="config-row" style="margin-top: 0.5rem;">
+                        <div>
+                            <div class="config-label">数据库连接地址 (MONGODB_URI)</div>
+                            <div class="config-desc">网关所绑定的 MongoDB 实例地址与对应数据库</div>
+                        </div>
+                        <div class="config-value" id="cfg-mongodb-uri">-</div>
+                    </div>
+                    <div class="config-row">
+                        <div>
+                            <div class="config-label">当前 Poe 版本协议 (Poe Revision)</div>
+                            <div class="config-desc">网关自动或手动设定的底层 Poe 核心 Revision 值</div>
+                        </div>
+                        <div class="config-value" id="cfg-poe-revision">-</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB: Realtime Logs -->
+        <div id="tab-logs" class="tab-content">
+            <div class="terminal-panel glass-panel">
+                <div class="terminal-header">
+                    <div class="flex-center">
+                        <span class="dot dot-orange" style="animation: pulse 1.5s infinite;"></span>
+                        <span style="font-weight: 600; font-size: 0.875rem;">实时运行日志输出</span>
+                    </div>
+                    <div class="terminal-actions">
+                        <select id="log-level-filter">
+                            <option value="ALL">显示所有日志</option>
+                            <option value="DEBUG">DEBUG & 以上</option>
+                            <option value="INFO" selected>INFO & 以上</option>
+                            <option value="WARNING">WARNING & 以上</option>
+                            <option value="ERROR">ERROR 只看错误</option>
+                        </select>
+                        <select id="log-lines-select">
+                            <option value="100">100 行</option>
+                            <option value="200" selected>200 行</option>
+                            <option value="500">500 行</option>
+                            <option value="1000">1000 行</option>
+                        </select>
+                        <label class="flex-center" style="font-size: 0.8125rem; cursor: pointer; user-select: none;">
+                            <input type="checkbox" id="log-autoscroll" checked> 自动滚动
+                        </label>
+                        <button id="clear-log-btn" class="btn btn-secondary" style="padding: 0.375rem 0.75rem; font-size: 0.75rem;">
+                            清除面板
+                        </button>
+                    </div>
+                </div>
+                <div class="terminal-body" id="log-terminal">
+                    <div class="log-line log-info">终端就绪。正在连接日志源...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JS Scripts -->
+    <script>
+        // Global variables
+        let statsInterval = null;
+        let logsInterval = null;
+        let pointsChart = null;
+        let statusChart = null;
+        let rawAccounts = [];
+        let expandedAccounts = new Set();
+        let firstLoad = true;
+
+        // Dom Elements
+        const tabButtons = document.querySelectorAll('.tab-btn');
+        const tabContents = document.querySelectorAll('.tab-content');
+        const autoRefreshSelect = document.getElementById('auto-refresh-select');
+        const refreshAllBtn = document.getElementById('refresh-all-btn');
+        const searchInput = document.getElementById('search-input');
+        const statusFilter = document.getElementById('status-filter');
+        const sortSelect = document.getElementById('sort-select');
+        const accountsTableBody = document.getElementById('accounts-table-body');
+        
+        const gatewayStatus = document.getElementById('gateway-status');
+        const readyAccountsCount = document.getElementById('ready-accounts-count');
+        const sysUptime = document.getElementById('sys-uptime');
+
+        const logTerminal = document.getElementById('log-terminal');
+        const logLevelFilter = document.getElementById('log-level-filter');
+        const logLinesSelect = document.getElementById('log-lines-select');
+        const logAutoscroll = document.getElementById('log-autoscroll');
+        const clearLogBtn = document.getElementById('clear-log-btn');
+
+        // Tab selection
+        tabButtons.forEach(button => {
+            button.addEventListener('click', () => {
+                const targetTab = button.getAttribute('data-tab');
+                
+                tabButtons.forEach(btn => btn.classList.remove('active'));
+                tabContents.forEach(content => content.classList.remove('active'));
+                
+                button.classList.add('active');
+                document.getElementById(targetTab).classList.add('active');
+                
+                if (targetTab === 'tab-logs') {
+                    startLogSync();
+                } else {
+                    stopLogSync();
+                }
+            });
+        });
+
+        // Initialize Auto Refresh
+        autoRefreshSelect.addEventListener('change', (e) => {
+            const val = parseInt(e.target.value);
+            startStatsSync(val);
+        });
+
+        // Search & Filter Events
+        searchInput.addEventListener('input', renderAccountsTable);
+        statusFilter.addEventListener('change', renderAccountsTable);
+        sortSelect.addEventListener('change', renderAccountsTable);
+
+        // Action Events
+        refreshAllBtn.addEventListener('click', refreshAllAccounts);
+        clearLogBtn.addEventListener('click', () => {
+            logTerminal.innerHTML = '<div class="log-line log-info">日志面板已手动清空。</div>';
+        });
+
+        // Helper to format Uptime
+        function formatUptime(seconds) {
+            if (isNaN(seconds) || seconds < 0) return '未知';
+            const d = Math.floor(seconds / (3600*24));
+            const h = Math.floor((seconds % (3600*24)) / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            
+            const parts = [];
+            if (d > 0) parts.push(`${d}天`);
+            if (h > 0 || d > 0) parts.push(`${h}小时`);
+            if (m > 0 || h > 0 || d > 0) parts.push(`${m}分`);
+            parts.push(`${s}秒`);
+            return parts.join('');
+        }
+
+        // Format Date Time
+        function formatDateTime(isoString) {
+            if (!isoString) return '从未';
+            try {
+                const d = new Date(isoString);
+                return d.toLocaleString('zh-CN', { 
+                    month: '2-digit', 
+                    day: '2-digit', 
+                    hour: '2-digit', 
+                    minute: '2-digit', 
+                    second: '2-digit',
+                    hour12: false
+                });
+            } catch (e) {
+                return '时间错误';
+            }
+        }
+
+        // Safe Copy Utility
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert('已复制到剪贴板！');
+            }).catch(err => {
+                console.error('复制失败', err);
+            });
+        }
+
+        // Fetch Dashboard Data
+        async function fetchDashboardStats() {
+            try {
+                const response = await fetch('/admin/dashboard-stats');
+                if (response.status === 401) {
+                    gatewayStatus.innerHTML = '<span class="dot dot-red"></span><span style="color: var(--danger); font-weight: 600;">未授权</span>';
+                    return;
+                }
+                if (!response.ok) {
+                    throw new Error(`HTTP 异常: ${response.status}`);
+                }
+                const data = await response.json();
+                updateStatsUI(data);
+            } catch (error) {
+                console.error('Fetch stats failed', error);
+                gatewayStatus.innerHTML = '<span class="dot dot-red"></span><span style="color: var(--danger); font-weight:600;">连接服务器失败</span>';
+            }
+        }
+
+        // Update Stats UI elements
+        function updateStatsUI(data) {
+            // Header stats
+            gatewayStatus.innerHTML = '<span class="dot dot-green"></span><span style="color: var(--success); font-weight: 600;">运行中</span>';
+            readyAccountsCount.textContent = `${data.ready_accounts} / ${data.total_accounts}`;
+            sysUptime.textContent = formatUptime(data.uptime_seconds);
+
+            // Metrics Cards
+            document.getElementById('stat-total-points').textContent = data.total_points.toLocaleString();
+            document.getElementById('stat-active-points').textContent = data.active_points.toLocaleString();
+            
+            document.getElementById('stat-total-accounts').textContent = data.total_accounts;
+            document.getElementById('count-active').textContent = data.status_counts.active;
+            document.getElementById('count-depleted').textContent = data.status_counts.depleted;
+            document.getElementById('count-cooldown').textContent = data.status_counts.cooldown;
+            document.getElementById('count-invalid').textContent = data.status_counts.invalid;
+
+            document.getElementById('stat-pool-active').innerHTML = `${data.pool_active_clients} <span style="font-size: 1.1rem; color: var(--text-muted); font-weight: normal;">/ ${data.pool_target_size}</span>`;
+            document.getElementById('stat-pool-connecting').textContent = data.pool_connecting_count;
+            document.getElementById('stat-pool-max').textContent = data.pool_max_size;
+
+            document.getElementById('stat-global-inflight').innerHTML = `${data.global_inflight} <span style="font-size: 1.1rem; color: var(--text-muted); font-weight: normal;">/ ${data.global_inflight_limit}</span>`;
+            document.getElementById('stat-queue-waiting').textContent = data.acquire_waiting;
+            document.getElementById('stat-blocked-accounts').textContent = data.blocked_accounts_count;
+
+            // System tab configurations
+            document.getElementById('cfg-max-inflight-account').textContent = data.config.max_inflight_per_account;
+            document.getElementById('cfg-global-inflight-limit').textContent = data.config.global_inflight_limit;
+            document.getElementById('cfg-depleted-threshold').textContent = data.config.depleted_threshold;
+            document.getElementById('cfg-cooldown-seconds').textContent = `${data.config.cooldown_seconds} 秒`;
+            document.getElementById('cfg-reset-tz-time').textContent = `${data.config.daily_reset_timezone} (${data.config.daily_reset_hour}:00)`;
+            document.getElementById('cfg-reset-points').textContent = data.config.daily_reset_point_balance;
+            document.getElementById('cfg-pool-size').textContent = `Min: ${data.config.min_pool_size} / Target: ${data.config.target_pool_size} / Max: ${data.config.max_pool_size}`;
+            document.getElementById('cfg-client-max-age').textContent = `${data.config.client_max_age_seconds} 秒`;
+            document.getElementById('cfg-mongodb-uri').textContent = `${data.config.mongodb_uri} [db: ${data.config.mongodb_db}]`;
+            document.getElementById('cfg-poe-revision').textContent = data.config.default_poe_revision || '自动侦测中...';
+
+            // Accounts
+            rawAccounts = data.accounts || [];
+            renderAccountsTable();
+            
+            // Build Charts
+            updateCharts(data);
+
+            firstLoad = false;
+        }
+
+        // Render accounts table with filter and sort
+        function renderAccountsTable() {
+            const searchVal = searchInput.value.toLowerCase().trim();
+            const statusVal = statusFilter.value;
+            const sortVal = sortSelect.value;
+
+            // Filtering
+            let filtered = rawAccounts.filter(acc => {
+                const matchesSearch = acc.email.toLowerCase().includes(searchVal);
+                const matchesStatus = (statusVal === 'all') || (acc.status === statusVal);
+                return matchesSearch && matchesStatus;
+            });
+
+            // Sorting
+            filtered.sort((a, b) => {
+                if (sortVal === 'points-desc') return b.message_point_balance - a.message_point_balance;
+                if (sortVal === 'points-asc') return a.message_point_balance - b.message_point_balance;
+                if (sortVal === 'email') return a.email.localeCompare(b.email);
+                if (sortVal === 'errors-desc') return b.error_count - a.error_count;
+                if (sortVal === 'inflight-desc') return b.inflight_count - a.inflight_count;
+                return 0;
+            });
+
+            if (filtered.length === 0) {
+                accountsTableBody.innerHTML = `<tr><td colspan="9" class="no-data">没有找到符合条件的账号</td></tr>`;
+                return;
+            }
+
+            accountsTableBody.innerHTML = '';
+            filtered.forEach(acc => {
+                // Main Row
+                const row = document.createElement('tr');
+                row.className = 'account-row';
+                row.setAttribute('data-id', acc.id);
+                
+                // Status Badge class
+                let statusBadgeClass = 'badge-active';
+                let statusText = '活跃';
+                if (acc.status === 'depleted') {
+                    statusBadgeClass = 'badge-depleted';
+                    statusText = '点数耗尽';
+                } else if (acc.status === 'cooldown') {
+                    statusBadgeClass = 'badge-cooldown';
+                    statusText = '冷却中';
+                } else if (acc.status === 'invalid') {
+                    statusBadgeClass = 'badge-invalid';
+                    statusText = '检验失效';
+                }
+
+                // Premium Badge
+                const subBadge = acc.subscription_active 
+                    ? '<span class="badge badge-premium">Premium 订阅</span>' 
+                    : '<span class="badge badge-free">Free 免费</span>';
+
+                // In pool badge
+                const poolBadge = acc.in_pool 
+                    ? '<span class="badge badge-pool">池内预热</span>' 
+                    : '<span style="color: var(--text-muted); font-size:0.75rem;">空闲</span>';
+
+                // Inflight and locked display
+                let inflightText = `${acc.inflight_count} 并发`;
+                if (acc.is_blocked) {
+                    inflightText += ' | <span style="color: var(--danger); font-weight:bold;">已被锁</span>';
+                }
+
+                row.innerHTML = `
+                    <td style="font-weight: 500;">
+                        ${acc.email}
+                        <button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${acc.email}')" title="复制邮箱">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                    </td>
+                    <td style="font-family: var(--font-mono); font-weight: 600;">${acc.message_point_balance.toLocaleString()}</td>
+                    <td><span class="badge ${statusBadgeClass}">${statusText}</span></td>
+                    <td>${subBadge}</td>
+                    <td>${inflightText}</td>
+                    <td style="font-family: var(--font-mono);">${acc.error_count} 次</td>
+                    <td>${poolBadge}</td>
+                    <td style="color: var(--text-muted);">${formatDateTime(acc.last_success_at)}</td>
+                    <td style="text-align: right;" onclick="event.stopPropagation();">
+                        <button class="btn btn-secondary refresh-single-btn" data-email="${acc.email}" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; font-weight: normal;">
+                            <svg width="12" height="12" class="icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                            刷新额度
+                        </button>
+                    </td>
+                `;
+
+                // Add Toggle detail row event
+                row.addEventListener('click', () => toggleAccountDetails(acc.id, acc));
+                accountsTableBody.appendChild(row);
+
+                // If currently expanded, render the detail row too
+                if (expandedAccounts.has(acc.id)) {
+                    renderDetailRow(acc);
+                }
+            });
+
+            // Bind single refresh actions
+            document.querySelectorAll('.refresh-single-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const email = btn.getAttribute('data-email');
+                    refreshSingleAccount(email, btn);
+                });
+            });
+        }
+
+        // Toggle Expand Account detail row
+        function toggleAccountDetails(id, acc) {
+            if (expandedAccounts.has(id)) {
+                expandedAccounts.delete(id);
+                const detailRow = document.getElementById(`detail-${id}`);
+                if (detailRow) detailRow.remove();
+            } else {
+                expandedAccounts.add(id);
+                renderDetailRow(acc);
+            }
+        }
+
+        // Helper to render expanded detail row
+        function renderDetailRow(acc) {
+            const prevRow = document.querySelector(`tr[data-id="${acc.id}"]`);
+            if (!prevRow) return;
+
+            const detailRow = document.createElement('tr');
+            detailRow.id = `detail-${acc.id}`;
+            detailRow.className = 'detail-row';
+            
+            // Format cooldown time
+            let cooldownInfo = '无';
+            if (acc.cooldown_until) {
+                const timeDiff = new Date(acc.cooldown_until) - new Date();
+                if (timeDiff > 0) {
+                    const min = Math.ceil(timeDiff / 60000);
+                    cooldownInfo = `${formatDateTime(acc.cooldown_until)} (冷却剩余约 ${min} 分钟)`;
+                } else {
+                    cooldownInfo = '冷却期已过';
+                }
+            }
+
+            let errorBoxHtml = '';
+            if (acc.last_error) {
+                errorBoxHtml = `
+                    <div style="margin-top: 0.5rem;">
+                        <span class="detail-label" style="color: var(--danger)">最近一次报错日志 Traceback:</span>
+                        <div class="detail-error-box">${acc.last_error}</div>
+                    </div>
+                `;
+            }
+
+            detailRow.innerHTML = `
+                <td colspan="9">
+                    <div class="detail-content">
+                        <div class="detail-grid">
+                            <div class="detail-item">
+                                <span class="detail-label">账户ID</span>
+                                <span class="detail-value">${acc.id}</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">健康评分 (Health Score)</span>
+                                <span class="detail-value" style="color: ${acc.health_score > 70 ? 'var(--success)' : acc.health_score > 30 ? 'var(--warning)' : 'var(--danger)'}">${acc.health_score.toFixed(1)} / 100.0</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">最后更新/刷新时间</span>
+                                <span class="detail-value">${formatDateTime(acc.last_refresh_at)}</span>
+                            </div>
+                            <div class="detail-item">
+                                <span class="detail-label">冷却结束时间</span>
+                                <span class="detail-value" style="color: ${acc.status === 'cooldown' ? 'var(--cooldown)' : 'inherit'}">${cooldownInfo}</span>
+                            </div>
+                        </div>
+                        ${errorBoxHtml}
+                    </div>
+                </td>
+            `;
+
+            prevRow.after(detailRow);
+        }
+
+        // Initialize and Update Charts
+        function updateCharts(data) {
+            // 1. Doughnut Status Chart
+            const statusLabels = ['活跃 (Active)', '耗尽 (Depleted)', '冷却中 (Cooldown)', '校验失效 (Invalid)'];
+            const statusValues = [
+                data.status_counts.active,
+                data.status_counts.depleted,
+                data.status_counts.cooldown,
+                data.status_counts.invalid
+            ];
+
+            if (!statusChart) {
+                const ctx = document.getElementById('statusChart').getContext('2d');
+                statusChart = new Chart(ctx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: statusLabels,
+                        datasets: [{
+                            data: statusValues,
+                            backgroundColor: ['#10b981', '#ef4444', '#8b5cf6', '#f59e0b'],
+                            borderWidth: 1,
+                            borderColor: 'rgba(255,255,255,0.05)'
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'bottom',
+                                labels: { color: '#9ca3af', font: { family: 'Inter', size: 11 } }
+                            }
+                        }
+                    }
+                });
+            } else {
+                statusChart.data.datasets[0].data = statusValues;
+                statusChart.update();
+            }
+
+            // 2. Bar Points Chart for top accounts
+            const sortedActive = (data.accounts || [])
+                .filter(a => a.status === 'active')
+                .sort((a,b) => b.message_point_balance - a.message_point_balance)
+                .slice(0, 15); // Show top 15
+
+            const pointsLabels = sortedActive.map(a => a.email.split('@')[0]);
+            const pointsValues = sortedActive.map(a => a.message_point_balance);
+
+            if (!pointsChart) {
+                const ctx = document.getElementById('pointsChart').getContext('2d');
+                pointsChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: pointsLabels,
+                        datasets: [{
+                            label: '剩余积分 (限前 15 名)',
+                            data: pointsValues,
+                            backgroundColor: 'rgba(59, 130, 246, 0.65)',
+                            borderColor: '#3b82f6',
+                            borderWidth: 1,
+                            borderRadius: 4
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                                ticks: { color: '#9ca3af' }
+                            },
+                            x: {
+                                grid: { display: false },
+                                ticks: { color: '#9ca3af', maxRotation: 45, minRotation: 45 }
+                            }
+                        },
+                        plugins: {
+                            legend: { display: false }
+                        }
+                    }
+                });
+            } else {
+                pointsChart.data.labels = pointsLabels;
+                pointsChart.data.datasets[0].data = pointsValues;
+                pointsChart.update();
+            }
+        }
+
+        // Action: Refresh single account points
+        async function refreshSingleAccount(email, btn) {
+            const svgIcon = btn.querySelector('.icon-refresh');
+            if (svgIcon) svgIcon.classList.add('spin');
+            btn.disabled = true;
+            btn.style.opacity = '0.5';
+
+            try {
+                const response = await fetch('/admin/accounts/refresh-points', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email: email })
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json();
+                    throw new Error(errData.error?.message || `状态码: ${response.status}`);
+                }
+
+                alert(`账号 ${email} 额度刷新成功！`);
+                // Reload dashboard data
+                await fetchDashboardStats();
+            } catch (err) {
+                alert(`刷新失败: ${err.message}`);
+            } finally {
+                if (svgIcon) svgIcon.classList.remove('spin');
+                btn.disabled = false;
+                btn.style.opacity = '1';
+            }
+        }
+
+        // Action: Refresh all accounts
+        async function refreshAllAccounts() {
+            if (!confirm('确定要发起全局刷新所有账号点数吗？该操作是后台异步进行的。')) {
+                return;
+            }
+
+            refreshAllBtn.disabled = true;
+            const originalHtml = refreshAllBtn.innerHTML;
+            refreshAllBtn.innerHTML = `<svg width="14" height="14" class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg> 正在发起重刷新...`;
+
+            try {
+                const response = await fetch('/admin/accounts/refresh-all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ concurrency: 5 })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP 状态码: ${response.status}`);
+                }
+
+                const result = await response.json();
+                alert(`后台全局刷新任务已成功下发！总数: ${result.total_scheduled}。正在进行异步拉取，可以在日志面板观察进度。`);
+                await fetchDashboardStats();
+            } catch (err) {
+                alert(`刷新失败: ${err.message}`);
+            } finally {
+                refreshAllBtn.disabled = false;
+                refreshAllBtn.innerHTML = originalHtml;
+            }
+        }
+
+        // Log Console Handler
+        async function fetchLogs() {
+            try {
+                const lines = logLinesSelect.value;
+                const response = await fetch(`/admin/logs?lines=${lines}`);
+                if (!response.ok) return;
+                const data = await response.json();
+                
+                const currentFilter = logLevelFilter.value;
+                
+                let html = '';
+                const logRows = data.logs || [];
+                
+                logRows.forEach(line => {
+                    const lowerLine = line.toLowerCase();
+                    let lineLevel = 'INFO';
+                    
+                    if (lowerLine.includes('| debug |') || lowerLine.includes('debug')) {
+                        lineLevel = 'DEBUG';
+                    } else if (lowerLine.includes('| warning |') || lowerLine.includes('warning') || lowerLine.includes('warn')) {
+                        lineLevel = 'WARNING';
+                    } else if (lowerLine.includes('| error |') || lowerLine.includes('error') || lowerLine.includes('exception') || lowerLine.includes('critical')) {
+                        lineLevel = 'ERROR';
+                    }
+
+                    // Level Filter match check
+                    let display = true;
+                    if (currentFilter === 'DEBUG' && lineLevel === 'NONE') display = false;
+                    if (currentFilter === 'INFO' && lineLevel === 'DEBUG') display = false;
+                    if (currentFilter === 'WARNING' && (lineLevel === 'DEBUG' || lineLevel === 'INFO')) display = false;
+                    if (currentFilter === 'ERROR' && lineLevel !== 'ERROR') display = false;
+
+                    if (display) {
+                        let levelClass = 'log-info';
+                        if (lineLevel === 'DEBUG') levelClass = 'log-debug';
+                        if (lineLevel === 'WARNING') levelClass = 'log-warn';
+                        if (lineLevel === 'ERROR') levelClass = 'log-error';
+
+                        // Escape HTML characters
+                        const safeLine = line
+                            .replace(/&/g, "&amp;")
+                            .replace(/</g, "&lt;")
+                            .replace(/>/g, "&gt;");
+                        
+                        html += `<div class="log-line ${levelClass}">${safeLine}</div>`;
+                    }
+                });
+
+                if (!html) {
+                    html = '<div class="log-line log-debug">没有匹配当前过滤器的日志记录。</div>';
+                }
+
+                const prevHeight = logTerminal.scrollHeight;
+                logTerminal.innerHTML = html;
+
+                // Auto Scroll logic
+                if (logAutoscroll.checked) {
+                    logTerminal.scrollTop = logTerminal.scrollHeight;
+                }
+            } catch (err) {
+                console.error('Fetch logs failed', err);
+            }
+        }
+
+        // Start/Stop log sync timers
+        function startLogSync() {
+            if (logsInterval) clearInterval(logsInterval);
+            fetchLogs();
+            logsInterval = setInterval(fetchLogs, 3000);
+        }
+
+        function stopLogSync() {
+            if (logsInterval) {
+                clearInterval(logsInterval);
+                logsInterval = null;
+            }
+        }
+
+        // Start/Stop stats sync timers
+        function startStatsSync(ms) {
+            if (statsInterval) clearInterval(statsInterval);
+            fetchDashboardStats();
+            
+            if (ms > 0) {
+                statsInterval = setInterval(fetchDashboardStats, ms);
+            }
+        }
+
+        // Entry point init
+        document.addEventListener('DOMContentLoaded', () => {
+            // Initial fetch stats
+            startStatsSync(10000);
+
+            // Level and lines change hooks for logs
+            logLevelFilter.addEventListener('change', fetchLogs);
+            logLinesSelect.addEventListener('change', fetchLogs);
+        });
+    </script>
+</body>
+</html>

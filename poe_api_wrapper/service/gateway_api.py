@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import math
@@ -36,7 +36,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from httpx import AsyncClient
@@ -947,6 +947,7 @@ async def startup_event() -> None:
         acquire_wait_counter=acquire_wait_counter,
     )
     app.state.runtime = runtime
+    app.state.startup_time = utc_now()
 
     await repo.init_indexes()
     await repo.bootstrap_service_keys(config.service_api_keys_bootstrap)
@@ -1268,6 +1269,160 @@ async def admin_reload_models(source: str = Query(default="poe", description="po
         result.get("source", "unknown"),
     )
     return JSONResponse(result)
+
+
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+async def admin_dashboard() -> HTMLResponse:
+    dashboard_path = Path(__file__).resolve().parent / "dashboard.html"
+    if not dashboard_path.exists():
+        raise HTTPException(status_code=404, detail="dashboard.html not found")
+    async with aiofiles.open(dashboard_path, mode="r", encoding="utf-8") as f:
+        content = await f.read()
+    return HTMLResponse(content=content)
+
+
+@app.get("/admin/dashboard-stats", response_model=None)
+async def admin_dashboard_stats() -> JSONResponse:
+    runtime = _runtime()
+    now = utc_now()
+
+    # 1. Server Uptime
+    startup_time = getattr(app.state, "startup_time", None)
+    uptime_seconds = int((now - startup_time).total_seconds()) if startup_time else 0
+
+    # 2. Get Accounts
+    def _get_accounts_op():
+        return list(runtime.repo.accounts.find({}))
+    accounts_docs = await runtime.repo._run(_get_accounts_op)
+
+    # 3. Sum Points and Status
+    total_points = 0
+    active_points = 0
+    status_counts = {"active": 0, "depleted": 0, "cooldown": 0, "invalid": 0}
+
+    # 4. Get active clients & connecting set
+    active_clients = runtime.pool.cached_account_ids()
+    connecting_ids = list(runtime.pool_monitor._connecting) if hasattr(runtime.pool_monitor, "_connecting") else []
+
+    # 5. Get current inflight and blocked
+    global_inflight = runtime.limiter._global_inflight
+    account_inflight = dict(runtime.limiter._account_inflight)
+    blocked_accounts = list(runtime.limiter._blocked_accounts)
+
+    # 6. Build accounts list
+    accounts_list = []
+    for doc in accounts_docs:
+        account_id = str(doc["_id"])
+        email = doc.get("email", "")
+        status = doc.get("status", "active")
+        balance = int(doc.get("message_point_balance", 0) or 0)
+        sub_active = bool(doc.get("subscription_active", False))
+        health_score = float(doc.get("health_score", 0.0) or 0.0)
+
+        # Status counts
+        if status in status_counts:
+            status_counts[status] += 1
+        else:
+            status_counts["active"] += 1  # default is active
+
+        total_points += balance
+        if status == "active":
+            active_points += balance
+
+        cooldown_until = doc.get("cooldown_until")
+        cooldown_until_str = cooldown_until.isoformat() if isinstance(cooldown_until, datetime) else None
+        last_success_at = doc.get("last_success_at")
+        last_refresh_at = doc.get("last_refresh_at")
+
+        accounts_list.append({
+            "id": account_id,
+            "email": email,
+            "status": status,
+            "message_point_balance": balance,
+            "subscription_active": sub_active,
+            "health_score": health_score,
+            "cooldown_until": cooldown_until_str,
+            "last_success_at": last_success_at.isoformat() if isinstance(last_success_at, datetime) else None,
+            "last_refresh_at": last_refresh_at.isoformat() if isinstance(last_refresh_at, datetime) else None,
+            "last_error": doc.get("last_error"),
+            "error_count": int(doc.get("error_count", 0) or 0),
+            "inflight_count": account_inflight.get(account_id, 0),
+            "in_pool": account_id in active_clients,
+            "is_blocked": account_id in blocked_accounts
+        })
+
+    # 7. Get ready accounts count
+    ready_accounts = await runtime.repo.count_ready_accounts()
+
+    return JSONResponse({
+        "ready_accounts": ready_accounts,
+        "total_accounts": len(accounts_docs),
+        "uptime_seconds": uptime_seconds,
+        "total_points": total_points,
+        "active_points": active_points,
+        "status_counts": status_counts,
+        "pool_active_clients": len(active_clients),
+        "pool_target_size": runtime.pool_monitor.target_pool_size if hasattr(runtime.pool_monitor, "target_pool_size") else runtime.config.target_pool_size,
+        "pool_max_size": runtime.pool_monitor.max_pool_size if hasattr(runtime.pool_monitor, "max_pool_size") else runtime.config.max_pool_size,
+        "pool_connecting_count": len(connecting_ids),
+        "global_inflight": global_inflight,
+        "global_inflight_limit": runtime.limiter.global_inflight_limit,
+        "acquire_waiting": runtime.acquire_wait_counter.value() if hasattr(runtime, "acquire_wait_counter") else 0,
+        "blocked_accounts_count": len(blocked_accounts),
+        "accounts": accounts_list,
+        "config": {
+            "max_inflight_per_account": runtime.config.max_inflight_per_account,
+            "global_inflight_limit": runtime.config.global_inflight_limit,
+            "depleted_threshold": runtime.config.depleted_threshold,
+            "cooldown_seconds": runtime.config.cooldown_seconds,
+            "daily_reset_timezone": runtime.config.daily_reset_timezone,
+            "daily_reset_hour": runtime.config.daily_reset_hour,
+            "daily_reset_point_balance": runtime.config.daily_reset_point_balance,
+            "min_pool_size": runtime.config.min_pool_size,
+            "target_pool_size": runtime.config.target_pool_size,
+            "max_pool_size": runtime.config.max_pool_size,
+            "client_max_age_seconds": runtime.config.client_max_age_seconds,
+            "mongodb_uri": mask_secret(runtime.config.mongodb_uri, keep=12),
+            "mongodb_db": runtime.config.mongodb_db,
+            "default_poe_revision": runtime.config.default_poe_revision
+        }
+    })
+
+
+@app.get("/admin/logs", response_model=None)
+async def admin_get_logs(lines: int = Query(default=200, ge=10, le=1000)) -> JSONResponse:
+    log_file_base = Path(os.environ.get("POE_GATEWAY_LOG_FILE", "log/poe-gateway.log")).expanduser()
+    log_dir = log_file_base.parent
+    if not log_dir.exists():
+        return JSONResponse({"logs": [], "error": f"Log directory {log_dir} does not exist"})
+
+    pattern = f"{log_file_base.stem}.*{log_file_base.suffix}"
+    log_files = sorted(
+        [f for f in log_dir.glob(pattern) if f.is_file()],
+        key=lambda x: x.stat().st_mtime,
+        reverse=True
+    )
+
+    if not log_files:
+        if log_file_base.exists():
+            log_files = [log_file_base]
+        else:
+            return JSONResponse({"logs": [], "error": "No log files found"})
+
+    logs_content = []
+    for path in log_files:
+        try:
+            async with aiofiles.open(path, mode="r", encoding="utf-8", errors="replace") as f:
+                content = await f.read()
+                file_lines = content.splitlines()
+                logs_content = file_lines + logs_content
+                if len(logs_content) >= lines:
+                    break
+        except Exception as exc:
+            logger.warning("Failed to read log file {}: {}", path, exc)
+
+    final_lines = logs_content[-lines:] if len(logs_content) > lines else logs_content
+    return JSONResponse({"logs": final_lines, "file_used": str(log_files[0])})
 
 
 @app.api_route("/models/{model}", methods=["GET", "POST", "PUT", "PATCH", "HEAD"], response_model=None)
