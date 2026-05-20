@@ -122,9 +122,14 @@ async def fetch_poe_revision(
 
         with cffi_requests.Session(**session_kwargs) as session:
             home = session.get("https://poe.com/", headers=_BROWSE_HEADERS, allow_redirects=False)
-            p_b = session.cookies.get("p-b", "") or home.cookies.get("p-b", "")
-            cf_bm = session.cookies.get("__cf_bm", "") or home.cookies.get("__cf_bm", "")
-            cf_clearance = _resolve_cf_clearance() or session.cookies.get("cf_clearance", "")
+            def _get_cookie(jar, name: str) -> str:
+                for c in jar:
+                    if c.name == name:
+                        return c.value
+                return ""
+            p_b = _get_cookie(session.cookies, "p-b") or _get_cookie(home.cookies, "p-b")
+            cf_bm = _get_cookie(session.cookies, "__cf_bm") or _get_cookie(home.cookies, "__cf_bm")
+            cf_clearance = _resolve_cf_clearance() or _get_cookie(session.cookies, "cf_clearance")
 
             logger.debug(
                 "fetch_poe_revision(curl_cffi): home status={} p_b={} cf_bm={}",

@@ -265,9 +265,9 @@ class AsyncPoeApi:
             force_refresh,
             bool(self.formkey),
             bool(self.tchannel_data),
-            bool(self.client.cookies.get("p-b")),
-            bool(self.client.cookies.get("cf_clearance")),
-            bool(self.client.cookies.get("__cf_bm")),
+            any(c.name == "p-b" for c in self.client.cookies.jar),
+            any(c.name == "cf_clearance" for c in self.client.cookies.jar),
+            any(c.name == "__cf_bm" for c in self.client.cookies.jar),
         )
 
         try:
@@ -495,6 +495,26 @@ class AsyncPoeApi:
             headers["poe-tag-id"] = hashlib.md5(base_string.encode()).hexdigest()
         return headers
 
+    def _cookie_snapshot(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self.client.cookies.jar
+        ]
+
+    @staticmethod
+    def _request_cookie_names(response) -> list[str]:
+        cookie_header = response.request.headers.get("cookie", "")
+        names = []
+        for part in cookie_header.split(";"):
+            name = part.strip().split("=", 1)[0].strip()
+            if name:
+                names.append(name)
+        return names
+
     def _build_upload_filetype_probe_headers(self) -> dict:
         keep_keys = (
             "Accept",
@@ -628,15 +648,7 @@ class AsyncPoeApi:
         )
         payload_text = orjson.dumps(payload).decode("utf-8")
         headers = self._build_receive_headers(payload_text)
-        cookie_snapshot = [
-            {
-                "name": cookie.name,
-                "domain": cookie.domain,
-                "path": cookie.path,
-            }
-            for cookie in self.client.cookies.jar
-        ]
-        logger.info("receive_POST cookies={}", cookie_snapshot)
+        logger.info("receive_POST cookies={}", self._cookie_snapshot())
         response = await self.client.post(
             f"{self.BASE_URL}/api/receive_POST",
             data=payload_text,
@@ -681,6 +693,14 @@ class AsyncPoeApi:
                     files={"file": file},
                     headers=upload_headers,
                     follow_redirects=True,
+                )
+                request_cookie_names = self._request_cookie_names(response)
+                logger.info(
+                    "finish_upload_POST cookies name={} sent_cookie_names={} has_p_b={} jar_cookies={}",
+                    file_name,
+                    request_cookie_names,
+                    "p-b" in request_cookie_names,
+                    self._cookie_snapshot(),
                 )
                 if response.status_code == 200:
                     break

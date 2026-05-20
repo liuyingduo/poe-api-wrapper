@@ -185,9 +185,9 @@ class PoeApi:
             force_refresh,
             bool(self.formkey),
             bool(self.tchannel_data),
-            bool(self.client.cookies.get("p-b")),
-            bool(self.client.cookies.get("cf_clearance")),
-            bool(self.client.cookies.get("__cf_bm")),
+            any(c.name == "p-b" for c in self.client.cookies.jar),
+            any(c.name == "cf_clearance" for c in self.client.cookies.jar),
+            any(c.name == "__cf_bm" for c in self.client.cookies.jar),
         )
 
         try:

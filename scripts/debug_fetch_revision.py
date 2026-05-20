@@ -78,9 +78,10 @@ def _preview(text: str, limit: int = 180) -> str:
 
 
 def _find_cookie_value(resp: httpx.Response, cookie_name: str) -> str:
-    value = resp.cookies.get(cookie_name)
-    if value:
-        return value
+    jar = getattr(resp.cookies, "jar", resp.cookies)
+    for c in jar:
+        if c.name == cookie_name:
+            return c.value
     for set_cookie in resp.headers.get_list("set-cookie"):
         if set_cookie.startswith(f"{cookie_name}="):
             return set_cookie.split(";", 1)[0].split("=", 1)[1]
@@ -157,8 +158,8 @@ def main() -> int:
         with cffi_requests.Session(**session_kwargs) as session:
             print("[1/2] GET https://poe.com/")
             home = session.get("https://poe.com/", headers=HEADERS, allow_redirects=False)
-            p_b = home.cookies.get("p-b", "")
-            cf_bm = home.cookies.get("__cf_bm", "")
+            p_b = _find_cookie_value(home, "p-b")
+            cf_bm = _find_cookie_value(home, "__cf_bm")
 
             print(f"  status={home.status_code}")
             print(f"  location={home.headers.get('location', '')}")
@@ -218,8 +219,13 @@ def main() -> int:
         with httpx.Client(**client_kwargs) as client:
             print("[1/2] GET https://poe.com/")
             home = client.get("https://poe.com/", headers=HEADERS)
-            p_b = client.cookies.get("p-b") or _find_cookie_value(home, "p-b")
-            cf_bm = client.cookies.get("__cf_bm") or _find_cookie_value(home, "__cf_bm")
+            def _get_cookie_from_jar(jar, name: str) -> str:
+                for c in jar:
+                    if c.name == name:
+                        return c.value
+                return ""
+            p_b = _get_cookie_from_jar(client.cookies.jar, "p-b") or _find_cookie_value(home, "p-b")
+            cf_bm = _get_cookie_from_jar(client.cookies.jar, "__cf_bm") or _find_cookie_value(home, "__cf_bm")
 
             print(f"  status={home.status_code}")
             print(f"  location={home.headers.get('location', '')}")

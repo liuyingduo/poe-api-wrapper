@@ -15,6 +15,17 @@ class FakeRepo:
     async def list_candidate_accounts(self, limit=1000):
         return self.accounts[:limit]
 
+    async def get_accounts_by_ids(self, account_ids):
+        return [a for a in self.accounts if a["_id"] in account_ids]
+
+
+class FakePool:
+    def __init__(self, account_ids):
+        self._account_ids = account_ids
+
+    def cached_account_ids_in_order(self):
+        return self._account_ids
+
 
 @pytest.mark.asyncio
 async def test_select_account_respects_top_n_pool():
@@ -27,6 +38,7 @@ async def test_select_account_respects_top_n_pool():
     selector = AccountSelector(
         repo=FakeRepo(accounts),
         limiter=RuntimeLimiter(max_inflight_per_account=2, global_inflight_limit=200),
+        pool=FakePool([a["_id"] for a in accounts]),
         top_n=2,
     )
     top_accounts = await selector._top_pool()
@@ -53,7 +65,7 @@ async def test_select_account_raises_if_no_candidates():
 async def test_select_account_capacity_limit():
     account = {"_id": "acc-1", "message_point_balance": 100, "health_score": 100.0, "error_count": 0}
     limiter = RuntimeLimiter(max_inflight_per_account=1, global_inflight_limit=1)
-    selector = AccountSelector(repo=FakeRepo([account]), limiter=limiter, top_n=100)
+    selector = AccountSelector(repo=FakeRepo([account]), limiter=limiter, pool=FakePool(["acc-1"]), top_n=100)
 
     selected, lease = await selector.select_account()
     assert selected["_id"] == "acc-1"
