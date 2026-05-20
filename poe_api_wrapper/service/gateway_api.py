@@ -573,14 +573,17 @@ async def _load_or_fetch_bot_pricing(
     runtime: "GatewayRuntime",
     client: Any,
     bots_data: list[dict[str, Any]],
+    force_refresh: bool = False,
 ) -> dict[int, dict[str, Any]]:
     bot_ids = [_bot_id_from_node(bot) for bot in bots_data if _bot_id_from_node(bot) > 0]
-    cached = await runtime.repo.get_bot_pricing_map(bot_ids)
+    cached = {}
+    if not force_refresh:
+        cached = await runtime.repo.get_bot_pricing_map(bot_ids)
 
     missing_bots = []
     for bot in bots_data:
         bot_id = _bot_id_from_node(bot)
-        if bot_id > 0 and bot_id not in cached:
+        if bot_id > 0 and (force_refresh or bot_id not in cached):
             missing_bots.append(bot)
 
     if not missing_bots:
@@ -628,7 +631,7 @@ async def _load_or_fetch_bot_pricing(
     return cached
 
 
-async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
+async def _fetch_models_from_poe(runtime: "GatewayRuntime", force_refresh_pricing: bool = False) -> dict[str, Any]:
     """
     启动/重载时直接使用可用账号临时创建 client，调用 ExploreBotsListPaginationQuery
     动态拉取 Poe `Official` 分类模型列表。
@@ -700,7 +703,7 @@ async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
 
-            pricing_by_bot_id = await _load_or_fetch_bot_pricing(runtime, client, bots_data)
+            pricing_by_bot_id = await _load_or_fetch_bot_pricing(runtime, client, bots_data, force_refresh=force_refresh_pricing)
             models = _build_models_from_poe_bots(bots_data, pricing_by_bot_id)
             if models:
                 logger.info(
@@ -724,9 +727,9 @@ async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
     raise RuntimeError(f"Failed to fetch models from Poe using all candidate accounts: {last_error}")
 
 
-async def _reload_models_dynamic(runtime: "GatewayRuntime") -> dict[str, Any]:
+async def _reload_models_dynamic(runtime: "GatewayRuntime", force_refresh_pricing: bool = False) -> dict[str, Any]:
     """动态拉取模型并更新 app.state.models，返回结果摘要。"""
-    models = await _fetch_models_from_poe(runtime)
+    models = await _fetch_models_from_poe(runtime, force_refresh_pricing=force_refresh_pricing)
     app.state.models = models
     loaded_at = int(utc_now().timestamp())
     return {
@@ -1519,7 +1522,10 @@ async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
 
 
 @app.post("/admin/models/reload", response_model=None, dependencies=[Depends(require_admin_auth)])
-async def admin_reload_models(source: str = Query(default="poe", description="poe=动态拉取（默认）；disk=从 models.json 重载")) -> JSONResponse:
+async def admin_reload_models(
+    source: str = Query(default="poe", description="poe=动态拉取（默认）；disk=从 models.json 重载"),
+    force_refresh_pricing: bool = Query(default=False, description="是否强制刷新积分/费率（重新从Poe官网抓取并更新DB缓存）"),
+) -> JSONResponse:
     rt = getattr(app.state, "runtime", None)
     if source == "disk" or rt is None:
         try:
@@ -1529,7 +1535,7 @@ async def admin_reload_models(source: str = Query(default="poe", description="po
             _openai_http_error(500, "provider_error", f"Failed to reload models from disk: {exc}")
     else:
         try:
-            result = await _reload_models_dynamic(rt)
+            result = await _reload_models_dynamic(rt, force_refresh_pricing=force_refresh_pricing)
         except Exception as exc:
             logger.exception("Failed to reload models from Poe: {}", exc)
             _openai_http_error(500, "provider_error", f"Failed to reload models from Poe: {exc}")

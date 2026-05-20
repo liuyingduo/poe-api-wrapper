@@ -14,7 +14,7 @@ _POINT_RATE_RE = re.compile(
     re.I,
 )
 _POINT_MESSAGE_RE = re.compile(
-    r"(?P<prefix>up to\s+)?(?P<points>\d+(?:\.\d+)?)\s*(?:points?|积分)\s*/\s*(?:message|条消息)",
+    r"(?P<prefix>up to\s+)?(?P<points>\d+(?:\.\d+)?)\s*(?:points?|积分)(?:\s*/\s*(?:message|条消息))?",
     re.I,
 )
 
@@ -95,6 +95,8 @@ def parse_rate_menu_markdown(markdown: str) -> dict[str, Any]:
 
         existing = rates.get(rate_type)
         if existing:
+            if table_count > 1:
+                continue
             for key in ("points_per_1k_tokens", "points_per_message"):
                 if key in parsed and key in existing:
                     parsed[key] = max(float(existing[key]), float(parsed[key]))

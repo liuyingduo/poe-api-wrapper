@@ -51,3 +51,22 @@ def test_count_chat_completion_message_tokens_accepts_openai_content_parts():
     ]
 
     assert count_chat_completion_message_tokens(messages) > 0
+
+
+def test_parse_rate_menu_markdown_multiple_tables():
+    markdown = """
+| Type | Rate (USD) | Rate (Points) |
+|------|------|------|
+| Input | $2.25/1M tokens | 75 points/1k tokens |
+| Output (text) | $9.0/1M tokens | 300 points/1k tokens |
+
+ _Image Generation_
+| Type | Rate (USD) | Rate (Points) |
+|------|------|------|
+| Input (text) | $4.53/1M tokens | 151 points/1k tokens |
+| High fidelity editing | $0.06 | 2000 points |
+"""
+    pricing = parse_rate_menu_markdown(markdown)
+    assert pricing["rates"]["input_text"]["points_per_1k_tokens"] == 75
+    assert pricing["rates"]["output_text"]["points_per_1k_tokens"] == 300
+    assert pricing["rates"]["high_fidelity_editing"]["points_per_message"] == 2000
