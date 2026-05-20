@@ -24,8 +24,8 @@ MONGODB_DB=poe_gateway
 FERNET_KEY=<fernet-key>
 ADMIN_API_KEY=<admin-key>
 SERVICE_API_KEYS_BOOTSTRAP=<service-key-1>,<service-key-2>
-DAILY_RESET_TIMEZONE=America/Los_Angeles
-DAILY_RESET_HOUR=0
+DAILY_RESET_TIMEZONE=Asia/Shanghai
+DAILY_RESET_HOUR=8
 DAILY_RESET_POINT_BALANCE=300
 
 # Optional tuning

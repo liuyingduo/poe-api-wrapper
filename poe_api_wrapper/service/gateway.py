@@ -1386,13 +1386,13 @@ class AccountHealthRefresher:
         repo: AccountRepository,
         *,
         default_poe_revision: str,
-        daily_reset_timezone: str = "America/Los_Angeles",
-        daily_reset_hour: int = 0,
+        daily_reset_timezone: str = "Asia/Shanghai",
+        daily_reset_hour: int = 8,
         daily_reset_point_balance: int = 300,
     ):
         self.repo = repo
         self.default_poe_revision = default_poe_revision.strip()
-        self.daily_reset_timezone = daily_reset_timezone.strip() or "America/Los_Angeles"
+        self.daily_reset_timezone = daily_reset_timezone.strip() or "Asia/Shanghai"
         self.daily_reset_hour = max(0, min(int(daily_reset_hour), 23))
         self.daily_reset_point_balance = max(0, int(daily_reset_point_balance))
         self._stopped = asyncio.Event()
@@ -1401,10 +1401,10 @@ class AccountHealthRefresher:
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         except Exception:
             logger.warning(
-                "Invalid DAILY_RESET_TIMEZONE='{}'. Fallback to America/Los_Angeles",
+                "Invalid DAILY_RESET_TIMEZONE='{}'. Fallback to Asia/Shanghai",
                 self.daily_reset_timezone,
             )
-            self.daily_reset_timezone = "America/Los_Angeles"
+            self.daily_reset_timezone = "Asia/Shanghai"
             self._daily_reset_tz = ZoneInfo(self.daily_reset_timezone)
         self._next_daily_reset_utc = self._compute_next_daily_reset_utc()
 
