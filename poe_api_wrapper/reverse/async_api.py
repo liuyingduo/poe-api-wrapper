@@ -80,10 +80,7 @@ class AsyncPoeApi:
     HEADERS = HEADERS
     MAX_CONCURRENT_MESSAGES = 3
     _bundle_cache_lock = threading.Lock()
-    _bundle_cache: dict[str, str] = {
-        "version": "",
-        "formkey": "",
-    }
+    _bundle_cache: dict[str, dict[str, str]] = {}
     
     def __init__(
         self,
@@ -314,10 +311,12 @@ class AsyncPoeApi:
         if self.formkey == "" or force_refresh:
             try:
                 cached_formkey = ""
-                if homepage_version and not force_refresh:
+                p_b = self.tokens.get("p-b", "")
+                if homepage_version and not force_refresh and p_b:
                     with self._bundle_cache_lock:
-                        if self._bundle_cache.get("version") == homepage_version:
-                            cached_formkey = self._bundle_cache.get("formkey", "")
+                        account_cache = self._bundle_cache.get(p_b, {})
+                        if account_cache.get("version") == homepage_version:
+                            cached_formkey = account_cache.get("formkey", "")
                 if cached_formkey:
                     self.formkey = cached_formkey
                     self.client.headers.update({
@@ -340,10 +339,12 @@ class AsyncPoeApi:
                     self.client.headers.update({
                         'Poe-Formkey': self.formkey,
                     })
-                    if homepage_version:
+                    if homepage_version and p_b:
                         with self._bundle_cache_lock:
-                            self._bundle_cache["version"] = homepage_version
-                            self._bundle_cache["formkey"] = self.formkey
+                            self._bundle_cache[p_b] = {
+                                "version": homepage_version,
+                                "formkey": self.formkey,
+                            }
                     logger.debug(
                         "load_bundle extract_formkey success; version={} formkey_len={}",
                         homepage_version,
