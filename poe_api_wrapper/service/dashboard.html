@@ -802,7 +802,7 @@
             <div class="charts-row">
                 <div class="chart-container glass-panel">
                     <div class="chart-header">
-                        <span>各活跃账号积分分布图</span>
+                        <span>连接池中账号积分分布图</span>
                     </div>
                     <div class="chart-wrapper">
                         <canvas id="pointsChart"></canvas>
@@ -1440,14 +1440,12 @@
                 statusChart.update();
             }
 
-            // 2. Bar Points Chart for top accounts
-            const sortedActive = (data.accounts || [])
-                .filter(a => a.status === 'active')
-                .sort((a,b) => b.message_point_balance - a.message_point_balance)
-                .slice(0, 15); // Show top 15
+            // 2. Bar Points Chart for connection pool accounts
+            const poolAccounts = (data.pool_accounts || (data.accounts || []).filter(a => a.in_pool))
+                .sort((a,b) => b.message_point_balance - a.message_point_balance);
 
-            const pointsLabels = sortedActive.map(a => a.email.split('@')[0]);
-            const pointsValues = sortedActive.map(a => a.message_point_balance);
+            const pointsLabels = poolAccounts.map(a => a.email.split('@')[0]);
+            const pointsValues = poolAccounts.map(a => a.message_point_balance);
 
             if (!pointsChart) {
                 const ctx = document.getElementById('pointsChart').getContext('2d');
@@ -1456,7 +1454,7 @@
                     data: {
                         labels: pointsLabels,
                         datasets: [{
-                            label: '剩余积分 (限前 15 名)',
+                            label: '连接池内剩余积分',
                             data: pointsValues,
                             backgroundColor: 'rgba(59, 130, 246, 0.65)',
                             borderColor: '#3b82f6',

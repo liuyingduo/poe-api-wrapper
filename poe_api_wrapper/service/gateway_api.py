@@ -1369,17 +1369,22 @@ async def admin_dashboard_stats(
         if matches_search and matches_status:
             filtered_list.append(acc)
 
-    # Apply python-based sorting
-    if sort == "points-desc":
-        filtered_list.sort(key=lambda x: x["message_point_balance"], reverse=True)
-    elif sort == "points-asc":
-        filtered_list.sort(key=lambda x: x["message_point_balance"])
-    elif sort == "email":
-        filtered_list.sort(key=lambda x: x["email"].lower())
-    elif sort == "errors-desc":
-        filtered_list.sort(key=lambda x: x["error_count"], reverse=True)
-    elif sort == "inflight-desc":
-        filtered_list.sort(key=lambda x: x["inflight_count"], reverse=True)
+    # Apply python-based sorting (Prioritize in_pool accounts to the top)
+    def get_sort_key(acc):
+        in_pool_val = -1 if acc.get("in_pool") else 0
+        if sort == "points-desc":
+            return (in_pool_val, -acc["message_point_balance"])
+        elif sort == "points-asc":
+            return (in_pool_val, acc["message_point_balance"])
+        elif sort == "email":
+            return (in_pool_val, acc["email"].lower())
+        elif sort == "errors-desc":
+            return (in_pool_val, -acc["error_count"])
+        elif sort == "inflight-desc":
+            return (in_pool_val, -acc["inflight_count"])
+        return (in_pool_val, 0)
+
+    filtered_list.sort(key=get_sort_key)
 
     # Slicing
     total_filtered = len(filtered_list)
@@ -1391,6 +1396,9 @@ async def admin_dashboard_stats(
     start_idx = (page - 1) * size
     end_idx = start_idx + size
     paged_accounts = filtered_list[start_idx:end_idx]
+
+    # Get connection pool accounts
+    pool_accounts = [acc for acc in accounts_list if acc.get("in_pool")]
 
     # 7. Get ready accounts count
     ready_accounts = await runtime.repo.count_ready_accounts()
@@ -1414,6 +1422,7 @@ async def admin_dashboard_stats(
         "global_inflight_limit": runtime.limiter.global_inflight_limit,
         "acquire_waiting": runtime.acquire_wait_counter.value() if hasattr(runtime, "acquire_wait_counter") else 0,
         "blocked_accounts_count": len(blocked_accounts),
+        "pool_accounts": pool_accounts,
         "accounts": paged_accounts,
         "config": {
             "max_inflight_per_account": runtime.config.max_inflight_per_account,
