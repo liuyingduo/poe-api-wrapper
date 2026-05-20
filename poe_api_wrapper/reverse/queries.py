@@ -29,6 +29,7 @@ QUERIES = {
   "BotLandingPageQuery": "18c8cd1a9e0707e93cf44d31e909809b05ceedcd2d10cdf7d1c49a82f6718e09",
   "BotSelectorModalQuery": "6e9a70b8e98922d018d12e87474124b766287137dcbdf06eda74d2e14c357aa7",
   "BotSwitcherModalQuery": "54023ee8b691543982b2819491532532c317b899918e049617928137c26d47f5",
+  "RateCardModalQuery": "63afb70b30540bafd08f593b26c61f8bdd5b6818590742e5170f417709792788",
   "BotKnowledgeSourcesModalPaginationQuery": "c02cd4af451d17837143f8572e24b5b9624c2e023bb98bfc1217bde9aedec1ad",
   "ChatDeleteConfirmationModalQuery": "716c8cc3ac6c13d6b41ceb2404e3a28c63aea6d166bf071dca1f98e0377727c3",
   "ChatHelpersSendNewChatMessageMutation": "de5e755e5887f89b558abb7dbbe67cd459dd89f088957e4146253c29942576b0",

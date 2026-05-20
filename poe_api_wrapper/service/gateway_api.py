@@ -45,6 +45,13 @@ from loguru import logger
 
 from . import helpers
 from .dashboard_stats import build_point_balance_distribution
+from .pricing import (
+    DEFAULT_POINT_BALANCE_LIMIT,
+    count_chat_completion_message_tokens,
+    estimate_image_generation_input_points,
+    estimate_input_points_from_tokens,
+    parse_rate_menu_markdown,
+)
 from .terminal_logging import install_terminal_log_tee
 from .gateway import (
     AccountHealthRefresher,
@@ -435,7 +442,10 @@ def _register_model_alias(result: dict[str, Any], alias: str, entry: dict[str, A
         result.setdefault(lower, dict(entry))
 
 
-def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_models_from_poe_bots(
+    bots_data: list[dict[str, Any]],
+    pricing_by_bot_id: Optional[dict[int, dict[str, Any]]] = None,
+) -> dict[str, Any]:
     """
     将 ExploreBotsListPaginationQuery 返回的官方 bot 节点列表
     转换为 app.state.models 格式。
@@ -447,6 +457,7 @@ def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, An
     """
     overrides = _load_overrides()
     result: dict[str, Any] = {}
+    pricing_by_bot_id = pricing_by_bot_id or {}
 
     for bot in bots_data:
         handle = str(bot.get("handle") or bot.get("model") or "").strip()
@@ -454,14 +465,19 @@ def _build_models_from_poe_bots(bots_data: list[dict[str, Any]]) -> dict[str, An
             continue
         display_name = str(bot.get("displayName") or "").strip()
         model_name = str(bot.get("model") or "").strip()
+        bot_id = int(bot.get("botId", 0) or 0)
 
         entry: dict[str, Any] = {
             "baseModel": handle,
+            "bot_id": bot_id,
             "tokens": DEFAULT_MODEL_TOKENS,
             "premium_model": False,
             "object": "model",
             "owned_by": "poe",
         }
+        pricing = pricing_by_bot_id.get(bot_id)
+        if pricing:
+            entry["pricing"] = pricing
 
         # 用 overrides 覆盖（tokens、premium_model 等）
         override = (
@@ -518,6 +534,98 @@ async def _list_model_fetch_candidates(runtime: "GatewayRuntime", *, limit: int 
         reverse=True,
     )
     return docs
+
+
+def _bot_id_from_node(bot: dict[str, Any]) -> int:
+    try:
+        return int(bot.get("botId", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _fetch_rate_card_pricing(client: Any, bot: dict[str, Any]) -> Optional[dict[str, Any]]:
+    bot_id = _bot_id_from_node(bot)
+    if bot_id <= 0:
+        return None
+
+    response = await client.send_request(
+        "gql_POST",
+        "RateCardModalQuery",
+        {"botId": bot_id},
+    )
+    bot_data = (response.get("data") or {}).get("botById") or {}
+    pricing_data = bot_data.get("botPricing") or {}
+    markdown = str(pricing_data.get("rateMenuMarkdown") or "")
+    if not markdown:
+        return None
+    parsed = parse_rate_menu_markdown(markdown)
+    return {
+        "bot_id": bot_id,
+        "handle": str(bot.get("handle") or bot_data.get("handle") or "").strip(),
+        "display_name": str(bot.get("displayName") or bot_data.get("displayName") or "").strip(),
+        "rate_menu_markdown": markdown,
+        "rates": parsed["rates"],
+        "has_multiple_tables": parsed["has_multiple_tables"],
+    }
+
+
+async def _load_or_fetch_bot_pricing(
+    runtime: "GatewayRuntime",
+    client: Any,
+    bots_data: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    bot_ids = [_bot_id_from_node(bot) for bot in bots_data if _bot_id_from_node(bot) > 0]
+    cached = await runtime.repo.get_bot_pricing_map(bot_ids)
+
+    missing_bots = []
+    for bot in bots_data:
+        bot_id = _bot_id_from_node(bot)
+        if bot_id > 0 and bot_id not in cached:
+            missing_bots.append(bot)
+
+    if not missing_bots:
+        logger.info("Loaded {} bot pricing records from DB cache", len(cached))
+        return cached
+
+    concurrency = max(1, int(os.getenv("RATE_CARD_FETCH_CONCURRENCY", "5")))
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _fetch_and_store(bot: dict[str, Any]) -> Optional[tuple[int, dict[str, Any]]]:
+        async with semaphore:
+            bot_id = _bot_id_from_node(bot)
+            try:
+                pricing = await _fetch_rate_card_pricing(client, bot)
+                if not pricing:
+                    return None
+                await runtime.repo.cache_bot_pricing(
+                    bot_id=bot_id,
+                    handle=str(bot.get("handle") or ""),
+                    display_name=str(bot.get("displayName") or ""),
+                    pricing=pricing,
+                )
+                return bot_id, pricing
+            except Exception as exc:
+                logger.warning(
+                    "RateCardModalQuery failed bot_id={} handle={} error={}",
+                    bot_id,
+                    bot.get("handle"),
+                    exc,
+                )
+                return None
+
+    fetched = await asyncio.gather(*[_fetch_and_store(bot) for bot in missing_bots])
+    for item in fetched:
+        if item:
+            bot_id, pricing = item
+            cached[bot_id] = pricing
+
+    logger.info(
+        "Bot pricing loaded: cached={} fetched={} missing={}",
+        len(cached),
+        len([item for item in fetched if item]),
+        len([item for item in fetched if not item]),
+    )
+    return cached
 
 
 async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
@@ -592,7 +700,8 @@ async def _fetch_models_from_poe(runtime: "GatewayRuntime") -> dict[str, Any]:
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
 
-            models = _build_models_from_poe_bots(bots_data)
+            pricing_by_bot_id = await _load_or_fetch_bot_pricing(runtime, client, bots_data)
+            models = _build_models_from_poe_bots(bots_data, pricing_by_bot_id)
             if models:
                 logger.info(
                     "Fetched live model list from Poe Explore using account {}: {} entries",
@@ -658,6 +767,33 @@ def _runtime() -> GatewayRuntime:
 
 def _openai_http_error(code: int, err_type: str, message: str, metadata: Optional[dict[str, Any]] = None):
     raise HTTPException(status_code=code, detail=build_openai_error(code, err_type, message, metadata))
+
+
+def _pricing_for_model(model: str) -> dict[str, Any]:
+    meta = app.state.models.get(model)
+    if not isinstance(meta, dict):
+        return {}
+    pricing = meta.get("pricing")
+    return pricing if isinstance(pricing, dict) else {}
+
+
+def _estimated_points_or_zero(points: int) -> int:
+    return max(0, int(points or 0))
+
+
+def _reject_request_if_points_exceed_limit(points: int, *, model: str) -> None:
+    estimated_points = _estimated_points_or_zero(points)
+    if estimated_points <= DEFAULT_POINT_BALANCE_LIMIT:
+        return
+    _openai_http_error(
+        402,
+        "insufficient_credits",
+        (
+            f"Estimated input cost for model {model} is {estimated_points} points, "
+            f"which exceeds the maximum account balance of {DEFAULT_POINT_BALANCE_LIMIT}."
+        ),
+        {"estimated_input_points": estimated_points, "max_account_points": DEFAULT_POINT_BALANCE_LIMIT},
+    )
 
 
 def _unwrap_root_exception(exc: BaseException) -> BaseException:
@@ -957,13 +1093,37 @@ async def _background_sync_account_points(runtime: GatewayRuntime, account_id: s
         logger.warning("Background points sync failed for account {}: {}", mask_secret(account_id), exc)
 
 
-async def _acquire_prewarmed_account(runtime: GatewayRuntime) -> tuple[dict[str, Any], AccountLease]:
+async def _mark_depleted_cached_accounts(runtime: GatewayRuntime) -> None:
+    cached_ids = runtime.pool.cached_account_ids_in_order()
+    if not cached_ids:
+        return
+    account_docs = await runtime.repo.get_accounts_by_ids(cached_ids)
+    for account_doc in account_docs:
+        account_id = str(account_doc["_id"])
+        balance = int(account_doc.get("message_point_balance", 0) or 0)
+        if balance < runtime.config.depleted_threshold:
+            await runtime.repo.mark_account_depleted(
+                account_id,
+                f"Points {balance} < depleted threshold {runtime.config.depleted_threshold}",
+            )
+            await runtime.pool.invalidate_client(account_id)
+
+
+async def _acquire_prewarmed_account(
+    runtime: GatewayRuntime,
+    *,
+    min_balance: int = 0,
+) -> tuple[dict[str, Any], AccountLease]:
     runtime.acquire_wait_counter.enter()
     wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
     try:
         while True:
             try:
-                account_doc, lease = await runtime.selector.select_account(prewarmed_only=True)
+                await _mark_depleted_cached_accounts(runtime)
+                account_doc, lease = await runtime.selector.select_account(
+                    prewarmed_only=True,
+                    min_balance=min_balance,
+                )
             except NoAccountAvailableError:
                 raise
             except CapacityLimitError:
@@ -2618,7 +2778,9 @@ async def _acquire_account_for_chat(
     session_id: str,
     persistent_session: bool,
     model: str,
+    estimated_input_points: int = 0,
 ) -> tuple[dict[str, Any], AccountLease, Optional[str], Optional[int]]:
+    min_balance = _estimated_points_or_zero(estimated_input_points)
     if persistent_session:
         session = await runtime.sessions.get_session(session_id)
         if session:
@@ -2642,6 +2804,35 @@ async def _acquire_account_for_chat(
                     {"session_id": session_id},
                 )
 
+            balance = int(account_doc.get("message_point_balance", 0) or 0)
+            if balance < runtime.config.depleted_threshold:
+                await runtime.repo.mark_account_depleted(
+                    account_id,
+                    f"Points {balance} < depleted threshold {runtime.config.depleted_threshold}",
+                )
+                await runtime.pool.invalidate_client(account_id)
+                await runtime.sessions.break_session(session_id, "bound account points depleted")
+                _openai_http_error(
+                    409,
+                    "invalid_request_error",
+                    "Bound account has no remaining points. Create a new session_id and retry.",
+                    {"session_id": session_id},
+                )
+            if min_balance > 0 and balance < min_balance:
+                await runtime.sessions.break_session(
+                    session_id,
+                    f"bound account points insufficient ({balance} < {min_balance})",
+                )
+                _openai_http_error(
+                    409,
+                    "invalid_request_error",
+                    (
+                        f"Bound account has insufficient points ({balance} < {min_balance}). "
+                        "Create a new session_id and retry."
+                    ),
+                    {"session_id": session_id, "estimated_input_points": min_balance},
+                )
+
             wait_sec = max(0.01, float(runtime.config.acquire_wait_poll_seconds))
             while not runtime.pool.has_client(account_id):
                 await asyncio.sleep(wait_sec)
@@ -2652,9 +2843,14 @@ async def _acquire_account_for_chat(
             return account_doc, lease, session.get("chat_code"), session.get("chat_id")
 
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(runtime, min_balance=min_balance)
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(
+            402,
+            "insufficient_credits",
+            "No active accounts available",
+            {"estimated_input_points": min_balance},
+        )
 
     account_id = str(account_doc["_id"])
     if persistent_session:
@@ -2719,6 +2915,12 @@ async def _chat_completions_impl(
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
+    input_token_count = count_chat_completion_message_tokens(messages)
+    estimated_input_points = estimate_input_points_from_tokens(
+        _pricing_for_model(model),
+        input_token_count,
+    )
+    _reject_request_if_points_exceed_limit(estimated_input_points, model=model)
 
     session_id, persistent_session = runtime.sessions.resolve_session_id(metadata, user)
     request.state.session_id = session_id
@@ -2754,6 +2956,7 @@ async def _chat_completions_impl(
             session_id=session_id,
             persistent_session=persistent_session,
             model=model,
+            estimated_input_points=estimated_input_points,
         )
         account_id = str(account_doc["_id"])
         request.state.account_id = account_id
@@ -2970,11 +3173,25 @@ async def create_images(
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
+    estimated_input_points = estimate_image_generation_input_points(
+        _pricing_for_model(model),
+        prompt,
+        n,
+    )
+    _reject_request_if_points_exceed_limit(estimated_input_points, model=model)
 
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(
+            runtime,
+            min_balance=estimated_input_points,
+        )
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(
+            402,
+            "insufficient_credits",
+            "No active accounts available",
+            {"estimated_input_points": estimated_input_points},
+        )
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 
@@ -3120,11 +3337,25 @@ async def edit_images(
     base_model = model_data["baseModel"]
     tokens_limit = _model_tokens(model_data)
     premium_model = bool(model_data.get("premium_model", False))
+    estimated_input_points = estimate_image_generation_input_points(
+        _pricing_for_model(model),
+        prompt,
+        n,
+    )
+    _reject_request_if_points_exceed_limit(estimated_input_points, model=model)
 
     try:
-        account_doc, lease = await _acquire_prewarmed_account(runtime)
+        account_doc, lease = await _acquire_prewarmed_account(
+            runtime,
+            min_balance=estimated_input_points,
+        )
     except NoAccountAvailableError:
-        _openai_http_error(402, "insufficient_credits", "No active accounts available")
+        _openai_http_error(
+            402,
+            "insufficient_credits",
+            "No active accounts available",
+            {"estimated_input_points": estimated_input_points},
+        )
     account_id = str(account_doc["_id"])
     request.state.account_id = account_id
 

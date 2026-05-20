@@ -652,6 +652,56 @@ class AccountRepository:
 
         await self._run(_op)
 
+    async def get_bot_pricing_map(self, bot_ids: list[int]) -> dict[int, dict[str, Any]]:
+        normalized_ids = {int(bot_id) for bot_id in bot_ids if bot_id}
+        if not normalized_ids:
+            return {}
+        keys = [f"poe_bot_pricing:{bot_id}" for bot_id in normalized_ids]
+
+        def _op() -> dict[int, dict[str, Any]]:
+            docs = list(self.metadata.find({"_id": {"$in": keys}}))
+            result: dict[int, dict[str, Any]] = {}
+            for doc in docs:
+                raw_bot_id = doc.get("bot_id")
+                try:
+                    bot_id = int(raw_bot_id)
+                except (TypeError, ValueError):
+                    continue
+                pricing = doc.get("pricing")
+                if isinstance(pricing, dict):
+                    result[bot_id] = pricing
+            return result
+
+        return await self._run(_op)
+
+    async def cache_bot_pricing(
+        self,
+        *,
+        bot_id: int,
+        handle: str,
+        display_name: str,
+        pricing: dict[str, Any],
+    ) -> None:
+        normalized_bot_id = int(bot_id)
+        now = utc_now()
+
+        def _op() -> None:
+            self.metadata.find_one_and_update(
+                {"_id": f"poe_bot_pricing:{normalized_bot_id}"},
+                {
+                    "$set": {
+                        "bot_id": normalized_bot_id,
+                        "handle": handle,
+                        "display_name": display_name,
+                        "pricing": pricing,
+                        "updated_at": now,
+                    }
+                },
+                upsert=True,
+            )
+
+        await self._run(_op)
+
     async def get_active_account_balances(self) -> list[int]:
         """返回数据库中所有 active 账号余额，用于池内账号淘汰中位数。"""
         def _op():
@@ -1102,8 +1152,21 @@ class AccountSelector:
                 return account, AccountLease(account_id=account_id, limiter=self.limiter)
         return None
 
-    async def select_account(self, *, prewarmed_only: bool = False) -> tuple[dict[str, Any], AccountLease]:
+    async def select_account(
+        self,
+        *,
+        prewarmed_only: bool = False,
+        min_balance: int = 0,
+    ) -> tuple[dict[str, Any], AccountLease]:
         top_accounts = await self._top_pool(prewarmed_only=prewarmed_only)
+        if min_balance > 0:
+            top_accounts = [
+                account
+                for account in top_accounts
+                if int(account.get("message_point_balance", 0) or 0) >= min_balance
+            ]
+            if not top_accounts:
+                raise NoAccountAvailableError("No candidate accounts have enough points")
         selected = await self._select_from_pool(top_accounts)
         if selected:
             return selected
