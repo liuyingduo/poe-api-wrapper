@@ -16,7 +16,6 @@ POINT_BALANCE_DISTRIBUTION_BUCKETS = (
 )
 POINT_BALANCE_HISTORY_COLLECTION = "point_balance_daily_snapshots"
 POINT_BALANCE_HISTORY_TYPE = "before_refresh_all"
-POINT_BALANCE_HISTORY_DAYS = (7, 30)
 ACCOUNT_STATUSES = ("active", "depleted", "cooldown", "invalid")
 
 
