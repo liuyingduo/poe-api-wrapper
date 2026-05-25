@@ -40,6 +40,7 @@ from .utils import (
                     is_bot_message,
                     is_human_message,
                     normalize_ws_message,
+                    resolve_bot_message_delta,
                     ensure_model_parameters,
                     is_nano_banana_model,
                     generate_nonce, 
@@ -1616,7 +1617,6 @@ class AsyncPoeApi:
         await self._reset_message_queue(chatId)
 
         last_text = ""        
-        stateChange = False
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
@@ -1708,16 +1708,7 @@ class AsyncPoeApi:
                     yield response
                     break
                 
-                if is_bot_message(response) and response["text"].strip() == last_text.strip():
-                    response["response"] = ""
-                elif is_bot_message(response) and (last_text == "" or bot != "web-search"):
-                    response["response"] = f'{response["text"]}\n'
-                else:
-                    if stateChange == False:
-                        response["response"] = response["text"]
-                        stateChange = True
-                    else:
-                        response["response"] = response["text"][len(last_text):]                   
+                response["response"] = resolve_bot_message_delta(response, last_text)
                 
                 if response["state"] == "complete":
                     if suggest_replies:
@@ -1933,7 +1924,6 @@ class AsyncPoeApi:
         await self._reset_message_queue(chatId)
 
         last_text = ""     
-        stateChange = False
         suggest_attempts = 6
         response = {}
         suggestedReplies = []
@@ -2025,16 +2015,7 @@ class AsyncPoeApi:
                     yield response
                     break
                 
-                if is_bot_message(response) and response["text"].strip() == last_text.strip():
-                    response["response"] = ""
-                elif is_bot_message(response) and (last_text == "" or bot != "web-search"):
-                    response["response"] = f'{response["text"]}\n'
-                else:
-                    if stateChange == False:
-                        response["response"] = response["text"]
-                        stateChange = True
-                    else:
-                        response["response"] = response["text"][len(last_text):]                        
+                response["response"] = resolve_bot_message_delta(response, last_text)
                 
                 if response["state"] == "complete":    
                     if suggest_replies:

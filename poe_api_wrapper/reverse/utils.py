@@ -176,6 +176,21 @@ def is_bot_message(message: dict[str, Any]) -> bool:
     return isinstance(author, str) and author not in ("", "human")
 
 
+def resolve_bot_message_delta(message: dict[str, Any], last_text: str) -> str:
+    if not is_bot_message(message):
+        return ""
+
+    current_text = str(message.get("text") or "")
+    previous_text = str(last_text or "")
+    if current_text.strip() == previous_text.strip():
+        return ""
+    if not previous_text:
+        return current_text
+    if current_text.startswith(previous_text):
+        return current_text.removeprefix(previous_text)
+    return current_text
+
+
 def normalize_ws_message(message: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(message)
     normalized["author"] = get_message_author(normalized)
