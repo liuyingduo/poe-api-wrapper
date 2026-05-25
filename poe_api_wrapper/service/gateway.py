@@ -1165,18 +1165,42 @@ class AccountSelector:
         min_balance: int = 0,
     ) -> tuple[dict[str, Any], AccountLease]:
         top_accounts = await self._top_pool(prewarmed_only=prewarmed_only)
+        candidate_info = [
+            f"{mask_secret(str(acc['_id']))}:{acc.get('message_point_balance', 0)}"
+            for acc in top_accounts
+        ]
+        logger.info(
+            "select_account: min_balance={} pool_size={} candidates=[{}]",
+            min_balance,
+            len(top_accounts),
+            ", ".join(candidate_info),
+        )
+
         if min_balance > 0:
-            top_accounts = [
+            filtered_accounts = [
                 account
                 for account in top_accounts
                 if int(account.get("message_point_balance", 0) or 0) >= min_balance
             ]
-            if not top_accounts:
-                raise NoAccountAvailableError("No candidate accounts have enough points")
+            if not filtered_accounts:
+                logger.warning(
+                    "select_account: no accounts have enough points (min_balance={})",
+                    min_balance,
+                )
+                raise NoAccountAvailableError(f"No candidate accounts have enough points (min_balance={min_balance})")
+            top_accounts = filtered_accounts
+
         selected = await self._select_from_pool(top_accounts)
         if selected:
+            sel_acc, sel_lease = selected
+            logger.info(
+                "select_account: successfully selected account {} with balance {}",
+                mask_secret(str(sel_acc["_id"])),
+                sel_acc.get("message_point_balance", 0),
+            )
             return selected
 
+        logger.warning("select_account: all candidate accounts are currently busy")
         raise CapacityLimitError("All candidate accounts are currently busy")
 
 

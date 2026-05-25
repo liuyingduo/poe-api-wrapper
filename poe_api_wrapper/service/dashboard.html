@@ -332,12 +332,18 @@
             min-height: 320px;
         }
 
+        .chart-container.chart-wide {
+            grid-column: 1 / -1;
+            min-height: 340px;
+        }
+
         .chart-header {
             font-size: 1rem;
             font-weight: 600;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 1rem;
         }
 
         .chart-wrapper {
@@ -800,6 +806,21 @@
 
             <!-- Charts Row -->
             <div class="charts-row">
+                <div class="chart-container glass-panel chart-wide">
+                    <div class="chart-header">
+                        <span>刷新前每日剩余积分</span>
+                        <div class="filters-group">
+                            <span id="point-history-summary" style="font-size: 0.8125rem; color: var(--text-muted);">暂无快照</span>
+                            <select id="point-history-range-select">
+                                <option value="7" selected>最近 7 天</option>
+                                <option value="30">最近 30 天</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="chart-wrapper">
+                        <canvas id="pointHistoryChart"></canvas>
+                    </div>
+                </div>
                 <div class="chart-container glass-panel">
                     <div class="chart-header">
                         <span>连接池中账号积分分布图</span>
@@ -1026,6 +1047,7 @@
         let pointsChart = null;
         let statusChart = null;
         let pointDistributionChart = null;
+        let pointHistoryChart = null;
         let rawAccounts = [];
         let expandedAccounts = new Set();
         let firstLoad = true;
@@ -1041,6 +1063,7 @@
         const searchInput = document.getElementById('search-input');
         const statusFilter = document.getElementById('status-filter');
         const sortSelect = document.getElementById('sort-select');
+        const pointHistoryRangeSelect = document.getElementById('point-history-range-select');
         const accountsTableBody = document.getElementById('accounts-table-body');
         
         // Pagination Elements
@@ -1091,6 +1114,7 @@
         searchInput.addEventListener('input', () => { currentPage = 1; fetchDashboardStats(); });
         statusFilter.addEventListener('change', () => { currentPage = 1; fetchDashboardStats(); });
         sortSelect.addEventListener('change', () => { currentPage = 1; fetchDashboardStats(); });
+        pointHistoryRangeSelect.addEventListener('change', fetchDashboardStats);
 
         // Pagination Events
         prevPageBtn.addEventListener('click', () => {
@@ -1148,6 +1172,19 @@
             }
         }
 
+        function formatHistoryDate(dateString) {
+            if (!dateString) return '-';
+            try {
+                const d = new Date(`${dateString}T00:00:00`);
+                return d.toLocaleDateString('zh-CN', {
+                    month: '2-digit',
+                    day: '2-digit'
+                });
+            } catch (e) {
+                return dateString;
+            }
+        }
+
         // Safe Copy Utility
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text).then(() => {
@@ -1163,7 +1200,8 @@
                 const searchVal = encodeURIComponent(searchInput.value.trim());
                 const statusVal = encodeURIComponent(statusFilter.value);
                 const sortVal = encodeURIComponent(sortSelect.value);
-                const url = `/admin/dashboard-stats?page=${currentPage}&size=${pageSize}&search=${searchVal}&status=${statusVal}&sort=${sortVal}`;
+                const pointHistoryDays = encodeURIComponent(pointHistoryRangeSelect.value);
+                const url = `/admin/dashboard-stats?page=${currentPage}&size=${pageSize}&search=${searchVal}&status=${statusVal}&sort=${sortVal}&point_history_days=${pointHistoryDays}`;
 
                 const response = await fetch(url);
                 if (response.status === 401) {
@@ -1411,6 +1449,81 @@
 
         // Initialize and Update Charts
         function updateCharts(data) {
+            // 1. Daily pre-refresh point balance history
+            const pointHistory = data.point_balance_history || [];
+            const pointHistoryLabels = pointHistory.map(item => formatHistoryDate(item.date));
+            const pointHistoryTotals = pointHistory.map(item => item.total_points);
+            const pointHistoryActiveTotals = pointHistory.map(item => item.active_points);
+            const pointHistoryAccountCounts = pointHistory.map(item => item.account_count);
+            const pointHistorySummary = document.getElementById('point-history-summary');
+            pointHistorySummary.textContent = pointHistory.length > 0 ? `已记录 ${pointHistory.length} 天` : '暂无快照';
+
+            if (!pointHistoryChart) {
+                const ctx = document.getElementById('pointHistoryChart').getContext('2d');
+                pointHistoryChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: pointHistoryLabels,
+                        datasets: [
+                            {
+                                label: '刷新前总剩余积分',
+                                data: pointHistoryTotals,
+                                borderColor: '#3b82f6',
+                                backgroundColor: 'rgba(59, 130, 246, 0.16)',
+                                borderWidth: 2,
+                                pointRadius: 3,
+                                tension: 0.25,
+                                fill: true
+                            },
+                            {
+                                label: '刷新前活跃积分',
+                                data: pointHistoryActiveTotals,
+                                borderColor: '#10b981',
+                                backgroundColor: 'rgba(16, 185, 129, 0.08)',
+                                borderWidth: 2,
+                                pointRadius: 3,
+                                tension: 0.25,
+                                fill: false
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                                ticks: { color: '#9ca3af' }
+                            },
+                            x: {
+                                grid: { display: false },
+                                ticks: { color: '#9ca3af' }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                position: 'bottom',
+                                labels: { color: '#9ca3af', font: { family: 'Inter', size: 11 } }
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    afterLabel: (context) => {
+                                        const accountCount = pointHistoryAccountCounts[context.dataIndex] || 0;
+                                        return `账号数: ${accountCount}`;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            } else {
+                pointHistoryChart.data.labels = pointHistoryLabels;
+                pointHistoryChart.data.datasets[0].data = pointHistoryTotals;
+                pointHistoryChart.data.datasets[1].data = pointHistoryActiveTotals;
+                pointHistoryChart.update();
+            }
+
             // 1. Doughnut Status Chart
             const statusLabels = ['活跃 (Active)', '耗尽 (Depleted)', '冷却中 (Cooldown)', '校验失效 (Invalid)'];
             const statusValues = [

@@ -44,7 +44,14 @@ from httpx import AsyncClient
 from loguru import logger
 
 from . import helpers
-from .dashboard_stats import build_point_balance_distribution
+from .dashboard_stats import (
+    POINT_BALANCE_HISTORY_COLLECTION,
+    POINT_BALANCE_HISTORY_TYPE,
+    build_point_balance_distribution,
+    build_pre_refresh_point_balance_snapshot,
+    point_balance_history_start_date,
+    serialize_point_balance_history,
+)
 from .pricing import (
     DEFAULT_POINT_BALANCE_LIMIT,
     count_chat_completion_message_tokens,
@@ -567,6 +574,65 @@ async def _fetch_rate_card_pricing(client: Any, bot: dict[str, Any]) -> Optional
         "rates": parsed["rates"],
         "has_multiple_tables": parsed["has_multiple_tables"],
     }
+
+
+async def _load_all_account_docs(runtime: "GatewayRuntime") -> list[dict[str, Any]]:
+    def _op() -> list[dict[str, Any]]:
+        return list(runtime.repo.accounts.find({}))
+
+    return await runtime.repo._run(_op)
+
+
+async def _record_pre_refresh_point_balance_snapshot(
+    runtime: "GatewayRuntime",
+    accounts_docs: list[dict[str, Any]],
+    captured_at: datetime,
+) -> None:
+    snapshot = build_pre_refresh_point_balance_snapshot(
+        accounts_docs,
+        captured_at=captured_at,
+        timezone_name=runtime.config.daily_reset_timezone,
+    )
+    snapshot_doc = {
+        **snapshot,
+        "created_at": captured_at,
+        "updated_at": captured_at,
+    }
+
+    def _op() -> None:
+        runtime.repo.db[POINT_BALANCE_HISTORY_COLLECTION].update_one(
+            {"type": POINT_BALANCE_HISTORY_TYPE, "date": snapshot["date"]},
+            {
+                "$setOnInsert": snapshot_doc,
+                "$set": {"updated_at": captured_at},
+            },
+            upsert=True,
+        )
+
+    await runtime.repo._run(_op)
+
+
+async def _load_pre_refresh_point_balance_history(
+    runtime: "GatewayRuntime",
+    *,
+    now: datetime,
+    days: int,
+) -> list[dict[str, Any]]:
+    start_date = point_balance_history_start_date(
+        now,
+        days,
+        runtime.config.daily_reset_timezone,
+    ).isoformat()
+
+    def _op() -> list[dict[str, Any]]:
+        return list(
+            runtime.repo.db[POINT_BALANCE_HISTORY_COLLECTION]
+            .find({"type": POINT_BALANCE_HISTORY_TYPE, "date": {"$gte": start_date}}, {"_id": 0})
+            .sort("date", 1)
+        )
+
+    docs = await runtime.repo._run(_op)
+    return serialize_point_balance_history(docs)
 
 
 async def _load_or_fetch_bot_pricing(
@@ -1514,6 +1580,12 @@ async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
         statuses,
         concurrency,
     )
+    pre_refresh_accounts = await _load_all_account_docs(runtime)
+    await _record_pre_refresh_point_balance_snapshot(
+        runtime,
+        pre_refresh_accounts,
+        utc_now(),
+    )
     result = await runtime.refresher.refresh_all_accounts(
         statuses=statuses,
         concurrency=concurrency,
@@ -1564,7 +1636,8 @@ async def admin_dashboard_stats(
     size: int = Query(default=10, ge=5, le=100),
     search: str = Query(default=""),
     status: str = Query(default="all"),
-    sort: str = Query(default="points-desc")
+    sort: str = Query(default="points-desc"),
+    point_history_days: int = Query(default=7, ge=1, le=30),
 ) -> JSONResponse:
     runtime = _runtime()
     now = utc_now()
@@ -1574,9 +1647,7 @@ async def admin_dashboard_stats(
     uptime_seconds = int((now - startup_time).total_seconds()) if startup_time else 0
 
     # 2. Get Accounts
-    def _get_accounts_op():
-        return list(runtime.repo.accounts.find({}))
-    accounts_docs = await runtime.repo._run(_get_accounts_op)
+    accounts_docs = await _load_all_account_docs(runtime)
 
     # 3. Sum Points and Status
     total_points = 0
@@ -1674,6 +1745,11 @@ async def admin_dashboard_stats(
     # Get connection pool accounts
     pool_accounts = [acc for acc in accounts_list if acc.get("in_pool")]
     point_balance_distribution = build_point_balance_distribution(accounts_list)
+    point_balance_history = await _load_pre_refresh_point_balance_history(
+        runtime,
+        now=now,
+        days=point_history_days,
+    )
 
     # 7. Get ready accounts count
     ready_accounts = await runtime.repo.count_ready_accounts()
@@ -1699,6 +1775,7 @@ async def admin_dashboard_stats(
         "blocked_accounts_count": len(blocked_accounts),
         "pool_accounts": pool_accounts,
         "point_balance_distribution": point_balance_distribution,
+        "point_balance_history": point_balance_history,
         "accounts": paged_accounts,
         "config": {
             "max_inflight_per_account": runtime.config.max_inflight_per_account,
