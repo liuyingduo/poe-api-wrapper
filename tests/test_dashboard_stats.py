@@ -1,12 +1,15 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from poe_api_wrapper.service.dashboard_stats import (
     build_point_balance_distribution,
-    build_pre_refresh_point_balance_snapshot,
+    build_pre_daily_reset_point_balance_snapshot,
     normalize_point_balance_history_days,
     point_balance_history_start_date,
     serialize_point_balance_history,
 )
+from poe_api_wrapper.service.gateway import AccountHealthRefresher
 
 
 def test_build_point_balance_distribution_counts_accounts_and_points():
@@ -40,7 +43,7 @@ def test_build_point_balance_distribution_counts_accounts_and_points():
     ]
 
 
-def test_build_pre_refresh_point_balance_snapshot_sums_account_points():
+def test_build_pre_daily_reset_point_balance_snapshot_sums_account_points():
     captured_at = datetime(2026, 5, 25, 1, 30, tzinfo=timezone.utc)
     accounts = [
         {"status": "active", "message_point_balance": 120},
@@ -50,14 +53,14 @@ def test_build_pre_refresh_point_balance_snapshot_sums_account_points():
         {"status": "unknown", "message_point_balance": 70},
     ]
 
-    snapshot = build_pre_refresh_point_balance_snapshot(
+    snapshot = build_pre_daily_reset_point_balance_snapshot(
         accounts,
         captured_at=captured_at,
         timezone_name="Asia/Hong_Kong",
     )
 
     assert snapshot == {
-        "type": "before_refresh_all",
+        "type": "before_daily_reset",
         "date": "2026-05-25",
         "captured_at": captured_at,
         "timezone": "Asia/Hong_Kong",
@@ -109,4 +112,34 @@ def test_serialize_point_balance_history_converts_datetime():
             "active_points": 240,
             "status_counts": {"active": 2},
         }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_daily_reset_records_snapshot_before_reset():
+    captured_at = datetime(2026, 5, 25, 0, 0, tzinfo=timezone.utc)
+    calls = []
+
+    class FakeRepo:
+        async def record_pre_daily_reset_point_balance_snapshot(self, *, captured_at, timezone_name):
+            calls.append(("snapshot", captured_at, timezone_name))
+
+        async def daily_reset_point_balance(self, *, point_balance, reset_statuses):
+            calls.append(("reset", point_balance, reset_statuses))
+            return 2
+
+    refresher = AccountHealthRefresher(
+        FakeRepo(),
+        default_poe_revision="",
+        daily_reset_timezone="Asia/Hong_Kong",
+        daily_reset_hour=8,
+        daily_reset_point_balance=300,
+    )
+    refresher._next_daily_reset_utc = captured_at
+
+    await refresher._run_daily_point_reset_if_due(captured_at)
+
+    assert calls == [
+        ("snapshot", captured_at, "Asia/Hong_Kong"),
+        ("reset", 300, ["active", "depleted", "cooldown"]),
     ]

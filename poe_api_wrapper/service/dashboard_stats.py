@@ -15,7 +15,7 @@ POINT_BALANCE_DISTRIBUTION_BUCKETS = (
     {"label": "251 - 300", "min_balance": 251, "max_balance": 300},
 )
 POINT_BALANCE_HISTORY_COLLECTION = "point_balance_daily_snapshots"
-POINT_BALANCE_HISTORY_TYPE = "before_refresh_all"
+POINT_BALANCE_HISTORY_TYPE = "before_daily_reset"
 ACCOUNT_STATUSES = ("active", "depleted", "cooldown", "invalid")
 
 
@@ -55,7 +55,7 @@ def point_balance_history_start_date(now: datetime, days: int, timezone_name: st
     return local_today - timedelta(days=normalize_point_balance_history_days(days) - 1)
 
 
-def build_pre_refresh_point_balance_snapshot(
+def build_pre_daily_reset_point_balance_snapshot(
     accounts: list[dict[str, Any]],
     *,
     captured_at: datetime,

@@ -36,6 +36,12 @@ from loguru import logger
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+from .dashboard_stats import (
+    POINT_BALANCE_HISTORY_COLLECTION,
+    POINT_BALANCE_HISTORY_TYPE,
+    build_pre_daily_reset_point_balance_snapshot,
+)
+
 if TYPE_CHECKING:
     from poe_api_wrapper.reverse import AsyncPoeApi
 
@@ -1033,6 +1039,42 @@ class AccountRepository:
 
         return await self._run(_op)
 
+    async def list_all_account_docs(self) -> list[dict[str, Any]]:
+        def _op() -> list[dict[str, Any]]:
+            return list(self.accounts.find({}))
+
+        return await self._run(_op)
+
+    async def record_pre_daily_reset_point_balance_snapshot(
+        self,
+        *,
+        captured_at: datetime,
+        timezone_name: str,
+    ) -> None:
+        accounts_docs = await self.list_all_account_docs()
+        snapshot = build_pre_daily_reset_point_balance_snapshot(
+            accounts_docs,
+            captured_at=captured_at,
+            timezone_name=timezone_name,
+        )
+        snapshot_doc = {
+            **snapshot,
+            "created_at": captured_at,
+            "updated_at": captured_at,
+        }
+
+        def _op() -> None:
+            self.db[POINT_BALANCE_HISTORY_COLLECTION].update_one(
+                {"type": POINT_BALANCE_HISTORY_TYPE, "date": snapshot["date"]},
+                {
+                    "$setOnInsert": snapshot_doc,
+                    "$set": {"updated_at": captured_at},
+                },
+                upsert=True,
+            )
+
+        await self._run(_op)
+
     async def close(self) -> None:
         await self._run(self.client.close)
 
@@ -1509,12 +1551,16 @@ class AccountHealthRefresher:
     async def _run_daily_point_reset_if_due(self, now_utc: datetime) -> None:
         if now_utc < self._next_daily_reset_utc:
             return
+        await self.repo.record_pre_daily_reset_point_balance_snapshot(
+            captured_at=now_utc,
+            timezone_name=self.daily_reset_timezone,
+        )
         modified_count = await self.repo.daily_reset_point_balance(
             point_balance=self.daily_reset_point_balance,
             reset_statuses=["active", "depleted", "cooldown"],
         )
         logger.info(
-            "Daily Poe point reset executed at {} (tz={} {}:00). modified_accounts={}, point_balance={}",
+            "Daily Poe point reset executed at {} (tz={} {}:00). snapshot_recorded=true modified_accounts={}, point_balance={}",
             now_utc.isoformat(),
             self.daily_reset_timezone,
             self.daily_reset_hour,

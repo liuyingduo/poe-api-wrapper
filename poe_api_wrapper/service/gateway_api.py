@@ -48,7 +48,6 @@ from .dashboard_stats import (
     POINT_BALANCE_HISTORY_COLLECTION,
     POINT_BALANCE_HISTORY_TYPE,
     build_point_balance_distribution,
-    build_pre_refresh_point_balance_snapshot,
     point_balance_history_start_date,
     serialize_point_balance_history,
 )
@@ -577,42 +576,10 @@ async def _fetch_rate_card_pricing(client: Any, bot: dict[str, Any]) -> Optional
 
 
 async def _load_all_account_docs(runtime: "GatewayRuntime") -> list[dict[str, Any]]:
-    def _op() -> list[dict[str, Any]]:
-        return list(runtime.repo.accounts.find({}))
-
-    return await runtime.repo._run(_op)
+    return await runtime.repo.list_all_account_docs()
 
 
-async def _record_pre_refresh_point_balance_snapshot(
-    runtime: "GatewayRuntime",
-    accounts_docs: list[dict[str, Any]],
-    captured_at: datetime,
-) -> None:
-    snapshot = build_pre_refresh_point_balance_snapshot(
-        accounts_docs,
-        captured_at=captured_at,
-        timezone_name=runtime.config.daily_reset_timezone,
-    )
-    snapshot_doc = {
-        **snapshot,
-        "created_at": captured_at,
-        "updated_at": captured_at,
-    }
-
-    def _op() -> None:
-        runtime.repo.db[POINT_BALANCE_HISTORY_COLLECTION].update_one(
-            {"type": POINT_BALANCE_HISTORY_TYPE, "date": snapshot["date"]},
-            {
-                "$setOnInsert": snapshot_doc,
-                "$set": {"updated_at": captured_at},
-            },
-            upsert=True,
-        )
-
-    await runtime.repo._run(_op)
-
-
-async def _load_pre_refresh_point_balance_history(
+async def _load_pre_daily_reset_point_balance_history(
     runtime: "GatewayRuntime",
     *,
     now: datetime,
@@ -1580,12 +1547,6 @@ async def admin_refresh_all_account_points(request: Request) -> JSONResponse:
         statuses,
         concurrency,
     )
-    pre_refresh_accounts = await _load_all_account_docs(runtime)
-    await _record_pre_refresh_point_balance_snapshot(
-        runtime,
-        pre_refresh_accounts,
-        utc_now(),
-    )
     result = await runtime.refresher.refresh_all_accounts(
         statuses=statuses,
         concurrency=concurrency,
@@ -1745,7 +1706,7 @@ async def admin_dashboard_stats(
     # Get connection pool accounts
     pool_accounts = [acc for acc in accounts_list if acc.get("in_pool")]
     point_balance_distribution = build_point_balance_distribution(accounts_list)
-    point_balance_history = await _load_pre_refresh_point_balance_history(
+    point_balance_history = await _load_pre_daily_reset_point_balance_history(
         runtime,
         now=now,
         days=point_history_days,
