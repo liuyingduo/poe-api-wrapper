@@ -9,7 +9,8 @@ from poe_api_wrapper.service.dashboard_stats import (
     point_balance_history_start_date,
     serialize_point_balance_history,
 )
-from poe_api_wrapper.service.gateway import AccountHealthRefresher
+from poe_api_wrapper.service.dashboard_stats import POINT_BALANCE_HISTORY_COLLECTION
+from poe_api_wrapper.service.gateway import AccountHealthRefresher, AccountRepository
 
 
 def test_build_point_balance_distribution_counts_accounts_and_points():
@@ -143,3 +144,40 @@ async def test_daily_reset_records_snapshot_before_reset():
         ("snapshot", captured_at, "Asia/Hong_Kong"),
         ("reset", 300, ["active", "depleted", "cooldown"]),
     ]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_upsert_does_not_conflict_on_updated_at():
+    captured_at = datetime(2026, 5, 25, 0, 0, tzinfo=timezone.utc)
+    update_calls = []
+
+    class FakeCollection:
+        def update_one(self, query, update, *, upsert):
+            update_calls.append((query, update, upsert))
+
+    class FakeDb:
+        def __getitem__(self, name):
+            assert name == POINT_BALANCE_HISTORY_COLLECTION
+            return FakeCollection()
+
+    repo = AccountRepository.__new__(AccountRepository)
+    repo.db = FakeDb()
+
+    async def _run(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    async def list_all_account_docs():
+        return [{"status": "active", "message_point_balance": 120}]
+
+    repo._run = _run
+    repo.list_all_account_docs = list_all_account_docs
+
+    await repo.record_pre_daily_reset_point_balance_snapshot(
+        captured_at=captured_at,
+        timezone_name="Asia/Hong_Kong",
+    )
+
+    _, update, upsert = update_calls[0]
+    assert upsert is True
+    assert "updated_at" not in update["$setOnInsert"]
+    assert update["$set"] == {"updated_at": captured_at}

@@ -1060,7 +1060,6 @@ class AccountRepository:
         snapshot_doc = {
             **snapshot,
             "created_at": captured_at,
-            "updated_at": captured_at,
         }
 
         def _op() -> None:
